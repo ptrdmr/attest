@@ -54,6 +54,14 @@ def approve_criteria(project):
 
 def mark_delivered(project):
     """Mark an active project as delivered and ready to attest."""
+    if project.status != Project.Status.ACTIVE:
+        raise InvalidTransition(
+            f"Cannot transition from {project.status} to {Project.Status.DELIVERED}."
+        )
+    if has_open_change_orders(project):
+        raise InvalidTransition(
+            "Proposed change orders must be resolved before delivery."
+        )
     return _transition(
         project,
         Project.Status.ACTIVE,
@@ -76,6 +84,57 @@ def criteria_locked(project):
         Project.Status.DRAFT,
         Project.Status.CRITERIA_PENDING,
     }
+
+
+def has_open_change_orders(project):
+    """Return whether the project has an unresolved change order."""
+    return project.change_orders.filter(
+        status=ChangeOrder.Status.PROPOSED,
+    ).exists()
+
+
+def propose_change_order(project, description, amount_cents, timeline_days):
+    """Create a proposed price or timeline adjustment for active work."""
+    if project.status != Project.Status.ACTIVE:
+        raise InvalidTransition(
+            "Change orders can only be proposed for active projects."
+        )
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError("Change order description must not be empty.")
+    if amount_cents is None or amount_cents < 0:
+        raise ValueError("Change order amount must not be negative.")
+    if timeline_days is None or timeline_days < 0:
+        raise ValueError("Change order timeline must not be negative.")
+    return ChangeOrder.objects.create(
+        project=project,
+        description=description,
+        amount_cents=amount_cents,
+        timeline_days=timeline_days,
+        status=ChangeOrder.Status.PROPOSED,
+    )
+
+
+def _resolve_change_order(change_order, target_status):
+    """Resolve one proposed change order with the requested decision."""
+    if change_order.status != ChangeOrder.Status.PROPOSED:
+        raise InvalidTransition(
+            f"Cannot transition change order from {change_order.status} "
+            f"to {target_status}."
+        )
+    change_order.status = target_status
+    change_order.resolved_at = timezone.now()
+    change_order.save(update_fields=("status", "resolved_at"))
+    return change_order
+
+
+def approve_change_order(change_order):
+    """Approve a proposed change order."""
+    return _resolve_change_order(change_order, ChangeOrder.Status.APPROVED)
+
+
+def decline_change_order(change_order):
+    """Decline a proposed change order."""
+    return _resolve_change_order(change_order, ChangeOrder.Status.DECLINED)
 
 
 def canonical_payload(project):

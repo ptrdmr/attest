@@ -50,12 +50,18 @@ Ledger read-only; hazard: signing flow, public record)
 - Tests: sign flow end-to-end, hash surfaced on record, disputed attestations
   frozen/annotated, no PII/tokens in rendered output
 
-### M4 — Change orders + billing gates (owning: Surface; consult: Ledger;
-hazard: billing)
-- Change-order flag → price/timeline → client approve before work; billing
-  gates for Pro/project-pack behind a `billing` interface (stub provider now,
-  Stripe later)
-- Tests: out-of-scope flow, gate enforcement, stub swap seam
+### M4 — Change orders + billing gates
+- **M4a (Ledger waiver, owning: Ledger; hazard: trust transitions):** add
+  `propose_change_order`, `approve_change_order`, `decline_change_order`;
+  unresolved PROPOSED change orders block `mark_delivered`. Schema: none
+  (ChangeOrder model already exists). Role sequence: Sol → Sonnet → Composer
+  → Grok → Gate → commit.
+- **M4b (Surface, owning: Surface; consult: Ledger; hazard: billing tokens):**
+  change-order UI + client token purpose `change_order`; billing gates behind
+  stub provider (no Stripe SDK). Role sequence: Sol → Sonnet → Composer →
+  Grok → Gate → commit.
+- Tests: CO transitions + unresolved block; Surface out-of-scope flow; billing
+  stub gate enforcement
 
 ### M5 — Landing + AI draft stub (owning: Surface)
 - Landing page (hero: "Signed proof you shipped", one CTA, record visual),

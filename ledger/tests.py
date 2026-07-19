@@ -20,13 +20,17 @@ from ledger.services import (
     InvalidSignatureMeta,
     InvalidTransition,
     amend_attestation,
+    approve_change_order,
     approve_criteria,
     canonical_payload,
     compute_payload_hash,
     criteria_locked,
+    decline_change_order,
     disputed_count,
     flag_dispute,
+    has_open_change_orders,
     mark_delivered,
+    propose_change_order,
     public_attestations,
     reopen_active,
     resolve_dispute,
@@ -233,6 +237,144 @@ class StatusMachineTests(TestCase):
         reopen_active(project)
         project.refresh_from_db()
         self.assertEqual(project.status, Project.Status.ACTIVE)
+
+
+class ChangeOrderServiceTests(TestCase):
+    """Change-order proposal, decision, and delivery guards."""
+
+    def setUp(self):
+        """Create active work eligible for a change-order proposal."""
+        self.project = make_project_with_items(status=Project.Status.ACTIVE)
+
+    def test_propose_creates_proposed_change_order(self):
+        """A valid proposal persists all requested adjustment fields."""
+        change_order = propose_change_order(
+            self.project,
+            "Add reporting export",
+            25000,
+            4,
+        )
+
+        self.assertEqual(change_order.project, self.project)
+        self.assertEqual(change_order.description, "Add reporting export")
+        self.assertEqual(change_order.amount_cents, 25000)
+        self.assertEqual(change_order.timeline_days, 4)
+        self.assertEqual(change_order.status, ChangeOrder.Status.PROPOSED)
+        self.assertIsNone(change_order.resolved_at)
+
+    def test_propose_rejects_non_active_project(self):
+        """Change orders cannot be proposed outside active work."""
+        for status in (
+            Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.DELIVERED,
+            Project.Status.ATTESTED,
+            Project.Status.DISPUTED,
+        ):
+            with self.subTest(status=status):
+                project = make_project_with_items(status=status)
+                with self.assertRaises(InvalidTransition):
+                    propose_change_order(project, "Extra work", 100, 1)
+                self.assertEqual(project.change_orders.count(), 0)
+
+    def test_propose_rejects_invalid_fields_without_creating_row(self):
+        """Blank descriptions and negative adjustments are rejected."""
+        invalid_values = (
+            ("", 0, 0),
+            ("   ", 0, 0),
+            ("Extra work", -1, 0),
+            ("Extra work", 0, -1),
+        )
+        for description, amount_cents, timeline_days in invalid_values:
+            with self.subTest(
+                description=description,
+                amount_cents=amount_cents,
+                timeline_days=timeline_days,
+            ):
+                with self.assertRaises(ValueError):
+                    propose_change_order(
+                        self.project,
+                        description,
+                        amount_cents,
+                        timeline_days,
+                    )
+        self.assertEqual(self.project.change_orders.count(), 0)
+
+    def test_approve_resolves_proposed_change_order(self):
+        """Approval stores its decision and resolution timestamp."""
+        change_order = propose_change_order(
+            self.project,
+            "Add reporting export",
+            25000,
+            4,
+        )
+
+        returned = approve_change_order(change_order)
+        change_order.refresh_from_db()
+
+        self.assertEqual(returned.pk, change_order.pk)
+        self.assertEqual(change_order.status, ChangeOrder.Status.APPROVED)
+        self.assertIsNotNone(change_order.resolved_at)
+
+    def test_decline_resolves_proposed_change_order(self):
+        """Decline stores its decision and resolution timestamp."""
+        change_order = propose_change_order(
+            self.project,
+            "Add reporting export",
+            25000,
+            4,
+        )
+
+        returned = decline_change_order(change_order)
+        change_order.refresh_from_db()
+
+        self.assertEqual(returned.pk, change_order.pk)
+        self.assertEqual(change_order.status, ChangeOrder.Status.DECLINED)
+        self.assertIsNotNone(change_order.resolved_at)
+
+    def test_resolved_change_order_cannot_be_decided_again(self):
+        """Only a proposed change order may receive a decision."""
+        approved = propose_change_order(self.project, "Approved work", 100, 1)
+        declined = propose_change_order(self.project, "Declined work", 200, 2)
+        approve_change_order(approved)
+        decline_change_order(declined)
+
+        for change_order, decision in (
+            (approved, approve_change_order),
+            (approved, decline_change_order),
+            (declined, approve_change_order),
+            (declined, decline_change_order),
+        ):
+            with self.subTest(
+                status=change_order.status,
+                decision=decision.__name__,
+            ):
+                with self.assertRaises(InvalidTransition):
+                    decision(change_order)
+
+    def test_proposed_change_order_blocks_delivery(self):
+        """Active work remains active until every proposal is decided."""
+        propose_change_order(self.project, "Pending work", 100, 1)
+
+        self.assertTrue(has_open_change_orders(self.project))
+        with self.assertRaises(InvalidTransition):
+            mark_delivered(self.project)
+
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+
+    def test_resolved_change_orders_allow_delivery(self):
+        """Approved and declined orders do not block delivery."""
+        approved = propose_change_order(self.project, "Approved work", 100, 1)
+        declined = propose_change_order(self.project, "Declined work", 200, 2)
+        approve_change_order(approved)
+        decline_change_order(declined)
+
+        self.assertFalse(has_open_change_orders(self.project))
+        mark_delivered(self.project)
+
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
 
 
 class PayloadHashTests(TestCase):
