@@ -8,7 +8,7 @@ from django.core import mail, signing
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
-from ledger.models import AcceptanceItem, Profile, Project
+from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
 from ledger.services import (
     approve_criteria,
     flag_dispute,
@@ -16,13 +16,21 @@ from ledger.services import (
     sign_attestation,
     submit_criteria_for_approval,
 )
+from surface import billing
 from surface.auth import MAGIC_LOGIN_MAX_AGE, make_magic_login_token
-from surface.tokens import CLIENT_TOKEN_MAX_AGE, make_client_token, read_client_token
+from surface.tokens import (
+    CLIENT_TOKEN_MAX_AGE,
+    make_change_order_token,
+    make_client_token,
+    read_client_token,
+)
 
 
 _profile_counter = 0
 
 LOCMem_EMAIL = {"EMAIL_BACKEND": "django.core.mail.backends.locmem.EmailBackend"}
+
+BILLING_STUB_SETTINGS = {"ATTEST_BILLING_STUB_MODE": True}
 
 
 def make_profile(handle=None, email=None):
@@ -81,9 +89,21 @@ def project_form_data(**overrides):
     return data
 
 
-def login_as(client, profile):
+def grant_session_entitlement(client, *, pro=False, pack_credits=0):
+    """Set session billing entitlement for HTTP tests."""
+    session = client.session
+    if pro:
+        session[billing._PRO_SESSION_KEY] = True
+    if pack_credits:
+        session[billing._PACK_CREDITS_SESSION_KEY] = pack_credits
+    session.save()
+
+
+def login_as(client, profile, *, grant_entitlement=True):
     """Establish an authenticated session as the given profile's user."""
     client.force_login(profile.user)
+    if grant_entitlement:
+        grant_session_entitlement(client, pro=True)
 
 
 def request_magic_link(client, email):
@@ -135,6 +155,17 @@ def sign_project_via_service(project, *, client_name="Client Signer"):
     )
     project.refresh_from_db()
     return attestation
+
+
+def change_order_form_data(**overrides):
+    """Return valid POST data for ChangeOrderForm."""
+    data = {
+        "description": "Additional reporting module",
+        "amount_cents": 15000,
+        "timeline_days": 5,
+    }
+    data.update(overrides)
+    return data
 
 
 def delivery_form_data(**overrides):
@@ -1097,3 +1128,370 @@ class RecordRedirectViewTests(TestCase):
         response = Client().get(reverse("surface:record"))
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("surface:login-request"), response.url)
+
+
+class ProjectEntitlementTests(TestCase):
+    """Project creation requires a Pro subscription or project-pack credit."""
+
+    @override_settings(**BILLING_STUB_SETTINGS)
+    def test_project_create_blocked_without_entitlement(self):
+        """Creating a project without billing entitlement redirects to billing."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner, grant_entitlement=False)
+
+        response = client.post(
+            reverse("surface:project-create"),
+            project_form_data(title="Blocked Without Plan"),
+            follow=True,
+        )
+
+        self.assertRedirects(response, reverse("surface:billing"))
+        self.assertFalse(
+            Project.objects.filter(title="Blocked Without Plan").exists()
+        )
+        self.assertContains(response, "Choose a plan before creating a project.")
+
+    @override_settings(**BILLING_STUB_SETTINGS)
+    def test_project_create_allowed_after_stub_pro(self):
+        """Stub Pro entitlement unlocks project creation after an unentitled start."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner, grant_entitlement=False)
+
+        blocked = client.post(
+            reverse("surface:project-create"),
+            project_form_data(title="Still Blocked"),
+        )
+        self.assertRedirects(blocked, reverse("surface:billing"))
+        self.assertFalse(Project.objects.filter(title="Still Blocked").exists())
+
+        client.post(reverse("surface:billing-activate-pro"))
+        response = client.post(
+            reverse("surface:project-create"),
+            project_form_data(title="Created With Pro"),
+        )
+
+        project = Project.objects.get(title="Created With Pro")
+        self.assertEqual(project.owner, owner)
+        self.assertRedirects(
+            response,
+            reverse("surface:project-detail", kwargs={"project_pk": project.pk}),
+        )
+
+    @override_settings(**BILLING_STUB_SETTINGS)
+    def test_project_create_allowed_after_stub_project_pack(self):
+        """A project-pack credit unlocks one project and is consumed on create."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner, grant_entitlement=False)
+        grant_session_entitlement(client, pack_credits=1)
+
+        response = client.post(
+            reverse("surface:project-create"),
+            project_form_data(title="Created With Pack"),
+        )
+
+        project = Project.objects.get(title="Created With Pack")
+        self.assertEqual(project.owner, owner)
+        self.assertRedirects(
+            response,
+            reverse("surface:project-detail", kwargs={"project_pk": project.pk}),
+        )
+        billing_page = client.get(reverse("surface:billing"))
+        self.assertContains(billing_page, "No project creation entitlement is active.")
+
+
+class ChangeOrderCreateViewTests(TestCase):
+    """Proposing change orders on active projects."""
+
+    @override_settings(DEBUG=True, **LOCMem_EMAIL)
+    def test_propose_change_order_on_active_emails_client_link(self):
+        """An active project proposal emails a change-order review URL."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        client = Client()
+        login_as(client, owner)
+        client.get(reverse("surface:project-detail", kwargs={"project_pk": project.pk}))
+
+        response = client.post(
+            reverse("surface:change-order-create", kwargs={"project_pk": project.pk}),
+            change_order_form_data(),
+            follow=True,
+        )
+
+        change_order = project.change_orders.get()
+        self.assertEqual(change_order.status, ChangeOrder.Status.PROPOSED)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("/client/change-order/", mail.outbox[0].body)
+        self.assertEqual(mail.outbox[0].to, [project.client_email])
+        self.assertRedirects(
+            response,
+            reverse("surface:project-detail", kwargs={"project_pk": project.pk}),
+        )
+        self.assertContains(response, "Change order sent for client review.")
+
+    def test_propose_change_order_returns_404_when_not_active(self):
+        """Draft projects cannot propose change orders through the Surface UI."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        client = Client()
+        login_as(client, owner)
+        response = client.post(
+            reverse("surface:change-order-create", kwargs={"project_pk": project.pk}),
+            change_order_form_data(),
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(project.change_orders.exists())
+
+
+class ChangeOrderTokenPurposeIsolationTests(TestCase):
+    """Change-order tokens are isolated from review and sign purposes."""
+
+    def setUp(self):
+        """Active project with review, sign, and change-order tokens."""
+        self.project = make_draft_project()
+        advance_to_active(self.project)
+        self.review_token = make_client_token(self.project, "review")
+        self.sign_token = make_client_token(self.project, "sign")
+        self.client = Client()
+
+    def test_review_token_cannot_open_client_change_order_page(self):
+        """A review-purpose token yields 410 on the change-order page."""
+        response = self.client.get(
+            reverse(
+                "surface:client-change-order",
+                kwargs={"token": self.review_token},
+            )
+        )
+        self.assertEqual(response.status_code, 410)
+        self.assertContains(
+            response,
+            "This review link is no longer available",
+            status_code=410,
+        )
+
+    def test_sign_token_cannot_open_client_change_order_page(self):
+        """A sign-purpose token yields 410 on the change-order page."""
+        response = self.client.get(
+            reverse(
+                "surface:client-change-order",
+                kwargs={"token": self.sign_token},
+            )
+        )
+        self.assertEqual(response.status_code, 410)
+        self.assertContains(
+            response,
+            "This review link is no longer available",
+            status_code=410,
+        )
+
+    def test_change_order_token_cannot_open_client_review_page(self):
+        """A change-order token cannot open criteria review."""
+        change_order = self.project.change_orders.create(
+            description="Scoped work",
+            amount_cents=1000,
+            timeline_days=2,
+            status=ChangeOrder.Status.PROPOSED,
+        )
+        token = make_change_order_token(change_order)
+        response = self.client.get(
+            reverse("surface:client-review", kwargs={"token": token})
+        )
+        self.assertEqual(response.status_code, 410)
+
+
+class ClientChangeOrderDecisionViewTests(TestCase):
+    """Client approve/decline decisions via purpose-bound change-order tokens."""
+
+    def setUp(self):
+        """Proposed change order with a fresh client token."""
+        self.project = make_draft_project()
+        advance_to_active(self.project)
+        self.change_order = self.project.change_orders.create(
+            description="Add dashboard export",
+            amount_cents=5000,
+            timeline_days=3,
+            status=ChangeOrder.Status.PROPOSED,
+        )
+        self.token = make_change_order_token(self.change_order)
+        self.client = Client()
+
+    def test_client_approve_via_token_sets_approved_status(self):
+        """Approve POST resolves the change order to approved."""
+        response = self.client.post(
+            reverse("surface:client-change-order", kwargs={"token": self.token}),
+            {"decision": "approve"},
+        )
+        self.change_order.refresh_from_db()
+        self.assertEqual(self.change_order.status, ChangeOrder.Status.APPROVED)
+        self.assertIsNotNone(self.change_order.resolved_at)
+        self.assertEqual(response.status_code, 200)
+
+    def test_client_decline_via_token_sets_declined_status(self):
+        """Decline POST resolves the change order to declined."""
+        response = self.client.post(
+            reverse("surface:client-change-order", kwargs={"token": self.token}),
+            {"decision": "decline"},
+        )
+        self.change_order.refresh_from_db()
+        self.assertEqual(self.change_order.status, ChangeOrder.Status.DECLINED)
+        self.assertIsNotNone(self.change_order.resolved_at)
+        self.assertEqual(response.status_code, 200)
+
+
+class MarkDeliveredChangeOrderGateTests(TestCase):
+    """Delivery is blocked while proposed change orders remain open."""
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_mark_delivered_blocked_while_proposed_change_order_open(self):
+        """Open proposed change orders block delivery with a friendly message."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        mark_all_items_passed(project)
+        project.change_orders.create(
+            description="Pending scope change",
+            amount_cents=1000,
+            timeline_days=1,
+            status=ChangeOrder.Status.PROPOSED,
+        )
+        client = Client()
+        login_as(client, owner)
+        client.get(reverse("surface:project-detail", kwargs={"project_pk": project.pk}))
+
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk})
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.ACTIVE)
+        self.assertEqual(len(mail.outbox), 0)
+        follow = client.get(response.url)
+        self.assertContains(
+            follow,
+            "Resolve all proposed change orders before delivery.",
+        )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_mark_delivered_works_after_change_order_approved(self):
+        """Delivery succeeds once the proposed change order is approved."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        mark_all_items_passed(project)
+        change_order = project.change_orders.create(
+            description="Approved scope change",
+            amount_cents=1000,
+            timeline_days=1,
+            status=ChangeOrder.Status.PROPOSED,
+        )
+        token = make_change_order_token(change_order)
+        client = Client()
+        client.post(
+            reverse("surface:client-change-order", kwargs={"token": token}),
+            {"decision": "approve"},
+        )
+        login_as(client, owner)
+        client.get(reverse("surface:project-detail", kwargs={"project_pk": project.pk}))
+
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk}),
+            follow=True,
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.DELIVERED)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("/client/sign/", mail.outbox[0].body)
+        self.assertContains(response, "Delivery recorded and sent for signature.")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_mark_delivered_works_after_change_order_declined(self):
+        """Delivery succeeds once the proposed change order is declined."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        mark_all_items_passed(project)
+        change_order = project.change_orders.create(
+            description="Declined scope change",
+            amount_cents=1000,
+            timeline_days=1,
+            status=ChangeOrder.Status.PROPOSED,
+        )
+        token = make_change_order_token(change_order)
+        client = Client()
+        client.post(
+            reverse("surface:client-change-order", kwargs={"token": token}),
+            {"decision": "decline"},
+        )
+        login_as(client, owner)
+        client.get(reverse("surface:project-detail", kwargs={"project_pk": project.pk}))
+
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk}),
+            follow=True,
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.DELIVERED)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertContains(response, "Delivery recorded and sent for signature.")
+
+
+class BillingPageTests(TestCase):
+    """Stub billing controls grant session entitlement."""
+
+    @override_settings(**BILLING_STUB_SETTINGS)
+    def test_billing_activate_pro_sets_entitlement(self):
+        """Activate Pro stores subscription entitlement in the session."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner, grant_entitlement=False)
+
+        response = client.post(
+            reverse("surface:billing-activate-pro"),
+            follow=True,
+        )
+
+        self.assertRedirects(response, reverse("surface:billing"))
+        self.assertContains(response, "Pro is active for this session.")
+        self.assertContains(response, "Billing entitlement activated.")
+
+    @override_settings(**BILLING_STUB_SETTINGS)
+    def test_billing_buy_project_pack_sets_entitlement(self):
+        """Buy project pack adds one credit to the session."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner, grant_entitlement=False)
+
+        response = client.post(
+            reverse("surface:billing-buy-project-pack"),
+            follow=True,
+        )
+
+        self.assertRedirects(response, reverse("surface:billing"))
+        self.assertContains(response, "1 project pack credit available.")
+        self.assertContains(response, "Billing entitlement activated.")
+
+    @override_settings(ATTEST_BILLING_STUB_MODE=False)
+    def test_billing_stub_disabled_refuses_activate_pro(self):
+        """Stub grant endpoints do nothing when ATTEST_BILLING_STUB_MODE is off."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner, grant_entitlement=False)
+
+        response = client.post(
+            reverse("surface:billing-activate-pro"),
+            follow=True,
+        )
+
+        self.assertRedirects(response, reverse("surface:billing"))
+        self.assertContains(response, "Local billing controls are not available.")
+        blocked = client.post(
+            reverse("surface:project-create"),
+            project_form_data(title="No Stub Create"),
+        )
+        self.assertRedirects(blocked, reverse("surface:billing"))
+        self.assertFalse(Project.objects.filter(title="No Stub Create").exists())

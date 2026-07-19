@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Billing · Attest{% endblock %}
+{% block content %}
+  <div class="page-heading">
+    <div>
+      <h1>Billing</h1>
+      <p>Choose ongoing access or one project at a time.</p>
+    </div>
+  </div>
+
+  <section class="card">
+    <h2>Current entitlement</h2>
+    {% if has_pro_subscription %}
+      <p class="notice">Pro is active for this session.</p>
+    {% elif project_pack_credits %}
+      <p class="notice">{{ project_pack_credits }} project pack credit{{ project_pack_credits|pluralize }} available.</p>
+    {% else %}
+      <p>No project creation entitlement is active.</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>{{ pro_plan_label }}</h2>
+    <p>Create projects throughout an active subscription.</p>
+    {% if stub_enabled %}
+      <form method="post" action="{% url 'surface:billing-activate-pro' %}">
+        {% csrf_token %}
+        <button type="submit">Activate Pro</button>
+      </form>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>{{ project_pack_label }}</h2>
+    <p>Purchase one credit for one new project.</p>
+    {% if stub_enabled %}
+      <form method="post" action="{% url 'surface:billing-buy-project-pack' %}">
+        {% csrf_token %}
+        <button type="submit">Buy project pack</button>
+      </form>
+    {% endif %}
+  </section>
+
+  {% if not stub_enabled %}
+    <p class="notice">Checkout is not configured yet. Contact support to activate a plan.</p>
+  {% endif %}
+{% endblock %}

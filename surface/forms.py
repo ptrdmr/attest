@@ -60,6 +60,26 @@ class DeliveryItemForm(forms.ModelForm):
         widgets = {"evidence_url": forms.URLInput(attrs={"placeholder": "https://…"})}
 
 
+class ChangeOrderForm(forms.Form):
+    """Validate a proposed project price and timeline adjustment."""
+
+    description = forms.CharField(
+        label="Change description",
+        strip=True,
+        widget=forms.Textarea(attrs={"rows": 3}),
+    )
+    amount_cents = forms.IntegerField(label="Additional amount (cents)", min_value=0)
+    timeline_days = forms.IntegerField(label="Additional timeline (days)", min_value=0)
+
+
+class ChangeOrderDecisionForm(forms.Form):
+    """Validate a client's explicit change-order decision."""
+
+    decision = forms.ChoiceField(
+        choices=(("approve", "Approve"), ("decline", "Decline")),
+    )
+
+
 class SignatureForm(forms.Form):
     """Validate the client's typed electronic signature."""
 

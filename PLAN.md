@@ -95,3 +95,7 @@ Ledger read-only; hazard: signing flow, public record)
   → fixed. Verifier (Composer, +19 surface tests → 53) → Verifier-adversary
   (Grok) rejected once (softball purpose-isolation GET) → fixed → accepted.
   Gate (Fable): PASS.
+- 2026-07-18: M4a Ledger CO services committed (24ce295). M4b Surface: Sol
+  built CO UI + billing stub; Implementer-adversary rejected once (consume
+  after save) → fixed; Verifier-adversary rejected once (soft CO/billing
+  tests) → tightened. Gate: PASS (prior pass + no new law violations).

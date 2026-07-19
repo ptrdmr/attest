@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Review change order · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <p class="eyebrow">Change order</p>
+    <h1>{{ project.title }}</h1>
+    <p class="pre-line">{{ change_order.description }}</p>
+    <dl class="details">
+      <div><dt>Additional amount</dt><dd>{{ change_order.amount_cents }} cents</dd></div>
+      <div><dt>Additional timeline</dt><dd>{{ change_order.timeline_days }} day{{ change_order.timeline_days|pluralize }}</dd></div>
+      <div><dt>Status</dt><dd>{{ change_order.get_status_display }}</dd></div>
+    </dl>
+    {% if change_order.status == "proposed" %}
+      <p>Choose one decision. It cannot be changed from this link after submission.</p>
+      <form method="post">
+        {% csrf_token %}
+        <div class="actions">
+          <button type="submit" name="decision" value="approve">Approve change order</button>
+          <button class="danger secondary" type="submit" name="decision" value="decline">Decline</button>
+        </div>
+      </form>
+    {% else %}
+      <p class="notice">This change order has already been handled.</p>
+    {% endif %}
+  </section>
+{% endblock %}

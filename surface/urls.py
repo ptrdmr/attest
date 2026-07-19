@@ -50,6 +50,11 @@ urlpatterns = [
         name="criteria-submit",
     ),
     path(
+        "projects/<int:project_pk>/change-orders/add/",
+        views.ChangeOrderCreateView.as_view(),
+        name="change-order-create",
+    ),
+    path(
         "projects/<int:project_pk>/delivery/<int:item_pk>/",
         views.DeliveryItemUpdateView.as_view(),
         name="delivery-item-update",
@@ -81,6 +86,11 @@ urlpatterns = [
         name="client-sign",
     ),
     path(
+        "client/change-order/<path:token>/",
+        views.ClientChangeOrderView.as_view(),
+        name="client-change-order",
+    ),
+    path(
         "u/<slug:handle>/",
         views.PublicRecordView.as_view(),
         name="public-record",
@@ -92,8 +102,17 @@ urlpatterns = [
     ),
     path(
         "billing/",
-        views.PlaceholderView.as_view(),
-        {"title": "Billing"},
+        views.BillingView.as_view(),
         name="billing",
+    ),
+    path(
+        "billing/activate-pro/",
+        views.BillingActionView.as_view(grant_type="pro"),
+        name="billing-activate-pro",
+    ),
+    path(
+        "billing/buy-project-pack/",
+        views.BillingActionView.as_view(grant_type="project_pack"),
+        name="billing-buy-project-pack",
     ),
 ]

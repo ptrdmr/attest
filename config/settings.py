@@ -118,6 +118,11 @@ else:
 
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "Attest <noreply@attest.local>")
 
+# Session-backed billing controls are available only when explicitly enabled.
+ATTEST_BILLING_STUB_MODE = (
+    os.environ.get("ATTEST_BILLING_STUB_MODE", "1" if DEBUG else "0") == "1"
+)
+
 # Production security hardening (harmless defaults locally).
 if not DEBUG:
     SECURE_SSL_REDIRECT = True

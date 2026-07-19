@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Change order recorded · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <h1>Decision recorded</h1>
+    <p>The change order is now {{ change_order.get_status_display|lower }}. The freelancer can continue from the updated project record.</p>
+  </section>
+{% endblock %}

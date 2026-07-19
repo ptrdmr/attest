@@ -15,8 +15,9 @@ from django.views import View
 from django.views.generic import FormView, TemplateView
 
 from ledger import services
-from ledger.models import AcceptanceItem, Profile, Project
+from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
 
+from . import billing
 from .auth import (
     ensure_profile,
     get_or_create_freelancer,
@@ -26,12 +27,19 @@ from .auth import (
 from .forms import (
     AcceptanceItemForm,
     ActionForm,
+    ChangeOrderDecisionForm,
+    ChangeOrderForm,
     DeliveryItemForm,
     MagicLinkRequestForm,
     ProjectForm,
     SignatureForm,
 )
-from .tokens import make_client_token, read_client_token
+from .tokens import (
+    make_change_order_token,
+    make_client_token,
+    read_change_order_token,
+    read_client_token,
+)
 
 
 def _is_htmx(request):
@@ -76,6 +84,20 @@ def _send_signing_link(request, project):
     )
 
 
+def _send_change_order_link(request, change_order):
+    """Email a proposal URL without rendering its token."""
+    token = make_change_order_token(change_order)
+    review_url = request.build_absolute_uri(
+        reverse("surface:client-change-order", kwargs={"token": token})
+    )
+    return _send_email(
+        request,
+        subject=f"Review a change order for {change_order.project.title}",
+        body=review_url,
+        recipient=change_order.project.client_email,
+    )
+
+
 def _project_context(project, **extra):
     """Build the common project-detail template context."""
     delivery_rows = [
@@ -87,6 +109,9 @@ def _project_context(project, **extra):
         "acceptance_items": project.acceptance_items.all(),
         "criteria_locked": services.criteria_locked(project),
         "acceptance_form": AcceptanceItemForm(),
+        "change_order_form": ChangeOrderForm(),
+        "change_orders": project.change_orders.order_by("-created_at", "-pk"),
+        "has_open_change_orders": services.has_open_change_orders(project),
         "action_form": ActionForm(),
         "delivery_rows": delivery_rows,
         "all_delivery_reviewed": bool(delivery_rows)
@@ -214,11 +239,25 @@ class ProjectCreateView(LoginRequiredMixin, FormView):
     template_name = "surface/projects/form.html"
     form_class = ProjectForm
 
+    def dispatch(self, request, *args, **kwargs):
+        """Require a Pro subscription or unused project-pack credit."""
+        if request.user.is_authenticated and not billing.has_project_entitlement(request):
+            messages.info(request, "Choose a plan before creating a project.")
+            return redirect("surface:billing")
+        return super().dispatch(request, *args, **kwargs)
+
     def form_valid(self, form):
-        """Assign ownership and persist the validated draft project."""
+        """Consume entitlement first, then persist the validated draft project."""
+        if not billing.consume_project_entitlement(self.request):
+            messages.info(self.request, "Choose a plan before creating a project.")
+            return redirect("surface:billing")
         project = form.save(commit=False)
         project.owner = ensure_profile(self.request.user)
-        project.save()
+        try:
+            project.save()
+        except (IntegrityError, ValueError, TypeError):
+            billing.restore_project_pack_credit(self.request)
+            raise
         messages.success(self.request, "Project created.")
         return redirect("surface:project-detail", project_pk=project.pk)
 
@@ -413,6 +452,37 @@ class SubmitCriteriaView(OwnedProjectMixin, View):
         )
 
 
+class ChangeOrderCreateView(OwnedProjectMixin, View):
+    """Propose an active-project change order and email it to the client."""
+
+    def project_is_accessible(self):
+        """Permit proposals only while project work is active."""
+        return self.project.status == Project.Status.ACTIVE
+
+    def post(self, request, project_pk):
+        """Validate the proposal and delegate creation to Ledger."""
+        form = ChangeOrderForm(request.POST)
+        if not form.is_valid():
+            return render(
+                request,
+                "surface/projects/detail.html",
+                _project_context(self.project, change_order_form=form),
+            )
+        try:
+            change_order = services.propose_change_order(
+                project=self.project,
+                description=form.cleaned_data["description"],
+                amount_cents=form.cleaned_data["amount_cents"],
+                timeline_days=form.cleaned_data["timeline_days"],
+            )
+        except (services.InvalidTransition, ValueError):
+            messages.error(request, "This change order cannot be proposed now.")
+            return redirect("surface:project-detail", project_pk=self.project.pk)
+        if _send_change_order_link(request, change_order):
+            messages.success(request, "Change order sent for client review.")
+        return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
 class DeliveryItemUpdateView(OwnedProjectMixin, View):
     """Record delivery status and evidence for one active criterion."""
 
@@ -471,7 +541,11 @@ class MarkDeliveredView(OwnedProjectMixin, View):
         try:
             services.mark_delivered(self.project)
         except services.InvalidTransition:
-            messages.error(request, "This project cannot be marked delivered now.")
+            if services.has_open_change_orders(self.project):
+                message = "Resolve all proposed change orders before delivery."
+            else:
+                message = "This project cannot be marked delivered now."
+            messages.error(request, message)
             return redirect("surface:project-detail", project_pk=self.project.pk)
 
         if _send_signing_link(request, self.project):
@@ -502,15 +576,63 @@ class ClientTokenMixin:
     token_purpose = None
     project = None
 
+    def resolve_client_token(self, token):
+        """Resolve this view's purpose-bound project token."""
+        return read_client_token(token, self.token_purpose)
+
     def dispatch(self, request, *args, **kwargs):
         """Validate the path token before dispatching the client view."""
         try:
-            self.project = read_client_token(kwargs["token"], self.token_purpose)
+            self.project = self.resolve_client_token(kwargs["token"])
         except signing.SignatureExpired:
             return _client_token_error(request)
-        except (signing.BadSignature, Project.DoesNotExist):
+        except (signing.BadSignature, ChangeOrder.DoesNotExist, Project.DoesNotExist):
             return _client_token_error(request)
         return super().dispatch(request, *args, **kwargs)
+
+
+class ClientChangeOrderView(ClientTokenMixin, View):
+    """Show and resolve one purpose-bound change-order proposal."""
+
+    token_purpose = "change_order"
+    change_order = None
+
+    def resolve_client_token(self, token):
+        """Resolve the proposal and expose its owning project to the view."""
+        self.change_order = read_change_order_token(token)
+        return self.change_order.project
+
+    def get(self, request, token):
+        """Render the proposal without copying its token into the response."""
+        return render(
+            request,
+            "surface/client/change_order.html",
+            {
+                "project": self.project,
+                "change_order": self.change_order,
+                "form": ChangeOrderDecisionForm(),
+            },
+        )
+
+    def post(self, request, token):
+        """Validate and delegate the client's decision to Ledger."""
+        form = ChangeOrderDecisionForm(request.POST)
+        if not form.is_valid():
+            return _client_token_error(request)
+        service = (
+            services.approve_change_order
+            if form.cleaned_data["decision"] == "approve"
+            else services.decline_change_order
+        )
+        try:
+            service(self.change_order)
+        except services.InvalidTransition:
+            messages.info(request, "This change order was already handled.")
+        return render(
+            request,
+            "surface/client/change_order_thanks.html",
+            {"change_order": self.change_order},
+        )
 
 
 class ClientReviewView(ClientTokenMixin, TemplateView):
@@ -657,13 +779,42 @@ class RecordRedirectView(LoginRequiredMixin, View):
         return redirect("surface:public-record", handle=profile.handle)
 
 
-class PlaceholderView(LoginRequiredMixin, TemplateView):
-    """Render an authenticated placeholder for a later milestone."""
+class BillingView(LoginRequiredMixin, TemplateView):
+    """Show the current session entitlement and available plans."""
 
-    template_name = "surface/placeholder.html"
+    template_name = "surface/billing.html"
 
     def get_context_data(self, **kwargs):
-        """Add the placeholder title from the URL configuration."""
+        """Add plan labels, status, and local stub availability."""
         context = super().get_context_data(**kwargs)
-        context["title"] = kwargs["title"]
+        context.update(
+            {
+                "pro_plan_label": billing.PRO_PLAN_LABEL,
+                "project_pack_label": billing.PROJECT_PACK_LABEL,
+                "has_pro_subscription": billing.has_pro_subscription(self.request),
+                "project_pack_credits": billing.project_pack_credits(self.request),
+                "stub_enabled": billing.billing_stub_enabled(),
+            }
+        )
         return context
+
+
+class BillingActionView(LoginRequiredMixin, View):
+    """Grant a local stub entitlement after an intentional POST."""
+
+    grant_type = None
+
+    def post(self, request):
+        """Validate the request and activate the selected stub plan."""
+        form = ActionForm(request.POST)
+        if not form.is_valid():
+            raise Http404
+        grant = {
+            "pro": billing.grant_pro_subscription,
+            "project_pack": billing.grant_project_pack,
+        }.get(self.grant_type)
+        if grant is None or not grant(request):
+            messages.error(request, "Local billing controls are not available.")
+            return redirect("surface:billing")
+        messages.success(request, "Billing entitlement activated.")
+        return redirect("surface:billing")
