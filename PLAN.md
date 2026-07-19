@@ -71,4 +71,11 @@ hazard: billing)
 ## Log
 - 2026-07-18: M0 executed. Django 6.0.7 (latest stable at install time; plan
   said 5.x — noted, no action needed)
-- Refit candidate: none yet
+- 2026-07-18: M1 executed. Builder (Sol) → adversary (Sonnet) rejected once
+  (OneToOne blocked amendment chains; queryset-update bypass; admin delete
+  hole) → fixed → accepted. Verifier (Composer, 47 tests) → adversary (Grok)
+  rejected once (sort_keys and is_disputed filters not load-bearing) → fixed →
+  accepted with mutation-testing proof. Gate: PASS
+- Refit candidates: (1) make is_disputed/disputed_at admin-readonly and route
+  admin dispute handling through services so tag recompute always runs;
+  (2) drop redundant db_index=True on Attestation.project FK
