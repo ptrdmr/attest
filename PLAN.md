@@ -99,3 +99,6 @@ Ledger read-only; hazard: signing flow, public record)
   built CO UI + billing stub; Implementer-adversary rejected once (consume
   after save) → fixed; Verifier-adversary rejected once (soft CO/billing
   tests) → tightened. Gate: PASS (prior pass + no new law violations).
+- 2026-07-18: M5 landing + AI draft stub. Builder (Composer) → Implementer-
+  adversary ACCEPT; Verifier (+8 surface tests) → Verifier-adversary ACCEPT;
+  Gate PASS (AI generate preview-only until human confirm).

@@ -17,7 +17,7 @@ from django.views.generic import FormView, TemplateView
 from ledger import services
 from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
 
-from . import billing
+from . import ai, billing
 from .auth import (
     ensure_profile,
     get_or_create_freelancer,
@@ -27,6 +27,8 @@ from .auth import (
 from .forms import (
     AcceptanceItemForm,
     ActionForm,
+    AiDraftConfirmForm,
+    AiDumpForm,
     ChangeOrderDecisionForm,
     ChangeOrderForm,
     DeliveryItemForm,
@@ -109,6 +111,7 @@ def _project_context(project, **extra):
         "acceptance_items": project.acceptance_items.all(),
         "criteria_locked": services.criteria_locked(project),
         "acceptance_form": AcceptanceItemForm(),
+        "ai_dump_form": AiDumpForm(),
         "change_order_form": ChangeOrderForm(),
         "change_orders": project.change_orders.order_by("-created_at", "-pk"),
         "has_open_change_orders": services.has_open_change_orders(project),
@@ -135,16 +138,13 @@ def _client_token_error(request):
 
 
 class HomeView(View):
-    """Route visitors to login and authenticated users to their projects."""
+    """Show marketing landing for visitors and route signed-in users to projects."""
 
     def get(self, request):
-        """Redirect according to the current authentication state."""
-        destination = (
-            "surface:project-list"
-            if request.user.is_authenticated
-            else "surface:login-request"
-        )
-        return redirect(destination)
+        """Render landing for anonymous users or redirect authenticated users."""
+        if request.user.is_authenticated:
+            return redirect("surface:project-list")
+        return render(request, "surface/landing.html")
 
 
 class MagicLinkRequestView(FormView):
@@ -308,6 +308,81 @@ class ProjectDeleteView(OwnedProjectMixin, View):
         self.project.delete()
         messages.success(request, "Draft project deleted.")
         return redirect("surface:project-list")
+
+
+class AiDraftGenerateView(OwnedProjectMixin, View):
+    """Generate editable AI draft output without persisting project changes."""
+
+    def project_is_accessible(self):
+        """Permit AI drafting only while the project remains a draft."""
+        return self.project.status == Project.Status.DRAFT
+
+    def post(self, request, project_pk):
+        """Run the deterministic stub and show an editable preview."""
+        form = AiDumpForm(request.POST)
+        if not form.is_valid():
+            return render(
+                request,
+                "surface/projects/detail.html",
+                _project_context(self.project, ai_dump_form=form),
+            )
+        draft = ai.draft_from_dump(form.cleaned_data["source_dump"])
+        confirm_form = AiDraftConfirmForm(
+            initial={
+                "brief": draft.brief,
+                "criteria_text": "\n".join(item.text for item in draft.criteria),
+            }
+        )
+        return render(
+            request,
+            "surface/projects/detail.html",
+            _project_context(
+                self.project,
+                ai_preview=True,
+                ai_confirm_form=confirm_form,
+            ),
+        )
+
+
+class AiDraftConfirmView(OwnedProjectMixin, View):
+    """Apply freelancer-confirmed AI draft output to the owned draft project."""
+
+    def project_is_accessible(self):
+        """Permit AI confirmation only while the project remains a draft."""
+        return self.project.status == Project.Status.DRAFT
+
+    def post(self, request, project_pk):
+        """Persist the edited brief and create acceptance criteria."""
+        form = AiDraftConfirmForm(request.POST)
+        if not form.is_valid():
+            return render(
+                request,
+                "surface/projects/detail.html",
+                _project_context(self.project, ai_preview=True, ai_confirm_form=form),
+            )
+        criteria_lines = form.criteria_lines()
+        if not criteria_lines:
+            form.add_error("criteria_text", "Add at least one acceptance criterion.")
+            return render(
+                request,
+                "surface/projects/detail.html",
+                _project_context(self.project, ai_preview=True, ai_confirm_form=form),
+            )
+        with transaction.atomic():
+            self.project.brief = form.cleaned_data["brief"]
+            self.project.save(update_fields=["brief", "updated_at"])
+            self.project.acceptance_items.all().delete()
+            for order, text in enumerate(criteria_lines, start=1):
+                AcceptanceItem.objects.create(
+                    project=self.project,
+                    text=text,
+                    order=order,
+                )
+        messages.success(
+            request,
+            "Draft applied. Review the brief and criteria before sending to the client.",
+        )
+        return redirect("surface:project-detail", project_pk=self.project.pk)
 
 
 class AcceptanceItemCreateView(OwnedProjectMixin, View):

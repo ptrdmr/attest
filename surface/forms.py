@@ -94,5 +94,43 @@ class SignatureForm(forms.Form):
     )
 
 
+class AiDumpForm(forms.Form):
+    """Validate pasted email or Slack source text for AI drafting."""
+
+    source_dump = forms.CharField(
+        label="Paste email or Slack thread",
+        strip=False,
+        widget=forms.Textarea(
+            attrs={
+                "rows": 8,
+                "placeholder": "Paste the conversation, bullets, or deliverables…",
+            }
+        ),
+    )
+
+
+class AiDraftConfirmForm(forms.Form):
+    """Validate freelancer-edited AI draft output before it is applied."""
+
+    brief = forms.CharField(
+        label="Project brief",
+        strip=True,
+        widget=forms.Textarea(attrs={"rows": 6}),
+    )
+    criteria_text = forms.CharField(
+        label="Acceptance criteria (one per line)",
+        strip=True,
+        widget=forms.Textarea(attrs={"rows": 8}),
+    )
+
+    def criteria_lines(self):
+        """Return non-empty criterion lines in display order."""
+        return [
+            line.strip()
+            for line in self.cleaned_data["criteria_text"].splitlines()
+            if line.strip()
+        ]
+
+
 class ActionForm(forms.Form):
     """Validate an intentional POST action with no additional input."""

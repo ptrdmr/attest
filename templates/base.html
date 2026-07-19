@@ -23,7 +23,7 @@
       </form>
     {% endif %}
   </header>
-  <main class="container">
+  <main class="{% block main_class %}container{% endblock %}">
     {% if messages %}
       <div class="messages" aria-live="polite">
         {% for message in messages %}

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Attest — Signed proof you shipped{% endblock %}
+{% block main_class %}landing-main{% endblock %}
+{% block content %}
+  <section class="landing-hero">
+    <div class="landing-hero-copy">
+      <p class="eyebrow">Attest</p>
+      <h1>Signed proof you shipped</h1>
+      <p class="landing-lead">
+        Turn finished freelance work into a verified Capability Record your next client can trust.
+      </p>
+      <a class="button landing-cta" href="{% url 'surface:login-request' %}">Close your next project</a>
+    </div>
+    <div class="landing-visual" aria-hidden="true">
+      <div class="record-mockup">
+        <div class="record-mockup-header">
+          <span class="record-mockup-eyebrow">Capability Record</span>
+          <span class="record-mockup-badge">Verified</span>
+        </div>
+        <h2 class="record-mockup-name">Alex Rivera</h2>
+        <p class="record-mockup-headline">Product designer · shipped 12 verified projects</p>
+        <div class="record-mockup-tags">
+          <span class="tag">Design systems · 4</span>
+          <span class="tag">Prototyping · 3</span>
+          <span class="tag">Research · 2</span>
+        </div>
+        <article class="record-mockup-card">
+          <div class="record-heading">
+            <h3>Checkout redesign for Northwind</h3>
+            <span class="badge">Verified</span>
+          </div>
+          <p>Signed Mar 14, 2026</p>
+          <p><strong>Skills:</strong> UX, Figma, usability testing</p>
+          <dl>
+            <dt>SHA-256 record hash</dt>
+            <dd class="record-hash">a4f9c2…8e1b0d</dd>
+          </dl>
+        </article>
+      </div>
+    </div>
+  </section>
+{% endblock %}

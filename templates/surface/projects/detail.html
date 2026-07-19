@@ -18,6 +18,34 @@
     {% endif %}
   </div>
 
+  {% if project.status == "draft" %}
+    <section class="card ai-draft-panel">
+      <h2>Draft from email or Slack</h2>
+      <p class="muted">
+        Paste a thread to generate a draft brief and criteria. Nothing is saved until you confirm.
+      </p>
+      {% if ai_preview %}
+        <p class="notice" role="status">
+          Review and edit the draft below, then confirm to apply it to this project.
+        </p>
+        <form method="post" action="{% url 'surface:ai-draft-confirm' project.pk %}">
+          {% csrf_token %}
+          {{ ai_confirm_form.as_div }}
+          <div class="actions">
+            <button type="submit">Confirm and apply draft</button>
+            <a class="button secondary" href="{% url 'surface:project-detail' project.pk %}">Discard preview</a>
+          </div>
+        </form>
+      {% else %}
+        <form method="post" action="{% url 'surface:ai-draft-generate' project.pk %}">
+          {% csrf_token %}
+          {{ ai_dump_form.as_div }}
+          <button type="submit">Generate draft</button>
+        </form>
+      {% endif %}
+    </section>
+  {% endif %}
+
   <section class="card">
     <h2>Project brief</h2>
     <p class="pre-line">{{ project.brief }}</p>

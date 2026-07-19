@@ -30,6 +30,16 @@ urlpatterns = [
         name="project-delete",
     ),
     path(
+        "projects/<int:project_pk>/ai-draft/",
+        views.AiDraftGenerateView.as_view(),
+        name="ai-draft-generate",
+    ),
+    path(
+        "projects/<int:project_pk>/ai-draft/confirm/",
+        views.AiDraftConfirmView.as_view(),
+        name="ai-draft-confirm",
+    ),
+    path(
         "projects/<int:project_pk>/criteria/add/",
         views.AcceptanceItemCreateView.as_view(),
         name="criterion-create",

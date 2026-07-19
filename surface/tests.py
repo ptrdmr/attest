@@ -1,4 +1,4 @@
-"""Verifier tests for the Surface layer (M2 + M3)."""
+"""Verifier tests for the Surface layer (M2 + M3 + M5)."""
 
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -176,6 +176,48 @@ def delivery_form_data(**overrides):
     }
     data.update(overrides)
     return data
+
+
+def ai_dump_form_data(**overrides):
+    """Return valid POST data for AiDumpForm."""
+    data = {
+        "source_dump": (
+            "We need a reporting dashboard for Q2.\n"
+            "- Export CSV\n"
+            "- Filter by date range"
+        ),
+    }
+    data.update(overrides)
+    return data
+
+
+def ai_confirm_form_data(**overrides):
+    """Return valid POST data for AiDraftConfirmForm."""
+    data = {
+        "brief": "Confirmed AI brief",
+        "criteria_text": "Applied criterion A\nApplied criterion B",
+    }
+    data.update(overrides)
+    return data
+
+
+class HomeViewTests(TestCase):
+    """Marketing landing for anonymous visitors and project redirect when signed in."""
+
+    def test_anonymous_home_shows_landing_page(self):
+        """Anonymous GET / returns the landing page with primary marketing copy."""
+        response = Client().get(reverse("surface:home"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signed proof you shipped")
+        self.assertContains(response, "Close your next project")
+
+    def test_authenticated_home_redirects_to_project_list(self):
+        """Signed-in freelancers are sent straight to their project list."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner)
+        response = client.get(reverse("surface:home"))
+        self.assertRedirects(response, reverse("surface:project-list"))
 
 
 class MagicLinkTests(TestCase):
@@ -1438,6 +1480,140 @@ class MarkDeliveredChangeOrderGateTests(TestCase):
         self.assertEqual(project.status, Project.Status.DELIVERED)
         self.assertEqual(len(mail.outbox), 1)
         self.assertContains(response, "Delivery recorded and sent for signature.")
+
+
+class AiDraftViewTests(TestCase):
+    """AI draft generate/confirm stays preview-only until explicit human confirm."""
+
+    def setUp(self):
+        """One editable draft project owned by the authenticated freelancer."""
+        self.owner = make_profile()
+        self.project = make_draft_project(owner=self.owner)
+        self.original_brief = self.project.brief
+        self.client = Client()
+        login_as(self.client, self.owner)
+
+    def test_generate_does_not_persist_brief_or_criteria(self):
+        """Generate shows a preview without writing brief or acceptance items."""
+        item_count_before = self.project.acceptance_items.count()
+        response = self.client.post(
+            reverse(
+                "surface:ai-draft-generate",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_dump_form_data(),
+        )
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.project.brief, self.original_brief)
+        self.assertEqual(self.project.acceptance_items.count(), item_count_before)
+
+    def test_generate_shows_editable_preview(self):
+        """Generate renders the confirm form with draft fields for human review."""
+        response = self.client.post(
+            reverse(
+                "surface:ai-draft-generate",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_dump_form_data(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Review and edit the draft below")
+        self.assertContains(response, "Confirm and apply draft")
+        self.assertContains(response, "Export CSV")
+        self.assertContains(response, "Filter by date range")
+
+    def test_confirm_applies_brief_and_replaces_criteria(self):
+        """Confirm persists the edited brief and replaces acceptance criteria."""
+        self.client.post(
+            reverse(
+                "surface:ai-draft-generate",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_dump_form_data(),
+        )
+        response = self.client.post(
+            reverse(
+                "surface:ai-draft-confirm",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_confirm_form_data(
+                brief="Confirmed brief text",
+                criteria_text="Applied criterion A\nApplied criterion B",
+            ),
+        )
+        self.project.refresh_from_db()
+        self.assertRedirects(
+            response,
+            reverse("surface:project-detail", kwargs={"project_pk": self.project.pk}),
+        )
+        self.assertEqual(self.project.brief, "Confirmed brief text")
+        texts = list(
+            self.project.acceptance_items.order_by("order").values_list("text", flat=True)
+        )
+        self.assertEqual(texts, ["Applied criterion A", "Applied criterion B"])
+
+    def test_confirm_without_valid_form_leaves_project_unchanged(self):
+        """Invalid confirm POST re-renders preview and leaves stored project state intact."""
+        item = self.project.acceptance_items.get()
+        response = self.client.post(
+            reverse(
+                "surface:ai-draft-confirm",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            {"brief": "", "criteria_text": ""},
+        )
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "This field is required")
+        self.assertEqual(self.project.brief, self.original_brief)
+        self.assertEqual(self.project.acceptance_items.count(), 1)
+        item.refresh_from_db()
+        self.assertEqual(item.text, "First criterion")
+
+    def test_ai_draft_endpoints_return_404_on_active_project(self):
+        """Generate and confirm are unavailable once the project leaves draft."""
+        advance_to_active(self.project)
+        generate = self.client.post(
+            reverse(
+                "surface:ai-draft-generate",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_dump_form_data(),
+        )
+        confirm = self.client.post(
+            reverse(
+                "surface:ai-draft-confirm",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_confirm_form_data(),
+        )
+        self.assertEqual(generate.status_code, 404)
+        self.assertEqual(confirm.status_code, 404)
+
+    def test_non_owner_cannot_generate_or_confirm_ai_draft(self):
+        """Another freelancer cannot run AI draft actions on an owned project."""
+        other = make_profile(handle="ai-other")
+        other_client = Client()
+        login_as(other_client, other)
+        generate = other_client.post(
+            reverse(
+                "surface:ai-draft-generate",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_dump_form_data(),
+        )
+        confirm = other_client.post(
+            reverse(
+                "surface:ai-draft-confirm",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_confirm_form_data(),
+        )
+        self.assertEqual(generate.status_code, 404)
+        self.assertEqual(confirm.status_code, 404)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.brief, self.original_brief)
 
 
 class BillingPageTests(TestCase):
