@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Login link unavailable · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <h1>This login link is no longer available</h1>
+    <p>It may be invalid or expired. Request a new link to continue.</p>
+    <a class="button" href="{% url 'surface:login-request' %}">Request a new link</a>
+  </section>
+{% endblock %}

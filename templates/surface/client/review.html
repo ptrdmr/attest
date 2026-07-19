@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Review project criteria · Attest{% endblock %}
+{% block content %}
+  <section class="card">
+    <p class="eyebrow">Client review</p>
+    <h1>{{ project.title }}</h1>
+    <h2>Project brief</h2>
+    <p class="pre-line">{{ project.brief }}</p>
+  </section>
+  <section class="card">
+    <h2>Acceptance criteria</h2>
+    <ol>
+      {% for item in acceptance_items %}
+        <li class="pre-line">{{ item.text }}</li>
+      {% empty %}
+        <li>No criteria were provided.</li>
+      {% endfor %}
+    </ol>
+    {% if project.status == "criteria_pending" %}
+      <div class="actions">
+        <form method="post" action="{% url 'surface:client-approve' token=view.kwargs.token %}">
+          {% csrf_token %}
+          <button type="submit">Approve criteria</button>
+        </form>
+        <form method="post" action="{% url 'surface:client-request-changes' token=view.kwargs.token %}">
+          {% csrf_token %}
+          <button class="secondary" type="submit">Request changes</button>
+        </form>
+      </div>
+    {% else %}
+      <p class="notice">These criteria have already been handled.</p>
+    {% endif %}
+  </section>
+{% endblock %}

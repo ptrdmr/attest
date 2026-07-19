@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ project.title }} · Attest{% endblock %}
+{% block content %}
+  <div class="page-heading">
+    <div>
+      <a href="{% url 'surface:project-list' %}">← Projects</a>
+      <h1>{{ project.title }}</h1>
+      <span class="badge">{{ project.get_status_display }}</span>
+    </div>
+    {% if project.status == "draft" %}
+      <div class="actions">
+        <a class="button secondary" href="{% url 'surface:project-update' project.pk %}">Edit details</a>
+        <form method="post" action="{% url 'surface:project-delete' project.pk %}">
+          {% csrf_token %}
+          <button class="danger" type="submit">Delete draft</button>
+        </form>
+      </div>
+    {% endif %}
+  </div>
+
+  <section class="card">
+    <h2>Project brief</h2>
+    <p class="pre-line">{{ project.brief }}</p>
+    <dl class="details">
+      <div><dt>Client</dt><dd>{{ project.client_name }}</dd></div>
+      <div><dt>Skills</dt><dd>{{ project.skills_csv|default:"—" }}</dd></div>
+      <div><dt>Revision limit</dt><dd>{{ project.revision_limit }}</dd></div>
+    </dl>
+  </section>
+
+  {% include "surface/partials/criteria.html" %}
+
+  {% if project.status == "draft" %}
+    <section class="card">
+      <h2>Ready for client review?</h2>
+      <p>Confirm the brief and criteria before sending. The client will receive a 14-day review link.</p>
+      <form method="post" action="{% url 'surface:criteria-submit' project.pk %}">
+        {% csrf_token %}
+        <button type="submit">Send for approval</button>
+      </form>
+    </section>
+  {% endif %}
+{% endblock %}

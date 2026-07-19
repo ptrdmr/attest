@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Check your email · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <h1>Check your email</h1>
+    <p>If the address can receive mail, a login link is on its way.</p>
+    <a href="{% url 'surface:login-request' %}">Request another link</a>
+  </section>
+{% endblock %}

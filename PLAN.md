@@ -79,3 +79,8 @@ hazard: billing)
 - Refit candidates: (1) make is_disputed/disputed_at admin-readonly and route
   admin dispute handling through services so tag recompute always runs;
   (2) drop redundant db_index=True on Attestation.project FK
+- 2026-07-18: M2 executed. Implementer-adversary (Sonnet) rejected once (no
+  tests; HTMX 400 validation paths invisible; DEBUG review_url token in HTML)
+  → fixed. Verifier (Composer, 34 surface tests) → Verifier-adversary (Grok)
+  rejected once (softball locked-mutation asserts) → fixed → accepted. Gate
+  (Fable): PASS. Full suite 81 tests green.

@@ -1,0 +1,52 @@
+<section class="card" id="criteria-panel">
+  <h2>Acceptance criteria</h2>
+  <div class="stack">
+    {% for item in acceptance_items %}
+      <article class="criterion" id="criterion-{{ item.pk }}">
+        <div>
+          <strong>{{ item.order }}.</strong>
+          <span class="pre-line">{{ item.text }}</span>
+        </div>
+        {% if not criteria_locked %}
+          <div class="actions">
+            <button
+              class="secondary"
+              type="button"
+              hx-get="{% url 'surface:criterion-update' project.pk item.pk %}"
+              hx-target="#criterion-{{ item.pk }}"
+              hx-swap="outerHTML"
+            >Edit</button>
+            <form
+              method="post"
+              action="{% url 'surface:criterion-delete' project.pk item.pk %}"
+              hx-post="{% url 'surface:criterion-delete' project.pk item.pk %}"
+              hx-target="#criteria-panel"
+              hx-swap="outerHTML"
+            >
+              {% csrf_token %}
+              <button class="danger secondary" type="submit">Delete</button>
+            </form>
+          </div>
+        {% endif %}
+      </article>
+    {% empty %}
+      <p>No acceptance criteria yet.</p>
+    {% endfor %}
+  </div>
+  {% if not criteria_locked %}
+    <form
+      class="criterion-form"
+      method="post"
+      action="{% url 'surface:criterion-create' project.pk %}"
+      hx-post="{% url 'surface:criterion-create' project.pk %}"
+      hx-target="#criteria-panel"
+      hx-swap="outerHTML"
+    >
+      {% csrf_token %}
+      {{ acceptance_form.as_div }}
+      <button type="submit">Add criterion</button>
+    </form>
+  {% else %}
+    <p class="muted">Criteria are read-only after client approval.</p>
+  {% endif %}
+</section>

@@ -1,0 +1,13 @@
+<article class="criterion" id="criterion-{{ item.pk }}">
+  <form
+    method="post"
+    action="{% url 'surface:criterion-update' project.pk item.pk %}"
+    hx-post="{% url 'surface:criterion-update' project.pk item.pk %}"
+    hx-target="#criteria-panel"
+    hx-swap="outerHTML"
+  >
+    {% csrf_token %}
+    {{ form.as_div }}
+    <button type="submit">Save criterion</button>
+  </form>
+</article>

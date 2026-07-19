@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}{% if form.instance.pk %}Edit{% else %}New{% endif %} project · Attest{% endblock %}
+{% block content %}
+  <section class="card">
+    <h1>{% if form.instance.pk %}Edit project{% else %}New project{% endif %}</h1>
+    <form method="post">
+      {% csrf_token %}
+      {{ form.as_div }}
+      <button type="submit">Save project</button>
+    </form>
+  </section>
+{% endblock %}

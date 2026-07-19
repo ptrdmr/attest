@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Projects · Attest{% endblock %}
+{% block content %}
+  <div class="page-heading">
+    <div>
+      <h1>Projects</h1>
+      <p>Build clear criteria and collect signed proof of delivery.</p>
+    </div>
+    <a class="button" href="{% url 'surface:project-create' %}">New project</a>
+  </div>
+  <div class="stack">
+    {% for project in projects %}
+      <a class="card project-row" href="{% url 'surface:project-detail' project.pk %}">
+        <strong>{{ project.title }}</strong>
+        <span class="badge">{{ project.get_status_display }}</span>
+      </a>
+    {% empty %}
+      <div class="card">
+        <p>No projects yet.</p>
+      </div>
+    {% endfor %}
+  </div>
+{% endblock %}

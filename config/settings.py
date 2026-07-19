@@ -102,6 +102,9 @@ MEDIA_ROOT = BASE_DIR / "media"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+LOGIN_URL = "surface:login-request"
+LOGIN_REDIRECT_URL = "surface:project-list"
+
 # Email: console in dev; SMTP via env in production.
 if os.environ.get("EMAIL_HOST"):
     EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
