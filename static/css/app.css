@@ -121,6 +121,7 @@ label {
 }
 
 input,
+select,
 textarea {
   width: 100%;
   padding: 0.7rem;
@@ -140,6 +141,12 @@ button,
   font: inherit;
   text-decoration: none;
   cursor: pointer;
+}
+
+button:disabled {
+  border-color: #9ca6b8;
+  background: #9ca6b8;
+  cursor: not-allowed;
 }
 
 .secondary,
@@ -171,6 +178,20 @@ button,
 
 .criterion-form {
   margin-top: 1.25rem;
+}
+
+.delivery-item {
+  padding: 1rem;
+  border: 1px solid #e5e9f1;
+  border-radius: 8px;
+}
+
+.delivery-item p:first-child {
+  margin-top: 0;
+}
+
+.delivery-record li + li {
+  margin-top: 1rem;
 }
 
 .details {
@@ -219,6 +240,43 @@ dd {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.dispute-notice {
+  padding: 1rem;
+  border: 1px solid #d98b27;
+  border-radius: 8px;
+  color: #71450d;
+  background: #fff5e5;
+}
+
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.tag {
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  color: #274395;
+  background: #eaf0ff;
+}
+
+.record-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.record-heading h3 {
+  margin: 0;
+}
+
+.record-hash {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.85rem;
 }
 
 @media (max-width: 680px) {

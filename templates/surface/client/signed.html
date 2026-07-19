@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Delivery signed · Attest{% endblock %}
+{% block content %}
+  <div class="narrow">
+    <section class="card">
+      <p class="eyebrow">Signature recorded</p>
+      <h1>Thank you</h1>
+      <p>You signed the delivery record for <strong>{{ project.title }}</strong>.</p>
+      <dl class="details">
+        <div>
+          <dt>Signed</dt>
+          <dd>{{ attestation.signed_at|date:"M j, Y, g:i A T" }}</dd>
+        </div>
+        <div>
+          <dt>Record hash</dt>
+          <dd class="break-word">{{ attestation.payload_hash }}</dd>
+        </div>
+      </dl>
+    </section>
+  </div>
+{% endblock %}

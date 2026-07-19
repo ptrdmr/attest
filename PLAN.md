@@ -84,3 +84,8 @@ hazard: billing)
   → fixed. Verifier (Composer, 34 surface tests) → Verifier-adversary (Grok)
   rejected once (softball locked-mutation asserts) → fixed → accepted. Gate
   (Fable): PASS. Full suite 81 tests green.
+- 2026-07-18: M3 executed. Builder (Sol) → Implementer-adversary (Sonnet)
+  rejected once (missing Surface tests; HomeView drive-by; already-signed UX)
+  → fixed. Verifier (Composer, +19 surface tests → 53) → Verifier-adversary
+  (Grok) rejected once (softball purpose-isolation GET) → fixed → accepted.
+  Gate (Fable): PASS.

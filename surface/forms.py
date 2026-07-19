@@ -43,5 +43,36 @@ class AcceptanceItemForm(forms.ModelForm):
         widgets = {"text": forms.Textarea(attrs={"rows": 2})}
 
 
+class DeliveryItemForm(forms.ModelForm):
+    """Validate delivery status and an optional evidence link."""
+
+    is_passed = forms.TypedChoiceField(
+        label="Delivery result",
+        choices=((True, "Passed"), (False, "Not passed")),
+        coerce=lambda value: value == "True",
+    )
+
+    class Meta:
+        """Expose only delivery fields on an active project."""
+
+        model = AcceptanceItem
+        fields = ("is_passed", "evidence_url")
+        widgets = {"evidence_url": forms.URLInput(attrs={"placeholder": "https://…"})}
+
+
+class SignatureForm(forms.Form):
+    """Validate the client's typed electronic signature."""
+
+    signature_name = forms.CharField(
+        label="Type your full name",
+        max_length=255,
+        strip=True,
+        widget=forms.TextInput(attrs={"autocomplete": "name"}),
+    )
+    confirm = forms.BooleanField(
+        label="I confirm this delivery record is accurate and sign it electronically."
+    )
+
+
 class ActionForm(forms.Form):
     """Validate an intentional POST action with no additional input."""

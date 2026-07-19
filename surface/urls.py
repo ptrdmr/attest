@@ -50,6 +50,21 @@ urlpatterns = [
         name="criteria-submit",
     ),
     path(
+        "projects/<int:project_pk>/delivery/<int:item_pk>/",
+        views.DeliveryItemUpdateView.as_view(),
+        name="delivery-item-update",
+    ),
+    path(
+        "projects/<int:project_pk>/deliver/",
+        views.MarkDeliveredView.as_view(),
+        name="mark-delivered",
+    ),
+    path(
+        "projects/<int:project_pk>/signing-link/",
+        views.SendSignLinkView.as_view(),
+        name="send-sign-link",
+    ),
+    path(
         "client/review/<path:token>/approve/",
         views.ClientApproveView.as_view(),
         name="client-approve",
@@ -61,9 +76,18 @@ urlpatterns = [
     ),
     path("client/review/<path:token>/", views.ClientReviewView.as_view(), name="client-review"),
     path(
+        "client/sign/<path:token>/",
+        views.ClientSignView.as_view(),
+        name="client-sign",
+    ),
+    path(
+        "u/<slug:handle>/",
+        views.PublicRecordView.as_view(),
+        name="public-record",
+    ),
+    path(
         "record/",
-        views.PlaceholderView.as_view(),
-        {"title": "Record"},
+        views.RecordRedirectView.as_view(),
         name="record",
     ),
     path(

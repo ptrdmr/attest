@@ -5,7 +5,7 @@ from django.core import signing
 from ledger.models import Project
 
 CLIENT_TOKEN_MAX_AGE = 14 * 24 * 60 * 60
-CLIENT_TOKEN_PURPOSES = frozenset({"review"})
+CLIENT_TOKEN_PURPOSES = frozenset({"review", "sign"})
 
 
 def _salt_for(purpose):

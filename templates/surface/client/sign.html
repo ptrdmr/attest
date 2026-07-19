@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Sign delivery record · Attest{% endblock %}
+{% block content %}
+  <div class="narrow">
+    <section class="card">
+      <p class="eyebrow">Electronic signature</p>
+      <h1>{{ project.title }}</h1>
+      <p>Review the delivery record below before signing.</p>
+    </section>
+    <section class="card">
+      <h2>Project brief</h2>
+      <p class="pre-line">{{ project.brief }}</p>
+      <h2>Delivery checklist</h2>
+      <ol class="delivery-record">
+        {% for item in acceptance_items %}
+          <li>
+            <p class="pre-line">{{ item.text }}</p>
+            <p>
+              <strong>{% if item.is_passed %}Passed{% else %}Not passed{% endif %}</strong>
+              {% if item.evidence_url %}
+                · <a class="break-word" href="{{ item.evidence_url }}" rel="noopener noreferrer">View evidence</a>
+              {% endif %}
+            </p>
+          </li>
+        {% endfor %}
+      </ol>
+    </section>
+    <section class="card">
+      <h2>Sign this record</h2>
+      <form method="post">
+        {% csrf_token %}
+        {{ form.as_p }}
+        <button type="submit">Sign delivery record</button>
+      </form>
+      <p class="muted">Your signature and signing time become part of the permanent attestation.</p>
+    </section>
+  </div>
+{% endblock %}

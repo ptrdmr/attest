@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ profile.display_name }} · Capability Record{% endblock %}
+{% block content %}
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Capability Record</p>
+      <h1>{{ profile.display_name }}</h1>
+      {% if profile.headline %}<p>{{ profile.headline }}</p>{% endif %}
+    </div>
+    {% if last_shipped %}
+      <p><span class="muted">Last shipped</span><br><strong>{{ last_shipped|date:"M j, Y" }}</strong></p>
+    {% endif %}
+  </div>
+
+  {% if disputed_count %}
+    <p class="dispute-notice" role="status">
+      {{ disputed_count }} signed record{{ disputed_count|pluralize }} currently
+      {% if disputed_count == 1 %}has{% else %}have{% endif %} an unresolved dispute
+      and {% if disputed_count == 1 %}is{% else %}are{% endif %} withheld from the verified record below.
+    </p>
+  {% endif %}
+
+  <section class="card">
+    <h2>Verified skills</h2>
+    <div class="tag-list">
+      {% for tag in capability_tags %}
+        <span class="tag">{{ tag.name }} · {{ tag.attested_count }}</span>
+      {% empty %}
+        <p class="muted">No verified skills yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section>
+    <h2>Signed attestations</h2>
+    <div class="stack">
+      {% for attestation in attestations %}
+        <article class="card">
+          <div class="record-heading">
+            <h3>{{ attestation.payload.title }}</h3>
+            <span class="badge">Verified</span>
+          </div>
+          <p>Signed {{ attestation.signed_at|date:"M j, Y" }}</p>
+          {% if attestation.project.skills_csv %}
+            <p><strong>Skills:</strong> {{ attestation.project.skills_csv }}</p>
+          {% endif %}
+          <dl>
+            <dt>SHA-256 record hash</dt>
+            <dd class="break-word record-hash">{{ attestation.payload_hash }}</dd>
+          </dl>
+        </article>
+      {% empty %}
+        <div class="card">
+          <p>No undisputed signed attestations are currently public.</p>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}

@@ -30,6 +30,52 @@
 
   {% include "surface/partials/criteria.html" %}
 
+  {% if project.status == "active" %}
+    <section class="card">
+      <h2>Delivery checklist</h2>
+      <p>Record the result for every criterion and add evidence links where available.</p>
+      <div class="stack">
+        {% for row in delivery_rows %}
+          <div class="delivery-item">
+            <p class="pre-line"><strong>{{ row.item.text }}</strong></p>
+            <form method="post" action="{% url 'surface:delivery-item-update' project.pk row.item.pk %}">
+              {% csrf_token %}
+              {{ row.form.as_p }}
+              <button class="secondary" type="submit">Save item</button>
+            </form>
+          </div>
+        {% empty %}
+          <p>No acceptance criteria are available.</p>
+        {% endfor %}
+      </div>
+    </section>
+    <section class="card">
+      <h2>Ready for client signature?</h2>
+      <p>Once delivered, the checklist is locked and the client receives a 14-day signing link.</p>
+      <form method="post" action="{% url 'surface:mark-delivered' project.pk %}">
+        {% csrf_token %}
+        <button type="submit" {% if not all_delivery_reviewed %}disabled{% endif %}>Mark delivered and send</button>
+      </form>
+    </section>
+  {% elif project.status == "delivered" %}
+    <section class="card">
+      <h2>Awaiting signature</h2>
+      <p>The delivery record was sent to the client for electronic signature.</p>
+      <form method="post" action="{% url 'surface:send-sign-link' project.pk %}">
+        {% csrf_token %}
+        <button class="secondary" type="submit">Resend signing link</button>
+      </form>
+    </section>
+  {% elif project.status == "attested" or project.status == "disputed" %}
+    <section class="card">
+      <h2>Capability Record</h2>
+      <p>
+        This project has a signed record.
+        <a href="{% url 'surface:public-record' project.owner.handle %}">View the public record</a>.
+      </p>
+    </section>
+  {% endif %}
+
   {% if project.status == "draft" %}
     <section class="card">
       <h2>Ready for client review?</h2>

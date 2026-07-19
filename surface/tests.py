@@ -1,4 +1,4 @@
-"""Verifier tests for the Surface layer (M2)."""
+"""Verifier tests for the Surface layer (M2 + M3)."""
 
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -9,7 +9,13 @@ from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 
 from ledger.models import AcceptanceItem, Profile, Project
-from ledger.services import approve_criteria, submit_criteria_for_approval
+from ledger.services import (
+    approve_criteria,
+    flag_dispute,
+    mark_delivered,
+    sign_attestation,
+    submit_criteria_for_approval,
+)
 from surface.auth import MAGIC_LOGIN_MAX_AGE, make_magic_login_token
 from surface.tokens import CLIENT_TOKEN_MAX_AGE, make_client_token, read_client_token
 
@@ -89,6 +95,56 @@ def login_path_from_outbox():
     """Return the path portion of the most recent magic-link email body."""
     body = mail.outbox[-1].body.strip()
     return urlparse(body).path
+
+
+def advance_to_active(project):
+    """Move a draft project to active through ledger services."""
+    project.refresh_from_db()
+    if project.status == Project.Status.DRAFT:
+        submit_criteria_for_approval(project)
+    if project.status == Project.Status.CRITERIA_PENDING:
+        approve_criteria(project)
+    project.refresh_from_db()
+    return project
+
+
+def mark_all_items_passed(project):
+    """Mark every acceptance item on the project as passed."""
+    project.acceptance_items.update(is_passed=True)
+
+
+def advance_to_delivered(project):
+    """Walk a project through services until it is delivered."""
+    advance_to_active(project)
+    mark_all_items_passed(project)
+    mark_delivered(project)
+    project.refresh_from_db()
+    return project
+
+
+def sign_project_via_service(project, *, client_name="Client Signer"):
+    """Sign a delivered project through ledger.services.sign_attestation."""
+    if project.status != Project.Status.DELIVERED:
+        advance_to_delivered(project)
+    mark_all_items_passed(project)
+    attestation = sign_attestation(
+        project,
+        project.client_email,
+        client_name,
+        {"user_agent": "Test/1.0", "ip_hash": "abc123def456"},
+    )
+    project.refresh_from_db()
+    return attestation
+
+
+def delivery_form_data(**overrides):
+    """Return valid POST data for DeliveryItemForm."""
+    data = {
+        "is_passed": "True",
+        "evidence_url": "https://example.com/evidence",
+    }
+    data.update(overrides)
+    return data
 
 
 class MagicLinkTests(TestCase):
@@ -675,3 +731,369 @@ class ClientApproveViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Thank you")
         self.assertContains(response, "These criteria were already handled.")
+
+
+class ClientTokenPurposeIsolationTests(TestCase):
+    """HTTP-level isolation between review and sign client tokens."""
+
+    def setUp(self):
+        """Active project with distinct review and sign tokens."""
+        self.project = make_draft_project()
+        submit_criteria_for_approval(self.project)
+        approve_criteria(self.project)
+        self.project.refresh_from_db()
+        self.review_token = make_client_token(self.project, "review")
+        self.sign_token = make_client_token(self.project, "sign")
+        self.client = Client()
+
+    def test_sign_token_cannot_open_client_review_page(self):
+        """A sign-purpose token yields 410 on the review page."""
+        response = self.client.get(
+            reverse("surface:client-review", kwargs={"token": self.sign_token})
+        )
+        self.assertEqual(response.status_code, 410)
+        self.assertContains(
+            response,
+            "This review link is no longer available",
+            status_code=410,
+        )
+
+    def test_sign_token_cannot_post_client_approve(self):
+        """A sign-purpose token yields 410 on criteria approval."""
+        response = self.client.post(
+            reverse("surface:client-approve", kwargs={"token": self.sign_token})
+        )
+        self.assertEqual(response.status_code, 410)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+
+    def test_sign_token_cannot_post_client_request_changes(self):
+        """A sign-purpose token yields 410 on the request-changes action."""
+        response = self.client.post(
+            reverse(
+                "surface:client-request-changes",
+                kwargs={"token": self.sign_token},
+            )
+        )
+        self.assertEqual(response.status_code, 410)
+
+    def test_review_token_cannot_open_client_sign_page(self):
+        """A review-purpose token yields 410 on the signing page."""
+        advance_to_delivered(self.project)
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.review_token})
+        )
+        self.assertEqual(response.status_code, 410)
+        self.assertContains(
+            response,
+            "This review link is no longer available",
+            status_code=410,
+        )
+
+    def test_review_token_cannot_post_client_sign(self):
+        """A review-purpose token yields 410 when posting a signature."""
+        advance_to_delivered(self.project)
+        response = self.client.post(
+            reverse("surface:client-sign", kwargs={"token": self.review_token}),
+            {
+                "signature_name": "Client Signer",
+                "confirm": "on",
+            },
+        )
+        self.assertEqual(response.status_code, 410)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+
+
+class DeliveryItemUpdateViewTests(TestCase):
+    """Freelancer delivery checklist updates on active projects."""
+
+    def setUp(self):
+        """One active project with a single acceptance item."""
+        self.owner = make_profile()
+        self.project = make_draft_project(owner=self.owner)
+        advance_to_active(self.project)
+        self.item = self.project.acceptance_items.get()
+        self.client = Client()
+
+    def test_owner_can_update_delivery_item_when_active(self):
+        """Owners may record pass/fail and evidence while the project is active."""
+        login_as(self.client, self.owner)
+        response = self.client.post(
+            reverse(
+                "surface:delivery-item-update",
+                kwargs={"project_pk": self.project.pk, "item_pk": self.item.pk},
+            ),
+            delivery_form_data(
+                is_passed="False",
+                evidence_url="https://example.com/not-passed",
+            ),
+        )
+        self.item.refresh_from_db()
+        self.assertFalse(self.item.is_passed)
+        self.assertEqual(self.item.evidence_url, "https://example.com/not-passed")
+        self.assertRedirects(
+            response,
+            reverse("surface:project-detail", kwargs={"project_pk": self.project.pk}),
+        )
+
+    def test_delivery_update_returns_404_when_not_active(self):
+        """Delivery updates are unavailable outside the active state."""
+        mark_delivered(self.project)
+        self.project.refresh_from_db()
+        login_as(self.client, self.owner)
+        response = self.client.post(
+            reverse(
+                "surface:delivery-item-update",
+                kwargs={"project_pk": self.project.pk, "item_pk": self.item.pk},
+            ),
+            delivery_form_data(),
+        )
+        self.assertEqual(response.status_code, 404)
+        self.item.refresh_from_db()
+        self.assertIsNone(self.item.is_passed)
+
+    def test_non_owner_delivery_update_returns_404(self):
+        """Non-owners cannot mutate another freelancer's delivery checklist."""
+        other = make_profile(handle="delivery-other")
+        login_as(self.client, other)
+        response = self.client.post(
+            reverse(
+                "surface:delivery-item-update",
+                kwargs={"project_pk": self.project.pk, "item_pk": self.item.pk},
+            ),
+            delivery_form_data(),
+        )
+        self.assertEqual(response.status_code, 404)
+        self.item.refresh_from_db()
+        self.assertIsNone(self.item.is_passed)
+
+
+class MarkDeliveredViewTests(TestCase):
+    """Marking an active project delivered and emailing the signing link."""
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_mark_delivered_requires_all_items_decided(self):
+        """Incomplete checklists stay active and do not send signing email."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        client = Client()
+        login_as(client, owner)
+        client.get(reverse("surface:project-detail", kwargs={"project_pk": project.pk}))
+
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk})
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.ACTIVE)
+        self.assertEqual(len(mail.outbox), 0)
+        follow = client.get(response.url)
+        self.assertContains(
+            follow,
+            "Review every delivery item before marking the project delivered.",
+        )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_mark_delivered_transitions_and_emails_sign_link(self):
+        """A fully reviewed checklist moves to delivered and emails /client/sign/."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        item = project.acceptance_items.get()
+        client = Client()
+        login_as(client, owner)
+        client.get(reverse("surface:project-detail", kwargs={"project_pk": project.pk}))
+        client.post(
+            reverse(
+                "surface:delivery-item-update",
+                kwargs={"project_pk": project.pk, "item_pk": item.pk},
+            ),
+            delivery_form_data(),
+        )
+
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk}),
+            follow=True,
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.DELIVERED)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("/client/sign/", mail.outbox[0].body)
+        self.assertEqual(mail.outbox[0].to, [project.client_email])
+        self.assertRedirects(
+            response,
+            reverse("surface:project-detail", kwargs={"project_pk": project.pk}),
+        )
+        self.assertContains(response, "Delivery recorded and sent for signature.")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_non_owner_cannot_mark_delivered(self):
+        """Another freelancer cannot mark a project delivered or trigger email."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        mark_all_items_passed(project)
+        other = make_profile()
+        client = Client()
+        login_as(client, other)
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk})
+        )
+        project.refresh_from_db()
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(project.status, Project.Status.ACTIVE)
+        self.assertEqual(len(mail.outbox), 0)
+
+
+class ClientSignViewTests(TestCase):
+    """Client signing of delivered projects via purpose-bound tokens."""
+
+    def setUp(self):
+        """Delivered project with a fresh sign token."""
+        self.project = make_draft_project()
+        advance_to_delivered(self.project)
+        self.sign_token = make_client_token(self.project, "sign")
+        self.client = Client()
+
+    def test_client_sign_happy_path_attests_and_shows_payload_hash(self):
+        """Valid signature posts through ledger and renders the record hash."""
+        response = self.client.post(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+            {
+                "signature_name": "Acme Authorized Signer",
+                "confirm": "on",
+            },
+        )
+        self.project.refresh_from_db()
+        attestation = self.project.attestations.get(is_current=True)
+        self.assertEqual(self.project.status, Project.Status.ATTESTED)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signature recorded")
+        self.assertContains(response, "Thank you")
+        self.assertContains(response, attestation.payload_hash)
+
+    def test_client_sign_missing_confirm_is_rejected(self):
+        """Signing without the confirmation checkbox does not create an attestation."""
+        response = self.client.post(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+            {"signature_name": "Acme Authorized Signer"},
+        )
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertFalse(self.project.attestations.exists())
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "This field is required")
+        self.assertContains(response, "Type your full name")
+
+    def test_client_sign_non_delivered_active_project_returns_410(self):
+        """Signing is unavailable before the project is marked delivered."""
+        reopen_project = make_draft_project()
+        advance_to_active(reopen_project)
+        token = make_client_token(reopen_project, "sign")
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": token})
+        )
+        self.assertEqual(response.status_code, 410)
+
+    def test_client_sign_already_attested_shows_signed_page(self):
+        """An already attested project shows the signed confirmation page."""
+        attestation = sign_project_via_service(self.project)
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token})
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Thank you")
+        self.assertContains(response, attestation.payload_hash)
+        self.assertNotContains(response, "Type your full name")
+
+    def test_client_sign_empty_signature_is_rejected(self):
+        """Blank signature names re-render the form with validation errors."""
+        response = self.client.post(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+            {
+                "signature_name": "",
+                "confirm": "on",
+            },
+        )
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "This field is required")
+        self.assertContains(response, "Type your full name")
+
+
+class PublicRecordViewTests(TestCase):
+    """Public capability record rendering without client secrets."""
+
+    def setUp(self):
+        """Profile with one clean attestation and one disputed attestation."""
+        self.owner = make_profile(handle="public-freelancer")
+        self.clean_project = make_draft_project(
+            owner=self.owner,
+            with_criteria=True,
+        )
+        self.clean_project.title = "Clean Public Project"
+        self.clean_project.save(update_fields=("title",))
+        self.clean_attestation = sign_project_via_service(
+            self.clean_project,
+            client_name="Clean Client Name",
+        )
+
+        self.disputed_project = make_draft_project(
+            owner=self.owner,
+            with_criteria=True,
+        )
+        self.disputed_project.title = "Disputed Public Project"
+        self.disputed_project.save(update_fields=("title",))
+        sign_project_via_service(
+            self.disputed_project,
+            client_name="Disputed Client Name",
+        )
+        flag_dispute(self.disputed_project)
+
+        self.review_token = make_client_token(self.clean_project, "review")
+        self.sign_token = make_client_token(self.clean_project, "sign")
+        self.client = Client()
+
+    def test_public_record_shows_clean_attestation_and_withholds_disputed(self):
+        """Public page lists clean attestations, hides disputed ones, and omits PII."""
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.clean_project.title)
+        self.assertContains(response, self.clean_attestation.payload_hash)
+        self.assertNotContains(response, self.disputed_project.title)
+        self.assertNotContains(response, self.clean_project.client_email)
+        self.assertNotContains(response, "Clean Client Name")
+        self.assertNotContains(response, "Disputed Client Name")
+        self.assertNotContains(response, self.review_token)
+        self.assertNotContains(response, self.sign_token)
+        self.assertContains(response, "dispute-notice")
+        self.assertContains(response, "1 signed record currently")
+        self.assertContains(response, "withheld from the verified record below")
+
+
+class RecordRedirectViewTests(TestCase):
+    """Authenticated redirect from dashboard record entry point."""
+
+    def test_logged_in_owner_redirects_to_public_record(self):
+        """Owners are sent to their public /u/<handle>/ capability record."""
+        owner = make_profile(handle="record-owner")
+        client = Client()
+        login_as(client, owner)
+        response = client.get(reverse("surface:record"))
+        self.assertRedirects(
+            response,
+            reverse("surface:public-record", kwargs={"handle": owner.handle}),
+        )
+
+    def test_anonymous_record_redirects_to_login(self):
+        """Unauthenticated visitors cannot use the dashboard record shortcut."""
+        response = Client().get(reverse("surface:record"))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("surface:login-request"), response.url)

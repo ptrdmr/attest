@@ -1,4 +1,4 @@
-"""HTTP views for authentication, projects, criteria, and client review."""
+"""HTTP views for projects, delivery, signing, and public records."""
 
 import smtplib
 
@@ -15,7 +15,7 @@ from django.views import View
 from django.views.generic import FormView, TemplateView
 
 from ledger import services
-from ledger.models import AcceptanceItem, Project
+from ledger.models import AcceptanceItem, Profile, Project
 
 from .auth import (
     ensure_profile,
@@ -23,7 +23,14 @@ from .auth import (
     make_magic_login_token,
     read_magic_login_token,
 )
-from .forms import AcceptanceItemForm, ActionForm, MagicLinkRequestForm, ProjectForm
+from .forms import (
+    AcceptanceItemForm,
+    ActionForm,
+    DeliveryItemForm,
+    MagicLinkRequestForm,
+    ProjectForm,
+    SignatureForm,
+)
 from .tokens import make_client_token, read_client_token
 
 
@@ -55,14 +62,35 @@ def _send_email(request, subject, body, recipient):
     return True
 
 
+def _send_signing_link(request, project):
+    """Email a purpose-bound signing URL without rendering its token."""
+    sign_token = make_client_token(project, "sign")
+    sign_url = request.build_absolute_uri(
+        reverse("surface:client-sign", kwargs={"token": sign_token})
+    )
+    return _send_email(
+        request,
+        subject="Sign the project delivery record",
+        body=sign_url,
+        recipient=project.client_email,
+    )
+
+
 def _project_context(project, **extra):
     """Build the common project-detail template context."""
+    delivery_rows = [
+        {"item": item, "form": DeliveryItemForm(instance=item)}
+        for item in project.acceptance_items.all()
+    ]
     context = {
         "project": project,
         "acceptance_items": project.acceptance_items.all(),
         "criteria_locked": services.criteria_locked(project),
         "acceptance_form": AcceptanceItemForm(),
         "action_form": ActionForm(),
+        "delivery_rows": delivery_rows,
+        "all_delivery_reviewed": bool(delivery_rows)
+        and all(row["item"].is_passed is not None for row in delivery_rows),
     }
     context.update(extra)
     return context
@@ -385,6 +413,89 @@ class SubmitCriteriaView(OwnedProjectMixin, View):
         )
 
 
+class DeliveryItemUpdateView(OwnedProjectMixin, View):
+    """Record delivery status and evidence for one active criterion."""
+
+    def project_is_accessible(self):
+        """Permit delivery updates only while the project is active."""
+        return self.project.status == Project.Status.ACTIVE
+
+    def post(self, request, project_pk, item_pk):
+        """Validate and persist the selected criterion's delivery result."""
+        item = get_object_or_404(
+            AcceptanceItem,
+            pk=item_pk,
+            project=self.project,
+        )
+        form = DeliveryItemForm(request.POST, instance=item)
+        if form.is_valid():
+            form.save()
+            messages.success(request, "Delivery item updated.")
+            return redirect("surface:project-detail", project_pk=self.project.pk)
+
+        delivery_rows = [
+            {
+                "item": candidate,
+                "form": form if candidate.pk == item.pk else DeliveryItemForm(instance=candidate),
+            }
+            for candidate in self.project.acceptance_items.all()
+        ]
+        return render(
+            request,
+            "surface/projects/detail.html",
+            _project_context(self.project, delivery_rows=delivery_rows),
+        )
+
+
+class MarkDeliveredView(OwnedProjectMixin, View):
+    """Mark a reviewed checklist delivered and email its signing link."""
+
+    def project_is_accessible(self):
+        """Permit delivery only from the active project state."""
+        return self.project.status == Project.Status.ACTIVE
+
+    def post(self, request, project_pk):
+        """Validate completion, transition through Ledger, and invite signing."""
+        form = ActionForm(request.POST)
+        items = self.project.acceptance_items.all()
+        if (
+            not form.is_valid()
+            or not items.exists()
+            or items.filter(is_passed__isnull=True).exists()
+        ):
+            messages.error(
+                request,
+                "Review every delivery item before marking the project delivered.",
+            )
+            return redirect("surface:project-detail", project_pk=self.project.pk)
+        try:
+            services.mark_delivered(self.project)
+        except services.InvalidTransition:
+            messages.error(request, "This project cannot be marked delivered now.")
+            return redirect("surface:project-detail", project_pk=self.project.pk)
+
+        if _send_signing_link(request, self.project):
+            messages.success(request, "Delivery recorded and sent for signature.")
+        return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
+class SendSignLinkView(OwnedProjectMixin, View):
+    """Resend a signing invitation for a delivered project."""
+
+    def project_is_accessible(self):
+        """Permit signing invitations only while awaiting signature."""
+        return self.project.status == Project.Status.DELIVERED
+
+    def post(self, request, project_pk):
+        """Validate the action and email a fresh expiring signing link."""
+        form = ActionForm(request.POST)
+        if not form.is_valid():
+            raise Http404
+        if _send_signing_link(request, self.project):
+            messages.success(request, "A fresh signing link was sent.")
+        return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
 class ClientTokenMixin:
     """Resolve a client token to a project or return a friendly gone page."""
 
@@ -453,6 +564,97 @@ class ClientRequestChangesView(ClientTokenMixin, View):
             "Please reply to the freelancer's email with the changes you need.",
         )
         return redirect("surface:client-review", token=token)
+
+
+class ClientSignView(ClientTokenMixin, View):
+    """Show and sign a delivered project through a purpose-bound token."""
+
+    token_purpose = "sign"
+    template_name = "surface/client/sign.html"
+
+    def get(self, request, token):
+        """Render the immutable delivery preview and signature form."""
+        if self.project.status == Project.Status.ATTESTED:
+            return self._already_signed(request)
+        if self.project.status != Project.Status.DELIVERED:
+            return _client_token_error(request)
+        return self._render(request, SignatureForm())
+
+    def post(self, request, token):
+        """Validate the typed signature and delegate signing to Ledger."""
+        if self.project.status == Project.Status.ATTESTED:
+            return self._already_signed(request)
+        if self.project.status != Project.Status.DELIVERED:
+            return _client_token_error(request)
+        form = SignatureForm(request.POST)
+        if not form.is_valid():
+            return self._render(request, form)
+        try:
+            attestation = services.sign_attestation(
+                project=self.project,
+                client_email=self.project.client_email,
+                client_name_typed=form.cleaned_data["signature_name"],
+                signature_meta={},
+            )
+        except services.InvalidTransition:
+            return _client_token_error(request)
+        return render(
+            request,
+            "surface/client/signed.html",
+            {"project": self.project, "attestation": attestation},
+        )
+
+    def _already_signed(self, request):
+        """Show a friendly confirmation when the project is already attested."""
+        attestation = self.project.attestations.filter(is_current=True).first()
+        return render(
+            request,
+            "surface/client/signed.html",
+            {"project": self.project, "attestation": attestation},
+        )
+
+    def _render(self, request, form):
+        """Render delivery evidence without exposing the signing token."""
+        return render(
+            request,
+            self.template_name,
+            {
+                "project": self.project,
+                "acceptance_items": self.project.acceptance_items.all(),
+                "form": form,
+            },
+        )
+
+
+class PublicRecordView(TemplateView):
+    """Render a freelancer's clean public attestations and dispute notice."""
+
+    template_name = "surface/record/detail.html"
+
+    def get_context_data(self, **kwargs):
+        """Build public record data through Ledger derivation services."""
+        context = super().get_context_data(**kwargs)
+        profile = get_object_or_404(Profile, handle=kwargs["handle"])
+        attestations = list(services.public_attestations(profile).order_by("-signed_at"))
+        context.update(
+            {
+                "profile": profile,
+                "attestations": attestations,
+                "capability_tags": profile.capability_tags.all(),
+                "last_shipped": attestations[0].signed_at if attestations else None,
+                "disputed_count": services.disputed_count(profile),
+            }
+        )
+        return context
+
+
+class RecordRedirectView(LoginRequiredMixin, View):
+    """Send a freelancer from the dashboard to their public record."""
+
+    def get(self, request):
+        """Resolve the current profile and redirect to its public URL."""
+        profile = ensure_profile(request.user)
+        return redirect("surface:public-record", handle=profile.handle)
 
 
 class PlaceholderView(LoginRequiredMixin, TemplateView):
