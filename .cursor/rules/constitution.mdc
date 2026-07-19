@@ -1,0 +1,28 @@
+---
+description: Non-negotiable project law - domain invariants, environment mechanics, and conduct floor for every agent
+alwaysApply: true
+---
+
+# Project Constitution (Non-Negotiables)
+
+- **Domain Law**
+  - Signed attestation payloads are immutable after signing: never UPDATE a signed `Attestation` row's payload or `payload_hash` — corrections are append-only amendments linked to the original
+  - Never log client PII beyond the email required for signature; never put client PII or attestation content into persisted AI prompt/response logs
+  - The public Capability Record must never present a disputed attestation as clean — dispute flag freezes or annotates public display until resolved
+  - AI-drafted briefs/criteria are never shown to a client until the freelancer's explicit human-confirm step; AI output is a draft, never a source of truth
+  - No secrets, API keys, Stripe keys, or magic-link/signing token values in code, fixtures, logs, or error messages
+  - Billing gates (Pro subscription / project pack) may not be bypassed or weakened except by an explicitly authorized plan
+
+- **Environment Mechanics**
+  - Default for all app/test commands (Windows, venv): `.\.venv\Scripts\python manage.py ...`
+  - Test suite: `.\.venv\Scripts\python manage.py test`
+  - Known environment trap: shell is PowerShell — Unix flags (`ls -la`), `&&` chaining in old PS versions, and unquoted paths with spaces fail; a bare `python` may resolve to a system install outside the venv ("Defaulting to user installation" means you are outside the venv)
+
+- **Conduct Floor (applies to every agent, every stance)**
+  - **Verify, don't assume.** There is no CI; a green run of `.\.venv\Scripts\python manage.py test` is the only evidence that exists
+  - **No change ships without Verifier-level tests** — tests that demonstrably CAN fail (revert the change → test fails). This applies on the fast path too
+  - **Stay inside declared file boundaries.** Work outside your brief's boundaries is a defect, not initiative
+  - **No schema/migration or auth-flow changes** unless the plan explicitly authorizes them
+  - **Clean your own campsite; don't renovate the neighborhood.** Remove dead code you created; log pre-existing mess as a Refit candidate instead of touching it
+  - **No new dependencies** without explicit approval
+  - Preserve unrelated code and comments — no side-effect changes or drive-by reformatting

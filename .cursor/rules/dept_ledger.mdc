@@ -1,0 +1,28 @@
+---
+description: Ledger Department - trust objects, attestation signing/hashing, and capability-record derivation (the product's source of truth)
+globs: **/models.py,**/migrations/**,**/services/**,**/attestations/**,**/ledger/**
+alwaysApply: false
+---
+
+# Ledger Department
+
+- **Territory & Key Files** (planned — update paths as the scaffold lands)
+  - `**/models.py` — User/Profile, Project (status machine: draft → criteria_pending → active → delivered → attested/disputed), AcceptanceItem, ChangeOrder, Attestation, CapabilityTag
+  - `**/services/**` — attestation signing, canonical-JSON serialization, SHA-256 hashing, capability-record derivation; business logic lives here, not in views
+  - `**/migrations/**` — schema changes require explicit plan authorization (constitution)
+
+- **Idioms**
+  - Attestation integrity: canonical JSON of criteria + delivery → SHA-256 → stored on the signature row at sign time; hash computed in one service function, never inline in views
+  - Project status transitions go through explicit service methods that validate the current state — never `project.status = X; save()` from a view
+  - Signed records are append-only: amendments are new rows linked to the original, never in-place updates
+  - Derived data (CapabilityTag, public record stats) is recomputed from attested projects — never hand-edited
+  - Validation lives in model `clean()` / service guard clauses; views trust the service layer
+
+- **Hazards**
+  - Anything touching a signed `Attestation` row is a hazard zone → full dispatch, gate applies
+  - Dispute state must propagate to public display — a Ledger change that alters status without checking public-record rendering is incomplete
+  - Timezone/timestamp integrity on `signed_at`: always timezone-aware UTC
+
+- **Verification**
+  - `.\.venv\Scripts\python manage.py test <app_label>` (scoped) then full suite
+  - Hash round-trip check: sign fixture payload → recompute hash from stored canonical JSON → must match stored `payload_hash`

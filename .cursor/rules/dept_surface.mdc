@@ -1,0 +1,30 @@
+---
+description: Surface Department - views, templates, urls, forms, magic-link auth, and Stripe/AI/S3 integration call sites
+globs: **/views.py,**/views/**,**/templates/**,**/urls.py,**/forms.py,**/static/**,**/integrations/**
+alwaysApply: false
+---
+
+# Surface Department
+
+- **Territory & Key Files** (planned — update paths as the scaffold lands)
+  - `**/views/**`, `**/urls.py` — class-based views preferred; thin views that call Ledger services
+  - `**/templates/**` — Django templates + HTMX; public Capability Record page is the flagship surface
+  - `**/forms.py` — all incoming data validated through forms; no raw `request.POST` reads in views
+  - `**/integrations/**` — Stripe Checkout/Portal, AI draft provider, S3 evidence storage; one module per provider
+
+- **Idioms**
+  - Client access is tokenized: magic links / signed tokens with expiry — clients never get accounts in MVP; token checks happen in a shared mixin/decorator, not per-view copies
+  - AI provider is draft-only: output lands in editable form fields with an explicit human-confirm step before any client-facing state change
+  - Errors to users are friendly and generic; details go to server logs (minus PII/tokens per constitution)
+  - Uploads enforce MIME/size limits at the form layer with friendly errors
+  - HTMX partials live beside their page templates; no inline scripts that would weaken CSP
+
+- **Hazards**
+  - Ledger territory is read-only from here — views call services, never mutate trust objects directly (that includes `.status` writes)
+  - Stripe webhook/redirect handlers and billing gates → full dispatch, gate applies
+  - Public Capability Record rendering must respect dispute-freeze state — do not cache it into staleness
+  - Magic-link token generation/validation is auth-flow code: changes require explicit plan authorization
+
+- **Verification**
+  - `.\.venv\Scripts\python manage.py test <app_label>` (scoped) then full suite
+  - Smoke: request public record page + one tokenized client view; assert 200 and no PII/tokens in rendered output

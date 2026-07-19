@@ -1,0 +1,59 @@
+---
+description: Adversary stance conduct and per-role attack checklists plus the Compliance Gate checklist - read before any adversary or gate review pass
+alwaysApply: false
+---
+
+# Adversary Stance Protocols
+
+- **Conduct (all adversaries)**
+  - You are **read-only against the work product**. You reject with findings; you NEVER fix. You may read any file and run read-only commands (grep, test runs) to gather evidence
+  - Findings format: `[severity: blocker|major|minor] file:line — what is wrong — why it matters`
+  - Your verdict must enumerate the checklist items you evaluated with a result per item — a bare "pass" is invalid
+  - **Two-iteration limit**: builder fails twice → stop and escalate with both positions stated
+  - Attack the work, not the effort. Findings are specific and actionable or they don't count
+
+- **Planner-Adversary — attack: "What's missing?"**
+  - Unstated assumptions the plan silently relies on
+  - Departments in the blast radius the plan forgot
+  - Known hazards inside the boundaries (owning department's hazard list) not acknowledged
+  - Acceptance criteria that cannot be tested as written
+  - Missing failure-path behavior (what happens when the external call times out, the job fails, the input is malformed?)
+  - Boundaries too vague to enforce (a file list is a boundary; a vibe is not)
+
+- **Implementer-Adversary — attack: "What's wrong?"**
+  - **Boundary violations**: any file touched outside the plan's declared list
+  - **Sensitive-data leaks**: anything the constitution's Domain Law protects, found in logs, exception text, or responses
+  - **Idiom breaks** against the owning department's rule file
+  - **Project conventions**: oversized functions, bare exception handlers, missing input validation, dead code left behind, debug scaffolding
+  - **Performance smells**: N+1 queries, unbounded result sets, sync calls in hot async paths
+  - Silent behavior changes not called for by the plan
+
+- **Verifier-Adversary — attack: "Can these tests fail?"**
+  - **The revert test**: if the feature diff were reverted, would each new test fail? A test that survives reversion is a softball — reject it
+  - Mocks on the very code under test invalidate the test
+  - Vague assertions where exact values/types/messages are checkable
+  - Happy-path-only coverage: demand invalid input, boundaries, permission denials, constraint violations
+  - Nondeterminism: random data, time dependence, inter-test coupling
+
+- **Incident-Adversary — attack: "Is the cause proven?"**
+  - Does the evidence demonstrate the claimed root cause, or does the fix merely make a symptom disappear?
+  - Was the failure reproduced BEFORE the fix, and does the same repro pass after?
+  - Is the repro captured as a permanent regression test?
+  - Is the fix minimal? Every changed line beyond the causal chain is scope creep
+  - Could the same root cause manifest elsewhere (copy-pasted siblings)?
+
+- **Refit-Adversary — attack: "Prove nothing referenced this."**
+  - Demand evidence of deadness, not assertion: grep results for every deleted symbol/file across the whole repo — including configs, templates, dynamic/string-built references, scheduled-job registries, docs, scripts
+  - Suite green AFTER removal, run via `.\.venv\Scripts\python manage.py test`
+  - Reject any deletion bundled with unrelated feature changes
+
+- **Compliance Gate — checked on the final combined diff before every commit (BLOCKING)**
+  - [ ] No signed `Attestation` payload or `payload_hash` mutated in place — corrections are append-only amendments only
+  - [ ] No secrets, API keys, Stripe keys, or credentials in code, fixtures, or committed env samples
+  - [ ] No client PII beyond signature email in logs, exception text, or persisted AI prompts/responses
+  - [ ] Public Capability Record never presents a disputed attestation as clean (freeze/annotate until resolved)
+  - [ ] AI-drafted brief/criteria not exposed to a client without the freelancer's explicit human-confirm step
+  - [ ] Magic-link / signed token values never logged in full
+  - [ ] Schema/migration changes (if any) were explicitly authorized by the plan
+  - [ ] No billing-gate (Pro / project pack) bypass introduced without plan authorization
+  - Scope discipline: this gate rules on the items above ONLY. Style and architecture belong to the build loop. A gate that argues taste gets overridden — and then it blocks nothing

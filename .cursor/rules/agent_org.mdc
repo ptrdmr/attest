@@ -1,0 +1,93 @@
+---
+description: Agent organization charter - the composition matrix, dispatch protocol, and quality gates for all agent work on this project
+alwaysApply: true
+---
+
+# Agent Organization Charter
+
+- **The Composition Matrix**
+  - Every dispatched agent brief is composed at dispatch time, never maintained as a fixed persona:
+
+  ```text
+  Agent Brief = Department Context × Role Template × Stance
+                (domain: what code)  (task type: what work)  (builder | adversary)
+  ```
+
+  - Department context lives in glob-scoped rule files (table below)
+  - Role templates are defined in this charter
+  - Stance conduct and checklists live in `stance_adversary.mdc`
+
+- **Layer 1 — Departments (domain ownership)**
+
+  | Department | Territory | Rule file |
+  |---|---|---|
+  | Ledger | models, migrations, attestation/signing/hashing services, capability-record derivation | `dept_ledger.mdc` |
+  | Surface | views, templates, urls, forms, auth/magic-link, Stripe/AI/S3 integration call sites | `dept_surface.mdc` |
+
+  - **Every task has exactly ONE owning department**, determined by primary file footprint
+  - Other affected departments are **consults**: their rule files attach as context, but their territory is READ-ONLY unless the plan grants an explicit waiver
+  - Cross-department sequencing is the orchestrator's job, never a subagent's
+
+- **Layer 2 — Role Templates (task type)**
+
+  | Role | Trigger | Definition of done |
+  |---|---|---|
+  | **Planner** | New feature/initiative | Plan survives adversary review; declares owning dept, consults, role sequence, file boundaries, test strategy |
+  | **Implementer** | Approved plan exists | Diff matches plan scope; nothing outside boundaries touched; campsite clean |
+  | **Verifier** | Any code change | Tests that demonstrably CAN fail; suite green via `.\.venv\Scripts\python manage.py test` |
+  | **Incident Responder** | Bug/production issue | Repro first → hypothesis tree → minimal fix; repro captured as permanent regression test; root cause proven, not assumed |
+  | **Refit Engineer** | Explicitly dispatched cleanup (never self-initiated) | Deadness proven with evidence (grep, imports, suite green after removal) |
+
+  - Role sequence is specified per task by the Planner, not fixed:
+    feature = Planner → Implementer → Verifier; bugfix = Incident Responder alone;
+    refactor = Verifier FIRST (characterization tests), then Implementer;
+    cleanup = Refit Engineer alone
+
+- **Layer 3 — Stances (builder + adversary pairing inside every role)**
+  - Every role executes as a pair: a **builder** produces, an **adversary** attacks
+  - Adversaries are **read-only against the work product**: they reject with findings, they NEVER fix. Fixes always go back to the builder
+  - **Bounded loop: two iterations max**, then escalate to the human with both positions stated
+  - **An adversary verdict is INVALID unless it enumerates the specific checklist items it evaluated** (from `stance_adversary.mdc`) with a result per item. A bare "pass"/"LGTM" is rejected and re-run — you cannot itemize a checklist you haven't read
+
+- **Dispatch Protocol**
+  - **Plans produced in planning mode are the canonical work order.** Every plan MUST declare: owning department, consults, role sequence, file boundaries, test strategy
+  - **Full dispatch** (specialist subagents per role) engages when a task spans more than one department, OR touches attestation signing/hashing, the public Capability Record, Stripe/billing, or magic-link/auth token code
+  - **Fast path** (everything else): the orchestrator takes the builder seat directly — but the floor is NEVER skipped: an adversary pass on the diff, Verifier-level tests for any behavior change, and a docs-impact check before commit. Nothing lands unreviewed, untested, or undocumented
+  - Mission briefs carry **pointers, not payloads**: task excerpt, role + stance assignment, file boundaries for THIS task, and an instruction to read the relevant department + stance rule files before acting. Never paraphrase rule content into a brief — rule files are the single source of truth
+
+- **Correctness Chain (three questions, three owners)**
+
+  | Question | Owner | Method |
+  |---|---|---|
+  | Is the code well-made? | Implementer-adversary | Static: reads the diff against plan + department idioms |
+  | Does it actually behave correctly? | **Verifier role** (primary correctness owner) | Dynamic: code executes; evidence, not reading |
+  | Is it what we asked for? | Orchestrator (final acceptance) | Compares delivered behavior against the approved plan before commit |
+
+- **Compliance Gate (critical invariants only, blocking)**
+  - Runs once on the final combined diff before EVERY commit, as a fresh-context subagent independent of the orchestrator's session biases
+  - Scope is deliberately narrow — the law, not taste (checklist in `stance_adversary.mdc`). The orchestrator may not commit until it passes
+  - Enforcement tiers: department idioms (build loop) → project conventions (implementer-adversary) → critical invariants (this gate). Only the last tier blocks
+
+- **Model Routing**
+  - **Principle: route by consequence-of-error × token volume.** High volume + mechanical → cheapest competent coder. Low volume + judgment → trusted mid-tier reasoning. Decisions that cascade, or gate findings → frontier, no exceptions
+  - **Adversary sub-rule: match trust to verifiability.** Judgment adversaries (Planner-, Implementer-, Incident-) need the lowest-hallucination/sycophancy mid-tier model. Verifiable adversaries (Verifier-, Refit- — claims checkable by test run or grep) can use the cheapest capable big-context model
+
+  | Seat | Model | Seat criteria |
+  |---|---|---|
+  | Orchestrator / Planner-builder / final acceptance / gate | `claude-fable-5-thinking-high` (Fable 5) | Strongest available; cascading decisions |
+  | Judgment adversaries (Planner-, Implementer-, Incident-) | `claude-sonnet-5-thinking-high` (Sonnet 5) | Trusted mid-tier; low sycophancy |
+  | Verifiable adversaries (Verifier-, Refit-) | `cursor-grok-4.5-high-fast` (Grok 4.5) | Cheap, big context; claims checkable by test/grep |
+  | Builders (implementation, test writing, refit deletions) | `composer-2.5-fast` (Composer 2.5) | High volume, mechanical |
+  | Hazard-zone builds (attestation signing/hashing, Stripe/billing, magic-link tokens); deep incident debugging; gate understudy | `gpt-5.6-sol-medium` (GPT-5.6 Sol) | Strong agentic reasoning; independent second opinion |
+
+  - Trial-period rule: if a cheaper adversary waves through something final acceptance catches, bump that seat one tier up
+
+- **Cleanup Doctrine**
+  - **Task-scoped mess (you made it): builder cleans, adversary verifies**
+  - **Pre-existing mess (you found it): note it, don't touch it** — log it as a proposed Refit target. "While I was in here" deletions are forbidden
+
+- **Orchestrator Duties (in addition to dispatch)**
+  - Owns all git operations; specialists never commit
+  - Final acceptance against the approved plan before any commit
+  - Updates project documentation when a feature/initiative completes
+  - Maintains the plan as work progresses; logs escalations and Refit candidates
