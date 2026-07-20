@@ -4,7 +4,7 @@ import hashlib
 import json
 
 from django.contrib.auth.models import User
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.test import TestCase
 
 from ledger.models import (
@@ -32,10 +32,12 @@ from ledger.services import (
     mark_delivered,
     propose_change_order,
     public_attestations,
+    recompute_capability_tags,
     reopen_active,
     resolve_dispute,
     sign_attestation,
     submit_criteria_for_approval,
+    verify_payload_hash,
 )
 
 
@@ -238,6 +240,21 @@ class StatusMachineTests(TestCase):
         project.refresh_from_db()
         self.assertEqual(project.status, Project.Status.ACTIVE)
 
+    def test_mark_delivered_rejects_failed_acceptance_item(self):
+        """An explicitly failed item keeps an active project out of delivery."""
+        project = make_project_with_items(status=Project.Status.ACTIVE)
+        items = list(project.acceptance_items.order_by("order"))
+        items[0].is_passed = True
+        items[0].save(update_fields=("is_passed",))
+        items[1].is_passed = False
+        items[1].save(update_fields=("is_passed",))
+
+        with self.assertRaises(InvalidTransition):
+            mark_delivered(project)
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.ACTIVE)
+
 
 class ChangeOrderServiceTests(TestCase):
     """Change-order proposal, decision, and delivery guards."""
@@ -396,6 +413,7 @@ class PayloadHashTests(TestCase):
             "title": "Golden Project",
             "brief": "Fixed brief",
             "revision_limit": 2,
+            "skills": ["django", "python"],
             "acceptance_items": [
                 {"text": "A", "is_passed": True, "evidence_url": ""},
             ],
@@ -477,6 +495,25 @@ class SignAttestationTests(TestCase):
                 "Signer",
                 safe_signature_meta(),
             )
+
+    def test_raises_when_any_acceptance_item_failed(self):
+        """is_passed=False on any item blocks signing."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        items = list(project.acceptance_items.order_by("order"))
+        items[0].is_passed = True
+        items[0].save(update_fields=("is_passed",))
+        items[1].is_passed = False
+        items[1].save(update_fields=("is_passed",))
+
+        with self.assertRaises(InvalidTransition):
+            sign_attestation(
+                project,
+                "signer@acme.com",
+                "Signer",
+                safe_signature_meta(),
+            )
+
+        self.assertFalse(project.attestations.exists())
 
     def test_requires_delivered_status(self):
         """Only delivered projects may be signed."""
@@ -617,6 +654,24 @@ class AttestationImmutabilityTests(TestCase):
         with self.assertRaises(ImmutableAttestation):
             self.project.attestations.update(payload_hash="0" * 64)
 
+    def test_instance_delete_raises_and_preserves_row(self):
+        """Instance deletion cannot remove a signed attestation."""
+        with self.assertRaises(ImmutableAttestation):
+            self.attestation.delete()
+        self.assertTrue(Attestation.objects.filter(pk=self.attestation.pk).exists())
+
+    def test_queryset_delete_raises_and_preserves_row(self):
+        """Manager queryset deletion cannot remove signed attestations."""
+        with self.assertRaises(ImmutableAttestation):
+            Attestation.objects.all().delete()
+        self.assertTrue(Attestation.objects.filter(pk=self.attestation.pk).exists())
+
+    def test_related_manager_delete_raises_and_preserves_row(self):
+        """Related-manager deletion cannot remove signed attestations."""
+        with self.assertRaises(ImmutableAttestation):
+            self.project.attestations.all().delete()
+        self.assertTrue(Attestation.objects.filter(pk=self.attestation.pk).exists())
+
     def test_flag_dispute_mutates_is_disputed_via_service(self):
         """Dispute markers are mutable through the flag_dispute service."""
         flag_dispute(self.project)
@@ -695,6 +750,22 @@ class AmendmentTests(TestCase):
                     is_current=True,
                 )
 
+    def test_amendment_snapshots_current_normalized_skills(self):
+        """An amendment signs current skills without rewriting the original."""
+        original_skills = self.original.payload["skills"]
+        self.project.skills_csv = "Fast API, Django, fast-api"
+        self.project.save(update_fields=("skills_csv", "updated_at"))
+
+        amendment = amend_attestation(
+            self.original,
+            "amended@acme.com",
+            "Amended Signer",
+            safe_signature_meta(),
+        )
+
+        self.assertEqual(original_skills, [])
+        self.assertEqual(amendment.payload["skills"], ["django", "fast-api"])
+
 
 class PublicDisplayTests(TestCase):
     """Public record queries respect dispute freeze and current-row rules."""
@@ -723,7 +794,7 @@ class PublicDisplayTests(TestCase):
     def test_public_attestations_excludes_disputed_row(self):
         """Disputed attestations are hidden from the public record."""
         flag_dispute(self.project)
-        self.assertEqual(public_attestations(self.profile).count(), 0)
+        self.assertEqual(len(public_attestations(self.profile)), 0)
 
     def test_public_attestations_excludes_non_current_row(self):
         """Superseded amendments do not appear in the public record."""
@@ -733,9 +804,9 @@ class PublicDisplayTests(TestCase):
             "Amended",
             safe_signature_meta(),
         )
-        public_ids = set(
-            public_attestations(self.profile).values_list("pk", flat=True)
-        )
+        public_ids = {
+            attestation.pk for attestation in public_attestations(self.profile)
+        }
         self.assertNotIn(self.attestation.pk, public_ids)
         self.assertEqual(len(public_ids), 1)
 
@@ -745,7 +816,7 @@ class PublicDisplayTests(TestCase):
         self.attestation.save(update_fields=("is_disputed",))
         self.project.refresh_from_db()
         self.assertEqual(self.project.status, Project.Status.ATTESTED)
-        self.assertEqual(public_attestations(self.profile).count(), 0)
+        self.assertEqual(len(public_attestations(self.profile)), 0)
 
     def test_project_status_filter_excludes_independently_of_is_disputed(self):
         """Disputed project status alone hides a clean attestation row."""
@@ -754,7 +825,7 @@ class PublicDisplayTests(TestCase):
         )
         self.attestation.refresh_from_db()
         self.assertFalse(self.attestation.is_disputed)
-        self.assertEqual(public_attestations(self.profile).count(), 0)
+        self.assertEqual(len(public_attestations(self.profile)), 0)
 
     def test_disputed_count_reflects_disputed_current_rows(self):
         """disputed_count tracks current rows flagged as disputed."""
@@ -764,11 +835,35 @@ class PublicDisplayTests(TestCase):
 
     def test_dispute_freeze_and_restore_on_public_record(self):
         """Attestation disappears on dispute and returns after resolve."""
-        self.assertEqual(public_attestations(self.profile).count(), 1)
+        self.assertEqual(len(public_attestations(self.profile)), 1)
         flag_dispute(self.project)
-        self.assertEqual(public_attestations(self.profile).count(), 0)
+        self.assertEqual(len(public_attestations(self.profile)), 0)
         resolve_dispute(self.project)
-        self.assertEqual(public_attestations(self.profile).count(), 1)
+        self.assertEqual(len(public_attestations(self.profile)), 1)
+
+    def test_tampered_payload_fails_hash_and_is_excluded_beside_clean_sibling(self):
+        """Raw database tampering cannot render as a verified public record."""
+        sibling_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            owner=self.profile,
+        )
+        sibling = sign_project(sibling_project)
+        tampered_payload = dict(self.attestation.payload)
+        tampered_payload["brief"] = "Database-tampered brief"
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE ledger_attestation SET payload = %s WHERE id = %s",
+                [json.dumps(tampered_payload), self.attestation.pk],
+            )
+        self.attestation.refresh_from_db()
+
+        self.assertFalse(verify_payload_hash(self.attestation))
+        self.assertTrue(verify_payload_hash(sibling))
+        self.assertEqual(
+            [attestation.pk for attestation in public_attestations(self.profile)],
+            [sibling.pk],
+        )
 
 
 class CapabilityTagTests(TestCase):
@@ -798,6 +893,30 @@ class CapabilityTagTests(TestCase):
             ("django", 1),
             ("htmx", 1),
         ])
+
+    def test_recompute_uses_signed_skills_after_live_project_skills_change(self):
+        """Capability tags remain tied to immutable signed skill data."""
+        attestation = sign_attestation(
+            self.project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+        self.assertEqual(attestation.payload["skills"], ["django", "htmx"])
+        self.project.skills_csv = "python"
+        self.project.save(update_fields=("skills_csv", "updated_at"))
+
+        recompute_capability_tags(self.profile)
+
+        self.assertEqual(
+            list(
+                CapabilityTag.objects.filter(profile=self.profile).values_list(
+                    "name",
+                    flat=True,
+                )
+            ),
+            ["django", "htmx"],
+        )
 
     def test_dispute_removes_capability_tags(self):
         """Disputing an attested project clears derived capability tags."""

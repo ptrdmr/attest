@@ -58,6 +58,8 @@ def mark_delivered(project):
         raise InvalidTransition(
             f"Cannot transition from {project.status} to {Project.Status.DELIVERED}."
         )
+    if project.acceptance_items.filter(is_passed=False).exists():
+        raise InvalidTransition("Every delivery item must pass before delivery.")
     if has_open_change_orders(project):
         raise InvalidTransition(
             "Proposed change orders must be resolved before delivery."
@@ -137,6 +139,17 @@ def decline_change_order(change_order):
     return _resolve_change_order(change_order, ChangeOrder.Status.DECLINED)
 
 
+def _normalized_skills(skills_csv):
+    """Return sorted unique skill slugs parsed from comma-separated input."""
+    return sorted(
+        {
+            slugify(tag.strip())
+            for tag in skills_csv.split(",")
+            if slugify(tag.strip())
+        }
+    )
+
+
 def canonical_payload(project):
     """Build the deterministic signed snapshot for a project."""
     acceptance_items = list(
@@ -156,6 +169,7 @@ def canonical_payload(project):
         "approved_change_orders": change_orders,
         "brief": project.brief,
         "revision_limit": project.revision_limit,
+        "skills": _normalized_skills(project.skills_csv),
         "title": project.title,
     }
 
@@ -169,6 +183,11 @@ def compute_payload_hash(payload: dict) -> str:
         ensure_ascii=True,
     )
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def verify_payload_hash(attestation) -> bool:
+    """Return whether a signed payload still matches its stored hash."""
+    return compute_payload_hash(attestation.payload) == attestation.payload_hash
 
 
 def _safe_signature_meta(signature_meta):
@@ -192,8 +211,8 @@ def sign_attestation(
     """Sign a delivered project snapshot and move it to attested."""
     if project.status != Project.Status.DELIVERED:
         raise InvalidTransition("Only delivered projects can be attested.")
-    if project.acceptance_items.filter(is_passed__isnull=True).exists():
-        raise InvalidTransition("All acceptance items must be verified.")
+    if project.acceptance_items.exclude(is_passed=True).exists():
+        raise InvalidTransition("Every acceptance item must pass before signing.")
 
     payload = canonical_payload(project)
     attestation = Attestation.objects.create(
@@ -287,11 +306,9 @@ def _tag_dates_by_name(profile):
         is_disputed=False,
     ).select_related("project")
     for attestation in attestations:
-        project_tags = {
-            slugify(tag.strip())
-            for tag in attestation.project.skills_csv.split(",")
-            if slugify(tag.strip())
-        }
+        if not verify_payload_hash(attestation):
+            continue
+        project_tags = set(attestation.payload.get("skills", []))
         for tag_name in project_tags:
             tag_dates[tag_name].append(attestation.signed_at)
     return tag_dates
@@ -317,12 +334,21 @@ def recompute_capability_tags(profile):
 
 def public_attestations(profile):
     """Return clean signed attestations safe for the public record."""
-    return Attestation.objects.filter(
-        project__owner=profile,
-        project__status=Project.Status.ATTESTED,
-        is_current=True,
-        is_disputed=False,
-    ).select_related("project")
+    candidates = (
+        Attestation.objects.filter(
+            project__owner=profile,
+            project__status=Project.Status.ATTESTED,
+            is_current=True,
+            is_disputed=False,
+        )
+        .select_related("project")
+        .order_by("-signed_at")
+    )
+    return [
+        attestation
+        for attestation in candidates
+        if verify_payload_hash(attestation)
+    ]
 
 
 def disputed_count(profile):

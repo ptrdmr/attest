@@ -145,7 +145,22 @@ Ledger read-only; hazard: signing flow, public record)
   guard; CSRF_TRUSTED_ORIGINS env; 4 fail-closed matrix tests in
   config/tests.py. Orchestrator fast-path adversary pass + Grok verifier
   ACCEPT (after softball fix).
+- 2026-07-19: M6b executed. Builder (Sol) completed all four items but its
+  session died on an API usage limit before reporting; orchestrator
+  recovered by verifying the finished diff directly (full suite 160 green,
+  +10) instead of re-dispatching. Implementer-adversary (Sonnet) ACCEPT
+  iter 1 — empirically verified PROTECT-vs-delete-guard cascade behavior
+  and exclude(is_passed=True) NULL semantics via generated SQL; one minor
+  (disputed_count not hash-aware). Verifier-adversary (Grok) ACCEPT — all
+  7 mutations forced expected failures; two minors (golden-hash fixture
+  alone doesn't pin the skills key; capability-tag order assertion relies
+  on insertion order). Gate + commit follow.
 - Refit/M7 candidates (new): shared CACHES backend (database or Redis)
   required before any multi-worker deploy; per-IP rate limiting on login
   request; CSRF-denial test (enforce_csrf_checks) for the confirm POST;
-  unused show_console_hint context key if still present after M6a.
+  unused show_console_hint context key if still present after M6a;
+  disputed_count/"withheld" UI notice not hash-tamper-aware; golden-hash
+  test could pin an independent literal digest; CapabilityTag assertions
+  could add explicit order_by; attestations signed pre-M6b carry no
+  "skills" payload key (dev data only — repair path if ever needed is a
+  client-re-signed amendment, never a payload edit).

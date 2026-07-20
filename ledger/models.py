@@ -138,7 +138,7 @@ class ChangeOrder(models.Model):
 
 
 class AttestationQuerySet(models.QuerySet):
-    """Block bulk updates that would rewrite signed attestation data."""
+    """Block bulk mutation or deletion of signed attestation data."""
 
     def update(self, **kwargs):
         """Apply a bulk update unless it targets immutable fields."""
@@ -148,6 +148,10 @@ class AttestationQuerySet(models.QuerySet):
                 "Signed attestation fields cannot be bulk-updated."
             )
         return super().update(**kwargs)
+
+    def delete(self):
+        """Reject bulk deletion of signed attestation rows."""
+        raise ImmutableAttestation("Signed attestations cannot be deleted.")
 
 
 class Attestation(models.Model):
@@ -214,6 +218,10 @@ class Attestation(models.Model):
                     "Signed attestation fields cannot be changed."
                 )
         return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        """Reject deletion of a signed attestation row."""
+        raise ImmutableAttestation("Signed attestations cannot be deleted.")
 
 
 class CapabilityTag(models.Model):

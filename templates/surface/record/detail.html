@@ -41,8 +41,8 @@
             <span class="badge">Verified</span>
           </div>
           <p>Signed {{ attestation.signed_at|date:"M j, Y" }}</p>
-          {% if attestation.project.skills_csv %}
-            <p><strong>Skills:</strong> {{ attestation.project.skills_csv }}</p>
+          {% if attestation.payload.skills %}
+            <p><strong>Skills:</strong> {{ attestation.payload.skills|join:", " }}</p>
           {% endif %}
           <dl>
             <dt>SHA-256 record hash</dt>

@@ -674,7 +674,9 @@ class MarkDeliveredView(OwnedProjectMixin, View):
         try:
             services.mark_delivered(self.project)
         except services.InvalidTransition:
-            if services.has_open_change_orders(self.project):
+            if items.filter(is_passed=False).exists():
+                message = "Every delivery item must pass before delivery."
+            elif services.has_open_change_orders(self.project):
                 message = "Resolve all proposed change orders before delivery."
             else:
                 message = "This project cannot be marked delivered now."
@@ -890,7 +892,7 @@ class PublicRecordView(TemplateView):
         """Build public record data through Ledger derivation services."""
         context = super().get_context_data(**kwargs)
         profile = get_object_or_404(Profile, handle=kwargs["handle"])
-        attestations = list(services.public_attestations(profile).order_by("-signed_at"))
+        attestations = services.public_attestations(profile)
         context.update(
             {
                 "profile": profile,

@@ -1221,6 +1221,29 @@ class MarkDeliveredViewTests(TestCase):
         self.assertContains(response, "Delivery recorded and sent for signature.")
 
     @override_settings(**LOCMem_EMAIL)
+    def test_mark_delivered_rejects_failed_item_with_clear_message(self):
+        """A failed checklist item blocks delivery and explains the policy."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        project.acceptance_items.update(is_passed=False)
+        client = Client()
+        login_as(client, owner)
+
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk}),
+            follow=True,
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.ACTIVE)
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertContains(
+            response,
+            "Every delivery item must pass before delivery.",
+        )
+
+    @override_settings(**LOCMem_EMAIL)
     def test_non_owner_cannot_mark_delivered(self):
         """Another freelancer cannot mark a project delivered or trigger email."""
         owner = make_profile()
@@ -1367,6 +1390,18 @@ class PublicRecordViewTests(TestCase):
         self.assertContains(response, "dispute-notice")
         self.assertContains(response, "1 signed record currently")
         self.assertContains(response, "withheld from the verified record below")
+
+    def test_public_record_displays_signed_skills_after_live_project_edit(self):
+        """Public skill text comes from the signed payload, not mutable project data."""
+        self.clean_project.skills_csv = "python"
+        self.clean_project.save(update_fields=("skills_csv", "updated_at"))
+
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertContains(response, "<strong>Skills:</strong> django", html=True)
+        self.assertNotContains(response, "<strong>Skills:</strong> python", html=True)
 
 
 class RecordRedirectViewTests(TestCase):
