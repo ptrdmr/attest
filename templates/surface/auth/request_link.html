@@ -3,7 +3,7 @@
 {% block content %}
   <section class="card narrow">
     <h1>Log in to Attest</h1>
-    <p>We will email you a secure link that expires in 15 minutes.</p>
+    <p>We will email you a secure link that expires in 60 minutes.</p>
     <form method="post">
       {% csrf_token %}
       {{ form.as_div }}

@@ -4,6 +4,14 @@
   <section class="card narrow">
     <h1>Check your email</h1>
     <p>If the address can receive mail, a login link is on its way.</p>
+    {% if dev_login_url %}
+      <p class="muted">
+        Development mode: do not copy the URL from the terminal (it is
+        MIME-encoded and will look like <code>token=3D…</code>). Use this
+        button instead:
+      </p>
+      <p><a class="button" href="{{ dev_login_url }}">Continue to Attest</a></p>
+    {% endif %}
     <a href="{% url 'surface:login-request' %}">Request another link</a>
   </section>
 {% endblock %}

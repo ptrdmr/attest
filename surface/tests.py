@@ -4,6 +4,7 @@ from unittest.mock import patch
 from urllib.parse import urlparse
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core import mail, signing
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
@@ -17,7 +18,7 @@ from ledger.services import (
     submit_criteria_for_approval,
 )
 from surface import billing
-from surface.auth import MAGIC_LOGIN_MAX_AGE, make_magic_login_token
+from surface.auth import MAGIC_LOGIN_MAX_AGE, MAGIC_LOGIN_SALT, make_magic_login_token
 from surface.tokens import (
     CLIENT_TOKEN_MAX_AGE,
     make_change_order_token,
@@ -112,9 +113,12 @@ def request_magic_link(client, email):
 
 
 def login_path_from_outbox():
-    """Return the path portion of the most recent magic-link email body."""
+    """Return path + query for the most recent magic-link email body."""
     body = mail.outbox[-1].body.strip()
-    return urlparse(body).path
+    parsed = urlparse(body)
+    if parsed.query:
+        return f"{parsed.path}?{parsed.query}"
+    return parsed.path
 
 
 def advance_to_active(project):
@@ -223,24 +227,186 @@ class HomeViewTests(TestCase):
 class MagicLinkTests(TestCase):
     """Passwordless freelancer login via signed email links."""
 
+    def setUp(self):
+        """Clear process-local auth counters and consumed-token markers."""
+        cache.clear()
+
+    def test_request_page_states_one_hour_expiry(self):
+        """The request page describes the configured 60-minute lifetime."""
+        response = Client().get(reverse("surface:login-request"))
+        self.assertContains(response, "expires in 60 minutes")
+
     @override_settings(**LOCMem_EMAIL)
     def test_request_email_then_valid_token_establishes_session(self):
-        """Requesting a link and visiting it logs the freelancer in."""
+        """Requesting and confirming a link logs the freelancer in."""
         client = Client()
         email = "freelancer@example.com"
 
         response = request_magic_link(client, email)
         self.assertRedirects(response, reverse("surface:login-sent"))
         self.assertEqual(len(mail.outbox), 1)
-        self.assertIn("/login/", mail.outbox[0].body)
+        self.assertIn("/login/confirm/", mail.outbox[0].body)
+        self.assertIn("token=", mail.outbox[0].body)
 
         login_path = login_path_from_outbox()
         response = client.get(login_path)
+        self.assertContains(response, "Confirm your login")
+        token = response.context["token"]
+        response = client.post(reverse("surface:magic-login"), {"token": token})
         self.assertRedirects(response, reverse("surface:project-list"))
 
         session = client.session
         user = get_user_model().objects.get(email=email)
         self.assertEqual(int(session["_auth_user_id"]), user.pk)
+
+    @override_settings(DEBUG=True)
+    def test_wrapped_token_whitespace_still_logs_in(self):
+        """DEBUG repairs wrapped token whitespace through confirmation."""
+        user = make_profile().user
+        token = make_magic_login_token(user)
+        wrapped = token[:12] + "\n " + token[12:]
+        client = Client()
+        response = client.get(
+            reverse("surface:magic-login"),
+            {"token": wrapped},
+        )
+        self.assertContains(response, "Confirm your login")
+        response = client.post(reverse("surface:magic-login"), {"token": wrapped})
+        self.assertRedirects(response, reverse("surface:project-list"))
+        self.assertEqual(int(client.session["_auth_user_id"]), user.pk)
+
+    @override_settings(DEBUG=True)
+    def test_quoted_printable_console_copy_still_logs_in(self):
+        """DEBUG repairs console MIME corruption through confirmation."""
+        user = make_profile().user
+        token = make_magic_login_token(user)
+        # Matches the corruption seen in runserver console output.
+        mangled = "3D" + token[:20] + "=" + token[20:]
+        client = Client()
+        response = client.get(
+            reverse("surface:magic-login"),
+            {"token": mangled},
+        )
+        self.assertContains(response, "Confirm your login")
+        response = client.post(reverse("surface:magic-login"), {"token": mangled})
+        self.assertRedirects(response, reverse("surface:project-list"))
+        self.assertEqual(int(client.session["_auth_user_id"]), user.pk)
+
+    @override_settings(DEBUG=False)
+    def test_quoted_printable_token_is_rejected_outside_debug(self):
+        """Production validation rejects console-only token repair."""
+        user = make_profile().user
+        token = make_magic_login_token(user)
+        mangled = "3D" + token[:20] + "=" + token[20:]
+        client = Client()
+        response = client.get(
+            reverse("surface:magic-login"),
+            {"token": mangled},
+        )
+        self.assertContains(response, "This login link is no longer available")
+        self.assertNotIn("_auth_user_id", client.session)
+
+    def test_valid_token_get_does_not_consume_before_post(self):
+        """Scanner-like GET validation leaves the token usable for confirmation."""
+        user = make_profile().user
+        token = make_magic_login_token(user)
+        login_url = reverse("surface:magic-login")
+        client = Client()
+
+        get_response = client.get(login_url, {"token": token})
+        self.assertContains(get_response, "Confirm your login")
+        self.assertNotIn("_auth_user_id", client.session)
+
+        post_response = client.post(login_url, {"token": token})
+        self.assertRedirects(post_response, reverse("surface:project-list"))
+        self.assertEqual(int(client.session["_auth_user_id"]), user.pk)
+
+    def test_magic_login_token_first_post_succeeds_second_post_fails(self):
+        """Only the first POST with a token can authenticate a session."""
+        user = make_profile().user
+        token = make_magic_login_token(user)
+        login_url = reverse("surface:magic-login")
+
+        first_client = Client()
+        first_response = first_client.post(login_url, {"token": token})
+        self.assertRedirects(first_response, reverse("surface:project-list"))
+
+        fresh_client = Client()
+        second_response = fresh_client.post(login_url, {"token": token})
+        self.assertContains(second_response, "This login link is no longer available")
+        self.assertNotIn("_auth_user_id", fresh_client.session)
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_new_link_after_consumption_logs_in(self):
+        """Requesting a fresh token after login produces another usable link."""
+        email = "repeat-login@example.com"
+        first_client = Client()
+        request_magic_link(first_client, email)
+        first_login_path = login_path_from_outbox()
+        first_confirm = first_client.get(first_login_path)
+        first_response = first_client.post(
+            reverse("surface:magic-login"),
+            {"token": first_confirm.context["token"]},
+        )
+        self.assertRedirects(first_response, reverse("surface:project-list"))
+
+        request_client = Client()
+        request_magic_link(request_client, email)
+        second_login_path = login_path_from_outbox()
+        self.assertNotEqual(second_login_path, first_login_path)
+
+        fresh_client = Client()
+        second_confirm = fresh_client.get(second_login_path)
+        second_response = fresh_client.post(
+            reverse("surface:magic-login"),
+            {"token": second_confirm.context["token"]},
+        )
+        self.assertRedirects(second_response, reverse("surface:project-list"))
+        self.assertIn("_auth_user_id", fresh_client.session)
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_sixth_request_is_silently_limited_per_email(self):
+        """The sixth request sends nothing while another email remains allowed."""
+        client = Client()
+        for _request_number in range(6):
+            response = request_magic_link(client, "limited@example.com")
+            self.assertRedirects(response, reverse("surface:login-sent"))
+        self.assertEqual(len(mail.outbox), 5)
+
+        response = request_magic_link(client, "other@example.com")
+        self.assertRedirects(response, reverse("surface:login-sent"))
+        self.assertEqual(len(mail.outbox), 6)
+        self.assertEqual(mail.outbox[-1].to, ["other@example.com"])
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_limited_request_does_not_create_unknown_user(self):
+        """A rate-limited unknown email is not persisted or emailed."""
+        from surface.views import _magic_link_request_allowed
+
+        email = "stranger@example.com"
+        for _ in range(5):
+            _magic_link_request_allowed(email)
+
+        response = request_magic_link(Client(), email)
+
+        self.assertRedirects(response, reverse("surface:login-sent"))
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertFalse(get_user_model().objects.filter(email=email).exists())
+
+    @override_settings(
+        DEBUG=True,
+        EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend",
+    )
+    def test_login_sent_shows_dev_continue_button_with_console_email(self):
+        """DEBUG + console email exposes a one-click login URL on the sent page."""
+        client = Client()
+        response = client.post(
+            reverse("surface:login-request"),
+            {"email": "devclick@example.com"},
+            follow=True,
+        )
+        self.assertContains(response, "Continue to Attest")
+        self.assertContains(response, "/login/confirm/?token=")
 
     def test_expired_magic_token_shows_link_error_without_session(self):
         """An expired token renders link_error and does not authenticate."""
@@ -254,7 +420,26 @@ class MagicLinkTests(TestCase):
             return_value=base_time + MAGIC_LOGIN_MAX_AGE + 1,
         ):
             response = client.get(
-                reverse("surface:magic-login", kwargs={"token": token})
+                reverse("surface:magic-login"),
+                {"token": token},
+            )
+        self.assertContains(response, "This login link is no longer available")
+        self.assertNotIn("_auth_user_id", client.session)
+
+    def test_expired_magic_token_post_shows_link_error_without_session(self):
+        """An expired token POST renders link_error and does not authenticate."""
+        user = make_profile().user
+        base_time = 1_700_000_000
+        with patch("django.core.signing.time.time", return_value=base_time):
+            token = make_magic_login_token(user)
+        client = Client()
+        with patch(
+            "django.core.signing.time.time",
+            return_value=base_time + MAGIC_LOGIN_MAX_AGE + 1,
+        ):
+            response = client.post(
+                reverse("surface:magic-login"),
+                {"token": token},
             )
         self.assertContains(response, "This login link is no longer available")
         self.assertNotIn("_auth_user_id", client.session)
@@ -266,17 +451,50 @@ class MagicLinkTests(TestCase):
         tampered = token[:-5] + ("x" if token[-5] != "x" else "y") + token[-4:]
         client = Client()
         response = client.get(
-            reverse("surface:magic-login", kwargs={"token": tampered})
+            reverse("surface:magic-login"),
+            {"token": tampered},
         )
         self.assertContains(response, "This login link is no longer available")
         self.assertNotIn("_auth_user_id", client.session)
 
     def test_malformed_magic_token_shows_link_error_without_session(self):
-        """Garbage token paths render link_error and do not authenticate."""
+        """Garbage tokens render link_error and do not authenticate."""
         client = Client()
         response = client.get(
-            reverse("surface:magic-login", kwargs={"token": "not-a-valid-token"})
+            reverse("surface:magic-login"),
+            {"token": "not-a-valid-token"},
         )
+        self.assertContains(response, "This login link is no longer available")
+        self.assertNotIn("_auth_user_id", client.session)
+
+    def test_missing_magic_token_shows_link_error_without_session(self):
+        """Confirm URL without a token query param does not authenticate."""
+        client = Client()
+        response = client.get(reverse("surface:magic-login"))
+        self.assertContains(response, "This login link is no longer available")
+        self.assertNotIn("_auth_user_id", client.session)
+
+    def test_post_missing_or_garbage_token_shows_link_error_without_session(self):
+        """POST confirmation rejects absent and malformed tokens."""
+        login_url = reverse("surface:magic-login")
+        for post_data in ({}, {"token": "not-a-valid-token"}):
+            with self.subTest(post_data=post_data):
+                client = Client()
+                response = client.post(login_url, post_data)
+                self.assertContains(
+                    response,
+                    "This login link is no longer available",
+                )
+                self.assertNotIn("_auth_user_id", client.session)
+
+    def test_signed_token_without_nonce_is_rejected(self):
+        """A correctly signed legacy payload without a nonce cannot log in."""
+        user = make_profile().user
+        token = signing.TimestampSigner(salt=MAGIC_LOGIN_SALT).sign(str(user.pk))
+        client = Client()
+
+        response = client.get(reverse("surface:magic-login"), {"token": token})
+
         self.assertContains(response, "This login link is no longer available")
         self.assertNotIn("_auth_user_id", client.session)
 

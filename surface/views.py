@@ -1,10 +1,15 @@
 """HTTP views for projects, delivery, signing, and public records."""
 
+from hashlib import sha256
 import smtplib
 
+from urllib.parse import urlencode
+
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import get_user_model, login, logout
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.core.cache import cache
 from django.core import signing
 from django.core.mail import send_mail
 from django.db import IntegrityError, transaction
@@ -22,7 +27,8 @@ from .auth import (
     ensure_profile,
     get_or_create_freelancer,
     make_magic_login_token,
-    read_magic_login_token,
+    read_and_consume_magic_login_token,
+    read_unconsumed_magic_login_token,
 )
 from .forms import (
     AcceptanceItemForm,
@@ -43,10 +49,27 @@ from .tokens import (
     read_client_token,
 )
 
+MAGIC_LINK_REQUEST_LIMIT = 5
+MAGIC_LINK_REQUEST_WINDOW = 60 * 60
+
 
 def _is_htmx(request):
     """Return whether a request asks for an HTMX fragment."""
     return request.headers.get("HX-Request") == "true"
+
+
+def _magic_link_request_allowed(email):
+    """Atomically count requests for one normalized email within an hour."""
+    normalized_email = email.strip().lower()
+    email_digest = sha256(normalized_email.encode("utf-8")).hexdigest()
+    cache_key = f"surface.magic-login.requests:{email_digest}"
+    if cache.add(cache_key, 1, timeout=MAGIC_LINK_REQUEST_WINDOW):
+        return True
+    try:
+        request_count = cache.incr(cache_key)
+    except ValueError:
+        return cache.add(cache_key, 1, timeout=MAGIC_LINK_REQUEST_WINDOW)
+    return request_count <= MAGIC_LINK_REQUEST_LIMIT
 
 
 def _owned_project(request, project_pk):
@@ -156,10 +179,16 @@ class MagicLinkRequestView(FormView):
 
     def form_valid(self, form):
         """Create the freelancer if needed and send a login URL only."""
-        user = get_or_create_freelancer(form.cleaned_data["email"])
+        email = form.cleaned_data["email"].strip().lower()
+        if not _magic_link_request_allowed(email):
+            self.request.session.pop("attest_dev_login_url", None)
+            return super().form_valid(form)
+        user = get_or_create_freelancer(email)
         token = make_magic_login_token(user)
+        # Query-param tokens survive terminal/email line wraps better than
+        # path segments that contain TimestampSigner colons.
         login_url = self.request.build_absolute_uri(
-            reverse("surface:magic-login", kwargs={"token": token})
+            reverse("surface:magic-login") + "?" + urlencode({"token": token})
         )
         if not _send_email(
             self.request,
@@ -168,6 +197,11 @@ class MagicLinkRequestView(FormView):
             recipient=user.email,
         ):
             return redirect("surface:login-request")
+        # Console email prints MIME quoted-printable (token=3D…, soft wraps).
+        # In DEBUG, offer a one-click link so local dogfooding does not depend
+        # on copying mangled terminal output.
+        if settings.DEBUG and settings.EMAIL_BACKEND.endswith("console.EmailBackend"):
+            self.request.session["attest_dev_login_url"] = login_url
         return super().form_valid(form)
 
 
@@ -176,14 +210,38 @@ class MagicLinkSentView(TemplateView):
 
     template_name = "surface/auth/link_sent.html"
 
+    def get_context_data(self, **kwargs):
+        """Expose a one-time DEBUG login URL when using the console email backend."""
+        context = super().get_context_data(**kwargs)
+        dev_login_url = self.request.session.pop("attest_dev_login_url", "")
+        context["dev_login_url"] = dev_login_url
+        context["show_console_hint"] = bool(dev_login_url)
+        return context
+
 
 class MagicLoginView(View):
-    """Authenticate a freelancer from a valid, unexpired signed token."""
+    """Confirm and consume a valid, unexpired freelancer login token."""
 
-    def get(self, request, token):
-        """Validate the token, establish a session, and redirect."""
+    def get(self, request):
+        """Validate without consuming, then show an explicit login confirmation."""
+        token = request.GET.get("token", "")
         try:
-            user = read_magic_login_token(token)
+            read_unconsumed_magic_login_token(token)
+        except signing.SignatureExpired:
+            return render(request, "surface/auth/link_error.html")
+        except (signing.BadSignature, get_user_model().DoesNotExist):
+            return render(request, "surface/auth/link_error.html")
+        return render(
+            request,
+            "surface/auth/login_confirm.html",
+            {"token": token},
+        )
+
+    def post(self, request):
+        """Consume the submitted token, establish a session, and redirect."""
+        token = request.POST.get("token", "")
+        try:
+            user = read_and_consume_magic_login_token(token)
         except signing.SignatureExpired:
             return render(request, "surface/auth/link_error.html")
         except (signing.BadSignature, get_user_model().DoesNotExist):

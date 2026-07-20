@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Confirm login · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <h1>Confirm your login</h1>
+    <p>Continue to securely log in to your Attest account.</p>
+    <form method="post">
+      {% csrf_token %}
+      <input type="hidden" name="token" value="{{ token }}">
+      <button type="submit">Continue to Attest</button>
+    </form>
+  </section>
+{% endblock %}
