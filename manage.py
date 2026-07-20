@@ -7,6 +7,8 @@ import sys
 def main():
     """Run administrative tasks."""
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+    # Dev CLI defaults to DEBUG; production serving paths (wsgi.py/asgi.py) stay fail-closed.
+    os.environ.setdefault("DJANGO_DEBUG", "1")
     try:
         from django.core.management import execute_from_command_line
     except ImportError as exc:

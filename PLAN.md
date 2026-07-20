@@ -69,6 +69,20 @@ Ledger read-only; hazard: signing flow, public record)
   criteria → human-confirm before client exposure
 - Tests: draft never client-visible pre-confirm; landing renders
 
+### M6 — Post-MVP hardening (audit remediation)
+- **M6a (owning: Surface; hazard: magic-link auth; full dispatch):** regularize
+  the previously ungoverned auth WIP — query-param confirm URL, POST-confirm
+  interstitial (scanner-prefetch safe), single-use tokens (sha256-keyed cache
+  consumption), mandatory nonce payloads, per-email rate limit (5/hour),
+  DEBUG-only QP token repair + one-click dev login, 60-min expiry + copy fix
+- **M6b (owning: Ledger; hazard: attestation rows; full dispatch; Surface
+  waiver: PublicRecordView/MarkDeliveredView messaging + record template):**
+  Attestation delete guard, read-time payload-hash verifier on public render,
+  skills snapshot into the signed payload, reject signing with failed items
+- **M6c (owning: Surface, config territory; fast path):** fail-closed prod
+  settings — DEBUG default 0 (manage.py keeps dev opt-in), ALLOWED_HOSTS
+  guard, CSRF_TRUSTED_ORIGINS env, settings fail-closed matrix tests
+
 ## Standing rules
 - Gate (fresh-context, Fable) runs on the final combined diff before EVERY commit
 - Orchestrator owns git; specialists never commit
@@ -102,3 +116,36 @@ Ledger read-only; hazard: signing flow, public record)
 - 2026-07-18: M5 landing + AI draft stub. Builder (Composer) → Implementer-
   adversary ACCEPT; Verifier (+8 surface tests) → Verifier-adversary ACCEPT;
   Gate PASS (AI generate preview-only until human confirm).
+- 2026-07-19: Full-stack audit (orchestrator + Ledger/Surface dept auditors).
+  Verdict: MVP architecture sound, no constitution violations in committed
+  code. Gaps → M6 plan: ungoverned auth WIP on disk, reusable bearer tokens,
+  failed-criteria attestation allowed, skills outside signed payload, no
+  read-time hash verify, fail-open DEBUG defaults. Auditor false positive
+  corrected at final acceptance: bulk_update does NOT bypass the Attestation
+  immutability guard (routes through QuerySet.update).
+- 2026-07-19: M6a executed (524e4b4). Sol iter 1 → Implementer-adversary
+  (Sonnet) REJECT: [blocker] LocMemCache is per-process so single-use +
+  rate-limit guarantees are per-worker; [major] scanner prefetch consumes
+  single-use tokens. Rulings: LocMem documented as accepted MVP risk —
+  production REQUIRES a shared CACHES backend (logged as M7 prerequisite);
+  scanner fix implemented as POST-confirm interstitial. Sol iter 2 → Sonnet
+  REJECT on a suspected nonce-test flake; orchestrator root-caused it to the
+  verifier's mutation (c) being live on disk during Sonnet's concurrent test
+  runs — code correct, ruling: accept. Verifier-adversary (Grok) rejected
+  twice across M6a/M6c (SECRET_KEY guard-masking softball; limiter test
+  mocking the gate under test) → fixed by Composer → ACCEPT. Full suite 150
+  green. Gate (fresh Fable): PASS 8/8.
+- Process lesson (orchestrator): never schedule the mutation-testing
+  verifier concurrently with another adversary that runs the suite —
+  mutations bleed into their runs as phantom flakes.
+- 2026-07-19: M6c executed. Builder (Composer): DJANGO_DEBUG default "0";
+  manage.py setdefault keeps dev/test ergonomics while WSGI/ASGI serving
+  paths fail closed (deliberate deviation from the plan's "env opt-in"
+  letter to preserve the canonical test command); ALLOWED_HOSTS RuntimeError
+  guard; CSRF_TRUSTED_ORIGINS env; 4 fail-closed matrix tests in
+  config/tests.py. Orchestrator fast-path adversary pass + Grok verifier
+  ACCEPT (after softball fix).
+- Refit/M7 candidates (new): shared CACHES backend (database or Redis)
+  required before any multi-worker deploy; per-IP rate limiting on login
+  request; CSRF-denial test (enforce_csrf_checks) for the confirm POST;
+  unused show_console_hint context key if still present after M6a.

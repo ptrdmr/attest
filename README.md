@@ -38,11 +38,22 @@ Lint/format:
 
 ## Environment variables
 
-| Variable | Purpose | Dev default |
+Development works out of the box via `manage.py` (it defaults `DJANGO_DEBUG=1`).
+Production serving (WSGI/ASGI) is fail-closed: set `DJANGO_SECRET_KEY` and
+`DJANGO_ALLOWED_HOSTS`; leave `DJANGO_DEBUG` unset or set `0`. Optionally set
+`DJANGO_CSRF_TRUSTED_ORIGINS` (comma-separated HTTPS origins) when using a
+reverse proxy or non-default host.
+
+Production deployments with multiple workers MUST configure a shared `CACHES`
+backend (for example, database or Redis), or single-use magic links and rate
+limits are per-process only.
+
+| Variable | Purpose | Dev default (`manage.py`) |
 |---|---|---|
-| `DJANGO_SECRET_KEY` | Session/signing key | insecure dev key |
-| `DJANGO_DEBUG` | `1`/`0` | `1` |
-| `DJANGO_ALLOWED_HOSTS` | Comma-separated hosts | empty |
+| `DJANGO_SECRET_KEY` | Session/signing key | insecure dev key when `DEBUG=1` |
+| `DJANGO_DEBUG` | `1`/`0` | `1` via `manage.py`; unset/`0` under WSGI |
+| `DJANGO_ALLOWED_HOSTS` | Comma-separated hosts | empty (required when `DEBUG=0`) |
+| `DJANGO_CSRF_TRUSTED_ORIGINS` | Comma-separated HTTPS origins | empty |
 | `DATABASE_URL` | `postgres://user:pass@host:port/name` | SQLite |
 | `EMAIL_HOST` (+ PORT/USER/PASSWORD/USE_TLS) | SMTP | console backend |
 | `DEFAULT_FROM_EMAIL` | From address | `Attest <noreply@attest.local>` |
