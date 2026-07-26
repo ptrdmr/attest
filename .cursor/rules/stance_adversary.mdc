@@ -34,6 +34,7 @@ alwaysApply: false
   - Vague assertions where exact values/types/messages are checkable
   - Happy-path-only coverage: demand invalid input, boundaries, permission denials, constraint violations
   - Nondeterminism: random data, time dependence, inter-test coupling
+  - **Mutation checks require an exclusive tree**: no other agent may run tests or edit files while mutations are live — the orchestrator sequences accordingly. Live mutations bleeding into a concurrent agent's suite runs manifest as phantom flakes (observed 2026-07-19: a verifier mutation mid-flight caused a false REJECT and near-escalation in a parallel adversary review). Every mutation is restored byte-exact immediately after its check, with `git status`/`git diff --stat` proof at the end
 
 - **Incident-Adversary — attack: "Is the cause proven?"**
   - Does the evidence demonstrate the claimed root cause, or does the fix merely make a symptom disappear?

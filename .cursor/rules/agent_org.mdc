@@ -54,6 +54,8 @@ alwaysApply: true
   - **Full dispatch** (specialist subagents per role) engages when a task spans more than one department, OR touches attestation signing/hashing, the public Capability Record, Stripe/billing, or magic-link/auth token code
   - **Fast path** (everything else): the orchestrator takes the builder seat directly — but the floor is NEVER skipped: an adversary pass on the diff, Verifier-level tests for any behavior change, and a docs-impact check before commit. Nothing lands unreviewed, untested, or undocumented
   - Mission briefs carry **pointers, not payloads**: task excerpt, role + stance assignment, file boundaries for THIS task, and an instruction to read the relevant department + stance rule files before acting. Never paraphrase rule content into a brief — rule files are the single source of truth
+  - **Parallel milestones must assign every shared file to exactly one milestone's boundary at dispatch** (README, urls, settings, shared templates). A file claimed by two concurrent briefs is a dispatch defect — resolve ownership before launching, not at commit time
+  - **If a builder session dies mid-task, the working tree is the work product, not the report.** The orchestrator assesses the diff and test state before re-dispatching; completed work goes straight to adversary review instead of being rebuilt
 
 - **Correctness Chain (three questions, three owners)**
 
@@ -81,6 +83,7 @@ alwaysApply: true
   | Hazard-zone builds (attestation signing/hashing, Stripe/billing, magic-link tokens); deep incident debugging; gate understudy | `gpt-5.6-sol-medium` (GPT-5.6 Sol) | Strong agentic reasoning; independent second opinion |
 
   - Trial-period rule: if a cheaper adversary waves through something final acceptance catches, bump that seat one tier up
+  - **No silent seat substitution in hazard zones**: if a seat's model becomes unavailable mid-task (API limit, outage), the task STOPS — infrastructure auto-switching to a fallback model does not transfer the seat's authority. The orchestrator re-routes deliberately (same family/tier substitute, or direct orchestrator verification of already-completed work). Output produced by an auto-substituted model in a hazard zone is treated as unreviewed
 
 - **Cleanup Doctrine**
   - **Task-scoped mess (you made it): builder cleans, adversary verifies**
