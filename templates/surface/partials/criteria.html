@@ -1,13 +1,13 @@
 <section class="card" id="criteria-panel">
   <h2>Acceptance criteria</h2>
-  <div class="stack">
-    {% for item in acceptance_items %}
-      <article class="criterion" id="criterion-{{ item.pk }}">
-        <div>
-          <strong>{{ item.order }}.</strong>
-          <span class="pre-line">{{ item.text }}</span>
-        </div>
-        {% if not criteria_locked %}
+  {% if not criteria_locked %}
+    <div class="stack">
+      {% for item in acceptance_items %}
+        <article class="criterion" id="criterion-{{ item.pk }}">
+          <div>
+            <strong>{{ item.order }}.</strong>
+            <span class="pre-line">{{ item.text }}</span>
+          </div>
           <div class="actions">
             <button
               class="secondary"
@@ -27,13 +27,11 @@
               <button class="danger secondary" type="submit">Delete</button>
             </form>
           </div>
-        {% endif %}
-      </article>
-    {% empty %}
-      <p>No acceptance criteria yet.</p>
-    {% endfor %}
-  </div>
-  {% if not criteria_locked %}
+        </article>
+      {% empty %}
+        <p>No acceptance criteria yet.</p>
+      {% endfor %}
+    </div>
     <form
       class="criterion-form"
       method="post"
@@ -46,7 +44,47 @@
       {{ acceptance_form.as_div }}
       <button type="submit">Add criterion</button>
     </form>
+  {% elif project.status == "active" %}
+    <p>Record the result for every criterion and add evidence links where available.</p>
+    <div class="stack">
+      {% for row in delivery_rows %}
+        <article class="delivery-item" id="criterion-{{ row.item.pk }}">
+          <p class="pre-line"><strong>{{ row.item.order }}.</strong> {{ row.item.text }}</p>
+          <form method="post" action="{% url 'surface:delivery-item-update' project.pk row.item.pk %}">
+            {% csrf_token %}
+            {{ row.form.as_p }}
+            <button class="secondary" type="submit">Save item</button>
+          </form>
+        </article>
+      {% empty %}
+        <p>No acceptance criteria are available.</p>
+      {% endfor %}
+    </div>
   {% else %}
+    <div class="stack">
+      {% for item in acceptance_items %}
+        <article class="criterion" id="criterion-{{ item.pk }}">
+          <div>
+            <strong>{{ item.order }}.</strong>
+            <span class="pre-line">{{ item.text }}</span>
+          </div>
+          <div class="delivery-result">
+            {% if item.is_passed %}
+              <span class="badge passed">Passed</span>
+            {% elif item.is_passed == False %}
+              <span class="badge failed">Not passed</span>
+            {% else %}
+              <span class="badge">Not reviewed</span>
+            {% endif %}
+            {% if item.evidence_url %}
+              <a class="break-word" href="{{ item.evidence_url }}" rel="noopener noreferrer">Evidence</a>
+            {% endif %}
+          </div>
+        </article>
+      {% empty %}
+        <p>No acceptance criteria yet.</p>
+      {% endfor %}
+    </div>
     <p class="muted">Criteria are read-only after client approval.</p>
   {% endif %}
 </section>

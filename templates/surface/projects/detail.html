@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ project.title }} · Attest{% endblock %}
+{% block main_class %}container wide{% endblock %}
 {% block content %}
   <div class="page-heading">
     <div>
@@ -18,134 +19,122 @@
     {% endif %}
   </div>
 
-  {% if project.status == "draft" %}
-    <section class="card ai-draft-panel">
-      <h2>Draft from email or Slack</h2>
-      <p class="muted">
-        Paste a thread to generate a draft brief and criteria. Nothing is saved until you confirm.
-      </p>
-      {% if ai_preview %}
-        <p class="notice" role="status">
-          Review and edit the draft below, then confirm to apply it to this project.
-        </p>
-        <form method="post" action="{% url 'surface:ai-draft-confirm' project.pk %}">
-          {% csrf_token %}
-          {{ ai_confirm_form.as_div }}
-          <div class="actions">
-            <button type="submit">Confirm and apply draft</button>
-            <a class="button secondary" href="{% url 'surface:project-detail' project.pk %}">Discard preview</a>
-          </div>
-        </form>
-      {% else %}
-        <form method="post" action="{% url 'surface:ai-draft-generate' project.pk %}">
-          {% csrf_token %}
-          {{ ai_dump_form.as_div }}
-          <button type="submit">Generate draft</button>
-        </form>
-      {% endif %}
-    </section>
-  {% endif %}
-
-  <section class="card">
-    <h2>Project brief</h2>
-    <p class="pre-line">{{ project.brief }}</p>
-    <dl class="details">
-      <div><dt>Client</dt><dd>{{ project.client_name }}</dd></div>
-      <div><dt>Skills</dt><dd>{{ project.skills_csv|default:"—" }}</dd></div>
-      <div><dt>Revision limit</dt><dd>{{ project.revision_limit }}</dd></div>
-    </dl>
-  </section>
-
-  {% include "surface/partials/criteria.html" %}
-
-  {% if project.status == "active" or change_orders %}
-    <section class="card">
-      <h2>Change orders</h2>
-      <div class="stack">
-        {% for change_order in change_orders %}
-          <div class="delivery-item">
-            <div class="page-heading">
-              <strong>{{ change_order.description }}</strong>
-              <span class="badge">{{ change_order.get_status_display }}</span>
-            </div>
-            <p>
-              {{ change_order.amount_cents }} cents ·
-              {{ change_order.timeline_days }} additional day{{ change_order.timeline_days|pluralize }}
+  <div class="project-layout">
+    <div class="project-column">
+      {% if project.status == "draft" %}
+        <section class="card ai-draft-panel">
+          <h2>Draft from email or Slack</h2>
+          <p class="muted">
+            Paste a thread to generate a draft brief and criteria. Nothing is saved until you confirm.
+          </p>
+          {% if ai_preview %}
+            <p class="notice" role="status">
+              Review and edit the draft below, then confirm to apply it to this project.
             </p>
-          </div>
-        {% empty %}
-          <p>No change orders have been proposed.</p>
-        {% endfor %}
-      </div>
-      {% if project.status == "active" %}
-        <h3>Propose a change</h3>
-        <p>The client will receive a private 14-day review link by email.</p>
-        <form method="post" action="{% url 'surface:change-order-create' project.pk %}">
-          {% csrf_token %}
-          {{ change_order_form.as_div }}
-          <button type="submit">Send change order</button>
-        </form>
-      {% endif %}
-    </section>
-  {% endif %}
-
-  {% if project.status == "active" %}
-    <section class="card">
-      <h2>Delivery checklist</h2>
-      <p>Record the result for every criterion and add evidence links where available.</p>
-      <div class="stack">
-        {% for row in delivery_rows %}
-          <div class="delivery-item">
-            <p class="pre-line"><strong>{{ row.item.text }}</strong></p>
-            <form method="post" action="{% url 'surface:delivery-item-update' project.pk row.item.pk %}">
+            <form method="post" action="{% url 'surface:ai-draft-confirm' project.pk %}">
               {% csrf_token %}
-              {{ row.form.as_p }}
-              <button class="secondary" type="submit">Save item</button>
+              {{ ai_confirm_form.as_div }}
+              <div class="actions">
+                <button type="submit">Confirm and apply draft</button>
+                <a class="button secondary" href="{% url 'surface:project-detail' project.pk %}">Discard preview</a>
+              </div>
             </form>
-          </div>
-        {% empty %}
-          <p>No acceptance criteria are available.</p>
-        {% endfor %}
-      </div>
-    </section>
-    <section class="card">
-      <h2>Ready for client signature?</h2>
-      <p>Once delivered, the checklist is locked and the client receives a 14-day signing link.</p>
-      {% if has_open_change_orders %}
-        <p class="notice">Resolve all proposed change orders before delivery.</p>
+          {% else %}
+            <form method="post" action="{% url 'surface:ai-draft-generate' project.pk %}">
+              {% csrf_token %}
+              {{ ai_dump_form.as_div }}
+              <button type="submit">Generate draft</button>
+            </form>
+          {% endif %}
+        </section>
       {% endif %}
-      <form method="post" action="{% url 'surface:mark-delivered' project.pk %}">
-        {% csrf_token %}
-        <button type="submit" {% if not all_delivery_reviewed or has_open_change_orders %}disabled{% endif %}>Mark delivered and send</button>
-      </form>
-    </section>
-  {% elif project.status == "delivered" %}
-    <section class="card">
-      <h2>Awaiting signature</h2>
-      <p>The delivery record was sent to the client for electronic signature.</p>
-      <form method="post" action="{% url 'surface:send-sign-link' project.pk %}">
-        {% csrf_token %}
-        <button class="secondary" type="submit">Resend signing link</button>
-      </form>
-    </section>
-  {% elif project.status == "attested" or project.status == "disputed" %}
-    <section class="card">
-      <h2>Capability Record</h2>
-      <p>
-        This project has a signed record.
-        <a href="{% url 'surface:public-record' project.owner.handle %}">View the public record</a>.
-      </p>
-    </section>
-  {% endif %}
 
-  {% if project.status == "draft" %}
-    <section class="card">
-      <h2>Ready for client review?</h2>
-      <p>Confirm the brief and criteria before sending. The client will receive a 14-day review link.</p>
-      <form method="post" action="{% url 'surface:criteria-submit' project.pk %}">
-        {% csrf_token %}
-        <button type="submit">Send for approval</button>
-      </form>
-    </section>
-  {% endif %}
+      <section class="card">
+        <h2>Project brief</h2>
+        <p class="pre-line">{{ project.brief }}</p>
+        <dl class="details">
+          <div><dt>Client</dt><dd>{{ project.client_name }}</dd></div>
+          <div><dt>Skills</dt><dd>{{ project.skills_csv|default:"—" }}</dd></div>
+          <div><dt>Revision limit</dt><dd>{{ project.revision_limit }}</dd></div>
+        </dl>
+      </section>
+
+      {% if project.status == "active" or change_orders %}
+        <section class="card">
+          <h2>Change orders</h2>
+          <div class="stack">
+            {% for change_order in change_orders %}
+              <div class="delivery-item">
+                <div class="page-heading">
+                  <strong>{{ change_order.description }}</strong>
+                  <span class="badge">{{ change_order.get_status_display }}</span>
+                </div>
+                <p>
+                  {{ change_order.amount_cents }} cents ·
+                  {{ change_order.timeline_days }} additional day{{ change_order.timeline_days|pluralize }}
+                </p>
+              </div>
+            {% empty %}
+              <p>No change orders have been proposed.</p>
+            {% endfor %}
+          </div>
+          {% if project.status == "active" %}
+            <h3>Propose a change</h3>
+            <p>The client will receive a private 14-day review link by email.</p>
+            <form method="post" action="{% url 'surface:change-order-create' project.pk %}">
+              {% csrf_token %}
+              {{ change_order_form.as_div }}
+              <button type="submit">Send change order</button>
+            </form>
+          {% endif %}
+        </section>
+      {% endif %}
+
+      {% if project.status == "draft" %}
+        <section class="card">
+          <h2>Ready for client review?</h2>
+          <p>Confirm the brief and criteria before sending. The client will receive a 14-day review link.</p>
+          <form method="post" action="{% url 'surface:criteria-submit' project.pk %}">
+            {% csrf_token %}
+            <button type="submit">Send for approval</button>
+          </form>
+        </section>
+      {% elif project.status == "delivered" %}
+        <section class="card">
+          <h2>Awaiting signature</h2>
+          <p>The delivery record was sent to the client for electronic signature.</p>
+          <form method="post" action="{% url 'surface:send-sign-link' project.pk %}">
+            {% csrf_token %}
+            <button class="secondary" type="submit">Resend signing link</button>
+          </form>
+        </section>
+      {% elif project.status == "attested" or project.status == "disputed" %}
+        <section class="card">
+          <h2>Capability Record</h2>
+          <p>
+            This project has a signed record.
+            <a href="{% url 'surface:public-record' project.owner.handle %}">View the public record</a>.
+          </p>
+        </section>
+      {% endif %}
+    </div>
+
+    <div class="project-column">
+      {% include "surface/partials/criteria.html" %}
+
+      {% if project.status == "active" %}
+        <section class="card">
+          <h2>Ready for client signature?</h2>
+          <p>Once delivered, the checklist is locked and the client receives a 14-day signing link.</p>
+          {% if has_open_change_orders %}
+            <p class="notice">Resolve all proposed change orders before delivery.</p>
+          {% endif %}
+          <form method="post" action="{% url 'surface:mark-delivered' project.pk %}">
+            {% csrf_token %}
+            <button type="submit" {% if not all_delivery_reviewed or has_open_change_orders %}disabled{% endif %}>Mark delivered and send</button>
+          </form>
+        </section>
+      {% endif %}
+    </div>
+  </div>
 {% endblock %}

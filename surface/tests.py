@@ -182,6 +182,14 @@ def delivery_form_data(**overrides):
     return data
 
 
+def criteria_panel_html(response):
+    """Return the criteria panel section markup from a detail response."""
+    content = response.content.decode()
+    start = content.index('id="criteria-panel"')
+    end = content.index("</section>", start)
+    return content[start:end]
+
+
 def ai_dump_form_data(**overrides):
     """Return valid POST data for AiDumpForm."""
     data = {
@@ -1158,6 +1166,91 @@ class DeliveryItemUpdateViewTests(TestCase):
         self.assertEqual(response.status_code, 404)
         self.item.refresh_from_db()
         self.assertIsNone(self.item.is_passed)
+
+    def test_invalid_evidence_url_rerenders_error_inside_criteria_panel(self):
+        """A malformed evidence URL re-renders with the error inside the merged panel."""
+        login_as(self.client, self.owner)
+        response = self.client.post(
+            reverse(
+                "surface:delivery-item-update",
+                kwargs={"project_pk": self.project.pk, "item_pk": self.item.pk},
+            ),
+            delivery_form_data(evidence_url="not-a-url"),
+        )
+        self.assertEqual(response.status_code, 200)
+        panel = criteria_panel_html(response)
+        self.assertIn("Enter a valid URL.", panel)
+        self.assertContains(response, "Project brief")
+        self.item.refresh_from_db()
+        self.assertIsNone(self.item.is_passed)
+
+
+class ProjectDetailPanelTests(TestCase):
+    """Two-column detail layout and the merged criteria/delivery panel."""
+
+    def setUp(self):
+        """One owned project with a single criterion, viewed by its owner."""
+        self.owner = make_profile()
+        self.project = make_draft_project(owner=self.owner)
+        self.item = self.project.acceptance_items.get()
+        self.client = Client()
+        login_as(self.client, self.owner)
+
+    def get_detail(self):
+        """GET the project detail page as the owner."""
+        return self.client.get(
+            reverse("surface:project-detail", kwargs={"project_pk": self.project.pk})
+        )
+
+    def test_detail_uses_two_column_layout(self):
+        """The detail page renders the panelled grid inside the wide container."""
+        response = self.get_detail()
+        self.assertContains(response, 'class="container wide"')
+        self.assertContains(response, 'class="project-layout"')
+
+    def test_draft_detail_shows_criteria_editing_inside_layout_grid(self):
+        """Draft projects keep criteria CRUD in the panelled grid, with no delivery form."""
+        response = self.get_detail()
+        content = response.content.decode()
+        self.assertIn('class="project-layout"', content)
+        self.assertLess(
+            content.index('class="project-layout"'),
+            content.index('id="criteria-panel"'),
+        )
+        panel = criteria_panel_html(response)
+        self.assertIn("Add criterion", panel)
+        self.assertNotIn("Save item", panel)
+        self.assertNotContains(response, "Delivery checklist")
+
+    def test_active_detail_merges_delivery_form_into_criteria_panel(self):
+        """Active projects show the pass/evidence form inside the criteria panel."""
+        advance_to_active(self.project)
+        response = self.get_detail()
+        update_url = reverse(
+            "surface:delivery-item-update",
+            kwargs={"project_pk": self.project.pk, "item_pk": self.item.pk},
+        )
+        panel = criteria_panel_html(response)
+        self.assertIn(update_url, panel)
+        self.assertIn("Save item", panel)
+        self.assertIn("First criterion", panel)
+        self.assertNotContains(response, "Delivery checklist")
+        self.assertNotContains(response, "Add criterion")
+
+    def test_delivered_detail_shows_read_only_results_with_evidence(self):
+        """After delivery the panel lists results and evidence without forms."""
+        advance_to_active(self.project)
+        self.project.acceptance_items.update(
+            is_passed=True,
+            evidence_url="https://example.com/proof",
+        )
+        mark_delivered(self.project)
+        response = self.get_detail()
+        panel = criteria_panel_html(response)
+        self.assertIn("Passed", panel)
+        self.assertIn("https://example.com/proof", panel)
+        self.assertNotContains(response, "Save item")
+        self.assertContains(response, "Awaiting signature")
 
 
 class MarkDeliveredViewTests(TestCase):
