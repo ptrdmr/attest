@@ -20,6 +20,7 @@ flow; every signed attestation builds a public, portable **Capability Record**.
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python manage.py migrate
+.\.venv\Scripts\python manage.py createcachetable
 .\.venv\Scripts\python manage.py runserver
 ```
 
@@ -44,9 +45,17 @@ Production serving (WSGI/ASGI) is fail-closed: set `DJANGO_SECRET_KEY` and
 `DJANGO_CSRF_TRUSTED_ORIGINS` (comma-separated HTTPS origins) when using a
 reverse proxy or non-default host.
 
-Production deployments with multiple workers MUST configure a shared `CACHES`
-backend (for example, database or Redis), or single-use magic links and rate
-limits are per-process only.
+The cache is database-backed in every environment, because single-use magic
+links and per-email rate limits must hold across worker processes. Run
+`manage.py createcachetable` once per database — including a newly provisioned
+production database, and any existing local database created before the cache
+moved to this backend — or those code paths fail on a missing table.
+
+Single-use link consumption is safe under concurrency: the cache table keys on
+a primary key, so a racing second use loses the insert and is rejected. The
+rate-limit counter uses read-modify-write and is therefore approximate under
+heavy concurrency — it bounds abuse globally rather than enforcing an exact
+ceiling.
 
 | Variable | Purpose | Dev default (`manage.py`) |
 |---|---|---|

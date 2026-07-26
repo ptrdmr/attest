@@ -1,4 +1,4 @@
-"""Verifier tests for production fail-closed settings (M6c)."""
+"""Verifier tests for production fail-closed settings (M6c) and the shared cache (M7a)."""
 
 import importlib
 import os
@@ -78,3 +78,43 @@ class SettingsFailClosedTests(unittest.TestCase):
         self.assertTrue(settings.DEBUG)
         self.assertEqual(settings.SECRET_KEY, DEV_SECRET_KEY)
         self.assertTrue(settings.ATTEST_BILLING_STUB_MODE)
+
+
+class SharedCacheSettingsTests(unittest.TestCase):
+    """The default cache must be shared across worker processes."""
+
+    def setUp(self):
+        self._original_env = os.environ.copy()
+
+    def tearDown(self):
+        _restore_settings_env(self._original_env)
+
+    def assertSharedCache(self, settings):
+        """Assert the default cache is database-backed and large enough."""
+        # Single-use login markers and rate-limit counters live here; a
+        # process-local backend makes both guarantees per-worker fiction.
+        default_cache = settings.CACHES["default"]
+        self.assertEqual(
+            default_cache["BACKEND"],
+            "django.core.cache.backends.db.DatabaseCache",
+        )
+        self.assertEqual(settings.CACHE_TABLE_NAME, "attest_cache")
+        self.assertEqual(default_cache["LOCATION"], settings.CACHE_TABLE_NAME)
+        # Culling deletes expired rows first, then drops the unexpired
+        # remainder in cache_key order rather than by recency, so the ceiling
+        # must stay far above the working set or a live marker can be lost.
+        self.assertGreaterEqual(default_cache["OPTIONS"]["MAX_ENTRIES"], 10_000)
+
+    def test_production_cache_is_shared_across_processes(self):
+        self.assertSharedCache(
+            _reload_settings(
+                {
+                    "DJANGO_DEBUG": "0",
+                    "DJANGO_SECRET_KEY": "production-test-secret",
+                    "DJANGO_ALLOWED_HOSTS": "example.com",
+                }
+            )
+        )
+
+    def test_debug_cache_matches_the_production_backend(self):
+        self.assertSharedCache(_reload_settings({"DJANGO_DEBUG": "1"}))

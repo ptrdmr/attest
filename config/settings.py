@@ -88,6 +88,27 @@ def _database_from_env():
 
 DATABASES = {"default": _database_from_env()}
 
+# Single-use magic-link markers and per-email rate limits are stored in the
+# cache, so it must be shared across worker processes. The database backend is
+# the default everywhere (dev matches prod); run `manage.py createcachetable`
+# before first use.
+CACHE_TABLE_NAME = "attest_cache"
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": CACHE_TABLE_NAME,
+        "OPTIONS": {
+            # Culling deletes expired rows first, then drops the unexpired
+            # remainder in cache_key order — a hash, unrelated to recency. An
+            # undersized ceiling can therefore evict a live consumed-link
+            # marker and let a used magic link log in again inside its window.
+            "MAX_ENTRIES": 50000,
+            "CULL_FREQUENCY": 4,
+        },
+    }
+}
+
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},

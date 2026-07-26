@@ -1,10 +1,13 @@
 """Verifier tests for the Surface layer (M2 + M3 + M5)."""
 
+from hashlib import sha256
 from unittest.mock import patch
 from urllib.parse import urlparse
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.cache.backends.db import DatabaseCache
 from django.core import mail, signing
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
@@ -18,7 +21,12 @@ from ledger.services import (
     submit_criteria_for_approval,
 )
 from surface import billing
-from surface.auth import MAGIC_LOGIN_MAX_AGE, MAGIC_LOGIN_SALT, make_magic_login_token
+from surface.auth import (
+    MAGIC_LOGIN_MAX_AGE,
+    MAGIC_LOGIN_SALT,
+    make_magic_login_token,
+    read_and_consume_magic_login_token,
+)
 from surface.tokens import (
     CLIENT_TOKEN_MAX_AGE,
     make_change_order_token,
@@ -505,6 +513,41 @@ class MagicLinkTests(TestCase):
 
         self.assertContains(response, "This login link is no longer available")
         self.assertNotIn("_auth_user_id", client.session)
+
+
+class SharedCacheAuthTests(TestCase):
+    """Magic-link guarantees must survive across workers sharing only the database."""
+
+    def setUp(self):
+        """Clear auth counters and consumed-token markers."""
+        cache.clear()
+
+    def other_worker_cache(self):
+        """Return a cache client that shares nothing but the database table."""
+        return DatabaseCache(settings.CACHE_TABLE_NAME, {})
+
+    def test_consumed_login_marker_is_visible_to_another_worker(self):
+        """A token consumed on one worker is already spent for every other worker."""
+        from surface.auth import _magic_login_cache_key
+
+        token = make_magic_login_token(make_profile().user)
+        read_and_consume_magic_login_token(token)
+
+        marker = self.other_worker_cache().get(_magic_login_cache_key(token))
+        self.assertTrue(marker)
+
+    def test_rate_limit_counter_is_visible_to_another_worker(self):
+        """Per-email request counts accumulate globally rather than per process."""
+        from surface.views import _magic_link_request_allowed
+
+        email = "shared-limit@example.com"
+        _magic_link_request_allowed(email)
+
+        email_digest = sha256(email.encode("utf-8")).hexdigest()
+        counter = self.other_worker_cache().get(
+            f"surface.magic-login.requests:{email_digest}"
+        )
+        self.assertEqual(counter, 1)
 
 
 class ClientTokenTests(TestCase):

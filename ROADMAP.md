@@ -50,12 +50,13 @@ operations matters more than effort estimates.
   attestation cover when criteria arrive iteratively?).
 - There is uncommitted work in the tree (criteria panel merge, two-column detail layout,
   new tests). That should land or be shelved before any new initiative dispatches.
+  **Resolved 2026-07-26:** landed as 69c2833; the tree is clean.
 
 ## Recommended Sequence
 
 The dependency logic: **domain before venue, venue before decoration.**
 
-### Step 0 — Land the in-flight work
+### Step 0 — Land the in-flight work — DONE (69c2833)
 
 Commit the criteria-panel changes (after the usual adversary pass + green suite). Small,
 but it unblocks everything.
@@ -98,27 +99,47 @@ others. If run concurrently with Initiatives 1–2, the only shared files to ass
 dispatch are `surface/urls.py` and `base.html` nav — per the charter, those must belong
 to exactly one milestone's boundary.
 
-## Decisions Needed Before the First Planner Dispatches
+## Decisions — RULED 2026-07-26
 
-1. **Iterative criteria semantics:** does per-item submission *replace* package submit or
-   coexist with it? Does the client approve items one at a time, or in batches of "newly
-   submitted"? And when criteria arrive iteratively, is there one attestation at the end,
-   or per-milestone attestations? (The last one has append-only/immutability
-   consequences.)
-2. **Portal access model:** 14-day tokens won't work for a months-long project. Options:
-   a long-lived re-issuable portal token the freelancer can resend, or a lightweight
-   client identity keyed to `client_email` with its own magic-link flow. The second is
-   more work but is the honest answer if the portal becomes the client's main touchpoint.
-3. **Public profile default:** opt-in (record hidden until enabled) or opt-out (current
-   behavior, add a hide switch)? Opt-in is the safer privacy posture but changes behavior
-   for existing profiles.
-4. **Monetization placement:** branding and maybe the portal are the most Pro-shaped
-   features. Deciding now which are gated avoids retrofitting billing checks later.
+All four were put to the human and answered. The full ruling ledger, including three
+further rulings the first one exposed, lives in `PLAN.md` under "Next initiatives".
+
+1. **Iterative criteria semantics:** per-item submission *coexists* with package submit;
+   the client approves batches of newly-submitted items; one attestation at the end.
+   Per-milestone attestations were rejected for now — they are not a services tweak but
+   a schema initiative, because `unique_current_attestation_per_project` and three
+   services assume a single current attestation, and the capability-tag derivation would
+   inflate skill counts if several attestations shared one project.
+2. **Portal access model:** client identity keyed to `client_email` with its own
+   magic-link flow, reusing the hardened M6a machinery. Blocked on the shared cache.
+3. **Public profile default:** strict opt-in. Chosen partly because it is nearly free
+   today — all attestation data is dev-only, so the migration runs against an empty
+   table — and partly because the current behavior is worse than "opt-out": a profile
+   with a guessable handle is auto-created for any email typed into the login form.
+4. **Monetization placement:** no new billing gates until Stripe is real. Branding was
+   the natural Pro candidate; the portal was rejected as a gate because it serves the
+   freelancer's client, and charging for it penalizes the wrong party.
+
+### Rulings the first ruling exposed
+
+Letting criteria arrive during an active project raised three questions the original
+five goals did not anticipate. Suspension in particular replaced an all-or-nothing
+client verdict that would have reintroduced the very waterfall rigidity Initiative 1
+exists to remove.
+
+5. **Item states:** `draft → submitted → approved`, plus `suspended` (either party may
+   park an item, reversibly) and `withdrawn` (terminal).
+6. **Removal:** approved items are never hard-deleted; they become `withdrawn` and stay
+   in the signed payload carrying that state. Hard delete remains legal only for items
+   the client never approved.
+7. **Submitted items lock** against freelancer edits. This closes a pre-existing hole:
+   `criteria_locked` is false during `criteria_pending`, so today a freelancer can edit
+   criteria while the client holds a live review link, and `ClientApproveView` checks
+   nothing about what the client was actually shown.
 
 ## Next Maneuver
 
-Manage this one initiative at a time through the existing pipeline — Planner (with
-adversary review) → dispatch — starting with a Planner brief for iterative criteria
-submission once decision 1 is answered. Hold off writing plan documents until the four
-decisions above are ruled on, since three of them change the shape of Initiatives 1
-and 3 directly.
+Sequence is now M7a (shared cache — DONE) → M7b (public-record opt-in) → I1a/I1b
+(per-item criteria) → I2 (notes) → I3 (portal) → I4 (branding), with I5 (directory and
+search) parallelizable and owning `surface/urls.py` plus the `base.html` nav at
+dispatch. Milestone definitions and file boundaries are in `PLAN.md`.
