@@ -389,9 +389,20 @@ hazard: client tokens; full dispatch)
   of them normalised "rerun and it passed" — which is the corrosive outcome
   when a green suite is the only evidence this project has. The immutability
   guard itself is sound; the defect is a test that can silently apply no
-  mutation at all and still report success. **Promoted from Refit candidate
-  to a dedicated fix before the next initiative.** Fix is to set an explicitly
-  different timestamp rather than a second `timezone.now()`.
+  mutation at all and still report success.
+- 2026-07-26: flaky test FIXED (orchestrator, fast path, test-only). The
+  mutation is now derived from the stored value (`signed_at -= timedelta(
+  days=1)`) rather than read from the clock, so it is unconditional by
+  arithmetic. Mutation-proven: dropping `signed_at` from `IMMUTABLE_FIELDS`
+  fails the test with `ImmutableAttestation not raised`. Verifier-adversary
+  (Grok) ACCEPT, six checklist items PASS, and independently confirmed a
+  second mutation (a two-day soft-tolerance guard) is also caught.
+  One [minor] declined with reasons: the adversary suggested
+  `timedelta(microseconds=1)` as stricter against a hypothetical
+  tolerance-based guard. Rejected — a one-microsecond delta depends on
+  datetime precision surviving the round trip on both SQLite and Postgres,
+  and this fix exists to remove a precision-dependent flake. Reintroducing a
+  precision dependency to catch a guard nobody would write is a bad trade.
 - Refit/M7 candidates (earlier): per-IP rate limiting on login
   request; CSRF-denial test (enforce_csrf_checks) for the confirm POST;
   unused show_console_hint context key (confirmed still set in views.py and

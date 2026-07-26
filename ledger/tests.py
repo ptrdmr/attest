@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import timedelta
 
 from django.contrib.auth.models import User
 from django.db import IntegrityError, connection, transaction
@@ -761,9 +762,10 @@ class AttestationImmutabilityTests(TestCase):
 
     def test_save_raises_when_signed_at_changed(self):
         """Instance save blocks signed_at mutation."""
-        from django.utils import timezone
-
-        self.attestation.signed_at = timezone.now()
+        # Derive the new value from the stored one instead of reading the clock
+        # again: a same-tick timezone.now() can equal signed_at, leaving the row
+        # unmutated and the guard with nothing to reject.
+        self.attestation.signed_at -= timedelta(days=1)
         with self.assertRaises(ImmutableAttestation):
             self.attestation.save()
 
