@@ -39,6 +39,7 @@ from .forms import (
     ChangeOrderForm,
     DeliveryItemForm,
     MagicLinkRequestForm,
+    ProfileVisibilityForm,
     ProjectForm,
     SignatureForm,
 )
@@ -887,22 +888,68 @@ class PublicRecordView(TemplateView):
     """Render a freelancer's clean public attestations and dispute notice."""
 
     template_name = "surface/record/detail.html"
+    profile = None
+    is_owner = False
+
+    def dispatch(self, request, *args, **kwargs):
+        """Resolve visibility and hide unpublished records from non-owners."""
+        self.profile = get_object_or_404(Profile, handle=kwargs["handle"])
+        self.is_owner = request.user.is_authenticated and self.profile.user_id == request.user.pk
+        if not self.profile.is_public and not self.is_owner:
+            raise Http404
+        return super().dispatch(request, *args, **kwargs)
 
     def get_context_data(self, **kwargs):
         """Build public record data through Ledger derivation services."""
         context = super().get_context_data(**kwargs)
-        profile = get_object_or_404(Profile, handle=kwargs["handle"])
-        attestations = services.public_attestations(profile)
+        attestations = services.public_attestations(self.profile)
         context.update(
             {
-                "profile": profile,
+                "profile": self.profile,
                 "attestations": attestations,
-                "capability_tags": profile.capability_tags.all(),
+                "capability_tags": self.profile.capability_tags.all(),
                 "last_shipped": attestations[0].signed_at if attestations else None,
-                "disputed_count": services.disputed_count(profile),
+                "disputed_count": services.disputed_count(self.profile),
+                "is_owner": self.is_owner,
+                "visibility_form": ProfileVisibilityForm(
+                    initial={
+                        "intent": (
+                            "unpublish" if self.profile.is_public else "publish"
+                        )
+                    }
+                ),
             }
         )
         return context
+
+    def render_to_response(self, context, **response_kwargs):
+        """Prevent indexing when rendering an owner's unpublished preview."""
+        response = super().render_to_response(context, **response_kwargs)
+        if not self.profile.is_public:
+            response["X-Robots-Tag"] = "noindex"
+        return response
+
+
+class ProfileVisibilityView(View):
+    """Publish or unpublish a profile for its authenticated owner."""
+
+    profile = None
+
+    def dispatch(self, request, *args, **kwargs):
+        """Resolve the profile and conceal this action from every non-owner."""
+        self.profile = get_object_or_404(Profile, handle=kwargs["handle"])
+        if not request.user.is_authenticated or self.profile.user_id != request.user.pk:
+            raise Http404
+        return super().dispatch(request, *args, **kwargs)
+
+    def post(self, request, handle):
+        """Validate the action and delegate the visibility change to Ledger."""
+        form = ProfileVisibilityForm(request.POST)
+        if not form.is_valid():
+            raise Http404
+        is_public = form.cleaned_data["intent"] == "publish"
+        services.set_profile_visibility(self.profile, is_public)
+        return redirect("surface:public-record", handle=self.profile.handle)
 
 
 class RecordRedirectView(LoginRequiredMixin, View):

@@ -12,6 +12,23 @@
     {% endif %}
   </div>
 
+  {% if is_owner %}
+    <section class="card" aria-label="Record visibility">
+      {% if profile.is_public %}
+        <p><strong>Published</strong> — anyone with this link can view your Capability Record.</p>
+      {% else %}
+        <p role="status"><strong>Not published</strong> — only you can see this private preview.</p>
+      {% endif %}
+      <form method="post" action="{% url 'surface:profile-visibility' profile.handle %}">
+        {% csrf_token %}
+        {{ visibility_form.intent }}
+        <button type="submit">
+          {% if profile.is_public %}Unpublish record{% else %}Publish record{% endif %}
+        </button>
+      </form>
+    </section>
+  {% endif %}
+
   {% if disputed_count %}
     <p class="dispute-notice" role="status">
       {{ disputed_count }} signed record{{ disputed_count|pluralize }} currently

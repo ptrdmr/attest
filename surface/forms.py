@@ -80,6 +80,15 @@ class ChangeOrderDecisionForm(forms.Form):
     )
 
 
+class ProfileVisibilityForm(forms.Form):
+    """Validate an owner's explicit profile visibility intent."""
+
+    intent = forms.ChoiceField(
+        choices=(("publish", "Publish"), ("unpublish", "Unpublish")),
+        widget=forms.HiddenInput,
+    )
+
+
 class SignatureForm(forms.Form):
     """Validate the client's typed electronic signature."""
 

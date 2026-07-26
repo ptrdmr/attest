@@ -23,6 +23,15 @@ class InvalidSignatureMeta(Exception):
     """Indicate unsafe or unsupported signature metadata."""
 
 
+def set_profile_visibility(profile, is_public):
+    """Set a Profile's visibility from a boolean and return the saved Profile."""
+    if not isinstance(is_public, bool):
+        raise ValueError("is_public must be a boolean.")
+    profile.is_public = is_public
+    profile.save(update_fields=("is_public",))
+    return profile
+
+
 def _transition(project, expected_status, target_status):
     """Move a project between two explicitly permitted workflow states."""
     if project.status != expected_status:

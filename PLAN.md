@@ -96,10 +96,49 @@ Ledger read-only; hazard: signing flow, public record)
   DEBUG and production env; surface tests assert consumed-link markers and
   rate-limit counters are visible to a second cache client that shares only
   the database.
-- **M7b (owning: Ledger + Surface; hazard: public Capability Record; full
-  dispatch):** `Profile.is_public` defaulting to False, public record 404s
-  when hidden, `noindex` whenever not published. Schema authorized: one
-  Profile field. Role sequence: Sol → Sonnet → Composer → Grok → Gate.
+- **M7b — public-record opt-in (hazard: public Capability Record; full
+  dispatch).** Split by department because the charter allows exactly one
+  owning department per task; M4a/M4b precedent. Two orchestrator rulings the
+  human ruling did not cover: (a) the owner may always view their own record
+  even when unpublished — otherwise `/record/` and the project-detail "View
+  the public record" link 404 for every user on day one, since the default is
+  False; (b) the publish toggle lives on the record page itself, owner-only,
+  so no new nav is needed and `base.html` stays free for I5.
+  - **M7b-1 (owning: Ledger):** `Profile.is_public = BooleanField(default=
+    False)` plus migration `0002`; `set_profile_visibility(profile, is_public)`
+    service, because Surface may not write trust-object fields directly.
+    Schema authorized: this one field only. Boundaries: `ledger/models.py`,
+    `ledger/migrations/`, `ledger/services.py`, `ledger/tests.py`.
+    **Explicitly out of scope: do NOT change capability-tag derivation,
+    `public_attestations`, or any attestation code — visibility is a display
+    concern and must not alter what is attested or derived.** Tests: default
+    is False for new and auto-created profiles; the service flips both ways;
+    derivation output is unchanged by visibility.
+  - **M7b-2 (owning: Surface; consult: Ledger read-only):** `PublicRecordView`
+    404s for anonymous and non-owner viewers when unpublished, renders for the
+    owner with an unmistakable not-published state; owner-only POST toggle
+    calling the Ledger service. `noindex` is emitted as an `X-Robots-Tag`
+    response header rather than a `<meta>` tag: `base.html` has no head block,
+    so a meta tag would require editing a file reserved for I5, and the header
+    is set in the view (M7b-2's own territory), cannot be missed by a partial
+    render, and is directly assertable. The toggle POST must carry **explicit
+    publish/unpublish intent** rather than inverting current state: a blind
+    toggle is not idempotent, so a double-submit, back-button resubmit, or
+    replayed POST can silently republish a record the owner just took offline
+    — the exact accidental-publish direction this milestone exists to close.
+    Boundaries: `surface/views.py`, `surface/urls.py`, `surface/forms.py`
+    (boundary extended at iteration 2 to hold the intent form, since
+    `dept_surface.mdc` forbids raw `request.POST` reads in views),
+    `templates/surface/record/detail.html`, `surface/tests.py` — `base.html`
+    stays untouched.
+    Tests: anonymous 404 on private and 200 on public; non-owner 404 on
+    private; owner 200 on own private with the not-published marker;
+    `X-Robots-Tag: noindex` present only when unpublished; toggle flips the
+    flag for the owner and 404s for a non-owner; the Surface profile
+    auto-creation call site does not override the private default (moved here
+    from M7b-1, where it forced a Ledger→Surface import inversion).
+  - Role sequence: Sol (M7b-1) → Sonnet, then Sol (M7b-2) → Sonnet, then
+    Composer (Verifier) → Grok (Verifier-adversary) → Gate (Opus) → commit.
 
 ## Next initiatives — rulings of 2026-07-26
 
@@ -175,7 +214,7 @@ hazard: client tokens; full dispatch)
   nav belong to I5's boundary, not to any concurrent milestone.
 
 ## Standing rules
-- Gate (fresh-context, Fable) runs on the final combined diff before EVERY commit
+- Gate (fresh-context, Opus) runs on the final combined diff before EVERY commit
 - Orchestrator owns git; specialists never commit
 - Refit candidates and escalations logged here
 
@@ -283,6 +322,60 @@ hazard: client tokens; full dispatch)
   the cache table holds only SHA-256 digests (no PII, token, or secret
   recoverable from keys or values), that README's single-use claim matches
   what the code delivers, and that `attest_cache` is plan-authorized.
+- 2026-07-26: M7b executed, split M7b-1 (Ledger) / M7b-2 (Surface) because the
+  charter allows one owning department per task.
+  M7b-1: Sol → Implementer-adversary (Sonnet) REJECT iter 1 — [major]
+  `ledger/tests.py` imported `surface.auth`, inverting the department
+  dependency; the adversary proved by mutation that the test re-proved the
+  model default through a Surface call site rather than establishing a Ledger
+  property, so the coverage moved to M7b-2 where it belongs. Defect was in the
+  orchestrator's brief, not builder execution. [minor] guard idiom: dropped an
+  unprecedented `isinstance` on the primary entity and switched `TypeError` →
+  `ValueError` to match `propose_change_order`. Orchestrator ruling: iteration
+  2 accepted directly rather than re-running the adversary, since both fixes
+  were mechanical and verifiable by reading, and three downstream seats still
+  had the code.
+  M7b-2: Sol → Sonnet REJECT iter 1 — [blocker] the visibility POST inverted
+  current state instead of carrying intent, so a double-submit, back-button
+  resubmit, or replayed POST could silently republish a record the owner had
+  just taken offline. Fixed with `ProfileVisibilityForm` carrying explicit
+  publish/unpublish intent; boundary extended to `surface/forms.py` at
+  iteration 2 because `dept_surface.mdc` forbids raw `request.POST` reads.
+  Verifier (Composer, +6 tests → 190) closed `/record/`, the project-detail
+  record link, authenticated-non-owner-on-published, dispute-notice
+  interaction, preview fidelity, and migration reversibility.
+  Verifier-adversary (Grok) REJECT iter 1, two blockers, both real: (1) the
+  non-owner/anonymous POST test sent no `intent`, so form validation returned
+  404 before the ownership check ran — deleting the authorization gate
+  entirely left the test green while a non-owner posting a valid intent got a
+  302 and published someone else's record; (2) `make_profile` set
+  `username=handle`, making a wrong-identifier ownership comparison
+  (`handle == user.username`) indistinguishable from the correct
+  `user_id == user.pk` — in production `username` is the email, so that bug
+  would 404 real owners out of their own records. Fixed; `make_profile` is now
+  production-shaped and caused no unrelated failures. Full suite 190 green.
+  Gate (fresh Opus): PASS 8/8 — independently confirmed the migration adds
+  only the authorized field with no drift, that dispute-freeze display is
+  untouched and renders identically in the owner's preview, and that a private
+  record is indistinguishable from a nonexistent handle in production. Its
+  exposure sweep also ruled out a sitemap, robots view, JSON endpoint, other
+  handle-resolving route, and any caching middleware that could serve a
+  private preview to an anonymous visitor. Two non-blocking notes recorded:
+  under `DEBUG=1` the technical 404 page distinguishes "no such handle" from
+  "private record" via the exception message (production renders both
+  generically), and an owner GETting the visibility URL gets a 405 rather than
+  a 404, which discloses nothing to anyone but the owner.
+  Docs: README's claim that every attestation builds a *public* record was
+  made false by this milestone and was corrected at final acceptance.
+- Orchestrator rulings on M7b minors, accepted as-is with reasoning:
+  `ProfileVisibilityView` omits `LoginRequiredMixin` deliberately — a blanket
+  404 for anonymous and non-owner alike never signals resource existence,
+  which matters more for a privacy control than matching `OwnedProjectMixin`.
+  `test_anonymous_published_record_is_indexable` and
+  `test_authenticated_non_owner_sees_published_record_without_owner_controls`
+  both survive a full revert: each pins an actor whose experience this feature
+  intentionally leaves unchanged, so neither can be a revert-detector by
+  definition, and both were mutation-proven to catch real leakage regressions.
 - Refit candidates (new): three pre-existing ruff `I001` import-order errors
   in `surface/auth.py`, `surface/tests.py`, `surface/views.py` (`django.core`
   sorted after `django.core.cache`) — untouched per the cleanup doctrine,
@@ -292,10 +385,13 @@ hazard: client tokens; full dispatch)
   mutates `signed_at` with a second `timezone.now()` call, so the "mutation"
   is only real if the clock advanced between `setUp` and the test body — on
   Windows the system clock granularity makes an identical value reachable.
-  Observed failing once in three suite runs by the adversary; not reproduced
-  in the orchestrator's two runs. The immutability guard itself is sound —
-  this is a test that can silently apply no mutation. Fix is to set an
-  explicitly different timestamp rather than "now".
+  Now observed by two independent agents across the M7a and M7b runs, and one
+  of them normalised "rerun and it passed" — which is the corrosive outcome
+  when a green suite is the only evidence this project has. The immutability
+  guard itself is sound; the defect is a test that can silently apply no
+  mutation at all and still report success. **Promoted from Refit candidate
+  to a dedicated fix before the next initiative.** Fix is to set an explicitly
+  different timestamp rather than a second `timezone.now()`.
 - Refit/M7 candidates (earlier): per-IP rate limiting on login
   request; CSRF-denial test (enforce_csrf_checks) for the confirm POST;
   unused show_console_hint context key (confirmed still set in views.py and

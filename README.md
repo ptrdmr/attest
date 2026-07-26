@@ -4,7 +4,11 @@ Portable, signed proof that work shipped — AI-assisted or not — against clea
 acceptance criteria.
 
 Freelancers close fixed-price projects through a criteria → delivery → e-sign
-flow; every signed attestation builds a public, portable **Capability Record**.
+flow; every signed attestation builds a portable **Capability Record**.
+
+The Capability Record is private by default and published only when the
+freelancer explicitly opts in. Until then it 404s for everyone but its owner,
+who can preview it from `/record/`, and it carries `X-Robots-Tag: noindex`.
 
 ## Stack
 

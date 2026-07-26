@@ -76,7 +76,7 @@ alwaysApply: true
 
   | Seat | Model | Seat criteria |
   |---|---|---|
-  | Orchestrator / Planner-builder / final acceptance / gate | `claude-fable-5-thinking-high` (Fable 5) | Strongest available; cascading decisions |
+  | Orchestrator / Planner-builder / final acceptance / gate | `claude-opus-5-thinking-high` (Opus 5) | Strongest available; cascading decisions |
   | Judgment adversaries (Planner-, Implementer-, Incident-) | `claude-sonnet-5-thinking-high` (Sonnet 5) | Trusted mid-tier; low sycophancy |
   | Verifiable adversaries (Verifier-, Refit-) | `cursor-grok-4.5-high-fast` (Grok 4.5) | Cheap, big context; claims checkable by test/grep |
   | Builders (implementation, test writing, refit deletions) | `composer-2.5-fast` (Composer 2.5) | High volume, mechanical |

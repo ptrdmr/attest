@@ -5,7 +5,8 @@ import json
 
 from django.contrib.auth.models import User
 from django.db import IntegrityError, connection, transaction
-from django.test import TestCase
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TestCase, TransactionTestCase
 
 from ledger.models import (
     AcceptanceItem,
@@ -35,6 +36,7 @@ from ledger.services import (
     recompute_capability_tags,
     reopen_active,
     resolve_dispute,
+    set_profile_visibility,
     sign_attestation,
     submit_criteria_for_approval,
     verify_payload_hash,
@@ -120,6 +122,129 @@ def sign_project(project, client_email="signer@acme.com", client_name="Signer Na
         client_name,
         safe_signature_meta(),
     )
+
+
+class ProfileVisibilityTests(TestCase):
+    """Profile visibility defaults, service writes, and derivation isolation."""
+
+    def test_directly_created_profile_defaults_to_private(self):
+        """A Profile created without visibility is private by default."""
+        profile = make_profile()
+
+        self.assertIs(profile.is_public, False)
+        profile.refresh_from_db()
+        self.assertIs(profile.is_public, False)
+
+    def test_set_profile_visibility_persists_both_directions(self):
+        """The service publishes and unpublishes the same Profile."""
+        profile = make_profile()
+
+        returned = set_profile_visibility(profile, True)
+        profile.refresh_from_db()
+        self.assertEqual(returned.pk, profile.pk)
+        self.assertIs(profile.is_public, True)
+
+        set_profile_visibility(profile, False)
+        profile.refresh_from_db()
+        self.assertIs(profile.is_public, False)
+
+    def test_set_profile_visibility_rejects_invalid_inputs(self):
+        """The service requires a boolean visibility value."""
+        profile = make_profile()
+
+        with self.assertRaises(ValueError):
+            set_profile_visibility(profile, "public")
+
+    def test_visibility_does_not_change_derivation_or_public_attestations(self):
+        """Visibility never changes signed evidence or capability derivation."""
+        profile = make_profile()
+        project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="django, htmx",
+            owner=profile,
+        )
+        attestation = sign_project(project)
+        private_tags = list(
+            CapabilityTag.objects.filter(profile=profile)
+            .order_by("name")
+            .values_list("name", "attested_count", "last_attested_at")
+        )
+        private_attestation_ids = [
+            row.pk for row in public_attestations(profile)
+        ]
+
+        set_profile_visibility(profile, True)
+        recompute_capability_tags(profile)
+
+        public_tags = list(
+            CapabilityTag.objects.filter(profile=profile)
+            .order_by("name")
+            .values_list("name", "attested_count", "last_attested_at")
+        )
+        public_attestation_ids = [
+            row.pk for row in public_attestations(profile)
+        ]
+        self.assertEqual(public_tags, private_tags)
+        self.assertEqual(
+            public_attestation_ids,
+            private_attestation_ids,
+        )
+        self.assertEqual(public_attestation_ids, [attestation.pk])
+
+
+class ProfileIsPublicMigrationTests(TransactionTestCase):
+    """Migration 0002 adds reversible is_public with a private default."""
+
+    def test_0002_profile_is_public_applies_and_reverses(self):
+        """The is_public field can be applied forward and rolled back cleanly."""
+        executor = MigrationExecutor(connection)
+        app_label = "ledger"
+        initial_migration = "0001_initial"
+        visibility_migration = "0002_profile_is_public"
+        latest_migration = next(
+            name
+            for app, name in executor.loader.graph.leaf_nodes()
+            if app == app_label
+        )
+
+        def profile_columns():
+            with connection.cursor() as cursor:
+                cursor.execute("PRAGMA table_info(ledger_profile)")
+                return {row[1] for row in cursor.fetchall()}
+
+        executor.migrate([(app_label, initial_migration)])
+        initial_state = executor.loader.project_state((app_label, initial_migration))
+        InitialProfile = initial_state.apps.get_model(app_label, "Profile")
+        self.assertNotIn(
+            "is_public",
+            {field.name for field in InitialProfile._meta.get_fields()},
+        )
+        self.assertNotIn("is_public", profile_columns())
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, visibility_migration)])
+        applied_state = executor.loader.project_state((app_label, visibility_migration))
+        AppliedProfile = applied_state.apps.get_model(app_label, "Profile")
+        is_public_field = AppliedProfile._meta.get_field("is_public")
+        self.assertIs(is_public_field.default, False)
+        self.assertIn("is_public", profile_columns())
+
+        profile = make_profile()
+        profile.refresh_from_db()
+        self.assertIs(profile.is_public, False)
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, initial_migration)])
+        reversed_state = executor.loader.project_state((app_label, initial_migration))
+        ReversedProfile = reversed_state.apps.get_model(app_label, "Profile")
+        self.assertNotIn(
+            "is_public",
+            {field.name for field in ReversedProfile._meta.get_fields()},
+        )
+        self.assertNotIn("is_public", profile_columns())
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, latest_migration)])
 
 
 class StatusMachineTests(TestCase):

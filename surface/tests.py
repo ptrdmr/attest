@@ -17,6 +17,7 @@ from ledger.services import (
     approve_criteria,
     flag_dispute,
     mark_delivered,
+    set_profile_visibility,
     sign_attestation,
     submit_criteria_for_approval,
 )
@@ -24,6 +25,7 @@ from surface import billing
 from surface.auth import (
     MAGIC_LOGIN_MAX_AGE,
     MAGIC_LOGIN_SALT,
+    get_or_create_freelancer,
     make_magic_login_token,
     read_and_consume_magic_login_token,
 )
@@ -51,7 +53,7 @@ def make_profile(handle=None, email=None):
     if email is None:
         email = f"{handle}@example.com"
     user = get_user_model().objects.create_user(
-        username=handle,
+        username=email,
         email=email,
         password="testpass",
     )
@@ -1481,6 +1483,7 @@ class PublicRecordViewTests(TestCase):
     def setUp(self):
         """Profile with one clean attestation and one disputed attestation."""
         self.owner = make_profile(handle="public-freelancer")
+        set_profile_visibility(self.owner, True)
         self.clean_project = make_draft_project(
             owner=self.owner,
             with_criteria=True,
@@ -1507,6 +1510,126 @@ class PublicRecordViewTests(TestCase):
         self.review_token = make_client_token(self.clean_project, "review")
         self.sign_token = make_client_token(self.clean_project, "sign")
         self.client = Client()
+
+    def test_anonymous_unpublished_record_returns_404(self):
+        """Anonymous visitors cannot discover an unpublished record."""
+        set_profile_visibility(self.owner, False)
+
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_anonymous_published_record_is_indexable(self):
+        """Anonymous visitors receive a published record without noindex."""
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("X-Robots-Tag", response)
+
+    def test_authenticated_non_owner_cannot_view_unpublished_record(self):
+        """Another freelancer receives 404 for an unpublished record."""
+        set_profile_visibility(self.owner, False)
+        other = make_profile(handle="record-viewer")
+        login_as(self.client, other)
+
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_owner_sees_unpublished_preview_with_noindex(self):
+        """The owner sees an unmistakable private preview that cannot be indexed."""
+        set_profile_visibility(self.owner, False)
+        login_as(self.client, self.owner)
+
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Not published")
+        self.assertContains(response, "only you can see this private preview")
+        self.assertContains(response, "Publish record")
+        self.assertContains(response, 'name="intent"')
+        self.assertContains(response, 'value="publish"')
+        self.assertContains(
+            response,
+            reverse(
+                "surface:profile-visibility",
+                kwargs={"handle": self.owner.handle},
+            ),
+        )
+        self.assertEqual(response["X-Robots-Tag"], "noindex")
+
+    def test_anonymous_published_record_hides_owner_controls(self):
+        """Published visitor pages contain no visibility form or owner-only copy."""
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Record visibility")
+        self.assertNotContains(response, "Publish record")
+        self.assertNotContains(response, "Unpublish record")
+        self.assertNotContains(
+            response,
+            reverse(
+                "surface:profile-visibility",
+                kwargs={"handle": self.owner.handle},
+            ),
+        )
+
+    def test_authenticated_non_owner_sees_published_record_without_owner_controls(self):
+        """A logged-in visitor sees a published record without owner UI or noindex."""
+        other = make_profile(handle="published-viewer")
+        login_as(self.client, other)
+
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, self.clean_project.title)
+        self.assertNotContains(response, "Record visibility")
+        self.assertNotContains(response, "Publish record")
+        self.assertNotContains(response, "Unpublish record")
+        self.assertNotIn("X-Robots-Tag", response)
+
+    def test_authenticated_non_owner_sees_dispute_notice_on_published_record(self):
+        """Dispute-freeze copy on a published record is unchanged for logged-in visitors."""
+        other = make_profile(handle="dispute-viewer")
+        login_as(self.client, other)
+
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "dispute-notice")
+        self.assertContains(response, "1 signed record currently")
+        self.assertContains(response, "withheld from the verified record below")
+        self.assertNotContains(response, self.disputed_project.title)
+
+    def test_owner_unpublished_preview_renders_tags_and_attestations(self):
+        """Private preview shows verified skills and clean attestations before publishing."""
+        set_profile_visibility(self.owner, False)
+        login_as(self.client, self.owner)
+
+        response = self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Not published")
+        self.assertContains(response, self.clean_project.title)
+        self.assertContains(response, self.clean_attestation.payload_hash)
+        self.assertContains(response, "Verified skills")
+        self.assertContains(response, "django · 1")
 
     def test_public_record_shows_clean_attestation_and_withholds_disputed(self):
         """Public page lists clean attestations, hides disputed ones, and omits PII."""
@@ -1540,6 +1663,119 @@ class PublicRecordViewTests(TestCase):
         self.assertNotContains(response, "<strong>Skills:</strong> python", html=True)
 
 
+class ProfileVisibilityViewTests(TestCase):
+    """Owner-only publication changes for the Capability Record."""
+
+    def setUp(self):
+        """Create one private profile and its visibility action URL."""
+        self.owner = make_profile(handle="visibility-owner")
+        self.url = reverse(
+            "surface:profile-visibility",
+            kwargs={"handle": self.owner.handle},
+        )
+
+    def test_owner_post_publishes_then_unpublishes_record(self):
+        """Explicit owner actions set visibility both ways through the endpoint."""
+        client = Client()
+        login_as(client, self.owner)
+
+        with patch(
+            "surface.views.services.set_profile_visibility",
+            wraps=set_profile_visibility,
+        ) as visibility_service:
+            publish_response = client.post(self.url, {"intent": "publish"})
+            self.owner.refresh_from_db()
+            self.assertTrue(self.owner.is_public)
+            self.assertRedirects(
+                publish_response,
+                reverse("surface:public-record", kwargs={"handle": self.owner.handle}),
+            )
+            published_page = client.get(
+                reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+            )
+            self.assertContains(published_page, "Unpublish record")
+            self.assertContains(published_page, 'value="unpublish"')
+
+            unpublish_response = client.post(self.url, {"intent": "unpublish"})
+            self.owner.refresh_from_db()
+            self.assertFalse(self.owner.is_public)
+            self.assertRedirects(
+                unpublish_response,
+                reverse("surface:public-record", kwargs={"handle": self.owner.handle}),
+            )
+
+        self.assertEqual(
+            [service_call.args[1] for service_call in visibility_service.call_args_list],
+            [True, False],
+        )
+
+    def test_repeated_visibility_intent_is_idempotent(self):
+        """Repeating either explicit intent cannot reverse the requested state."""
+        client = Client()
+        login_as(client, self.owner)
+
+        client.post(self.url, {"intent": "publish"})
+        client.post(self.url, {"intent": "publish"})
+        self.owner.refresh_from_db()
+        self.assertTrue(self.owner.is_public)
+
+        client.post(self.url, {"intent": "unpublish"})
+        client.post(self.url, {"intent": "unpublish"})
+        self.owner.refresh_from_db()
+        self.assertFalse(self.owner.is_public)
+
+    def test_invalid_or_missing_intent_does_not_change_visibility(self):
+        """Malformed owner actions return 404 without changing visibility."""
+        client = Client()
+        login_as(client, self.owner)
+
+        for post_data in ({"intent": "invalid"}, {}):
+            with self.subTest(post_data=post_data):
+                set_profile_visibility(self.owner, False)
+                response = client.post(self.url, post_data)
+                self.assertEqual(response.status_code, 404)
+                self.owner.refresh_from_db()
+                self.assertFalse(self.owner.is_public)
+
+    def test_non_owner_and_anonymous_posts_cannot_change_visibility(self):
+        """Valid intent from non-owners is rejected before visibility can change."""
+        other = make_profile(handle="visibility-other")
+        other_client = Client()
+        login_as(other_client, other)
+
+        for client, label in (
+            (other_client, "authenticated non-owner"),
+            (Client(), "anonymous"),
+        ):
+            with self.subTest(case=label):
+                set_profile_visibility(self.owner, False)
+                response = client.post(self.url, {"intent": "publish"})
+                self.assertEqual(response.status_code, 404)
+                self.owner.refresh_from_db()
+                self.assertFalse(self.owner.is_public)
+
+    def test_owner_post_requires_csrf_token(self):
+        """CSRF middleware rejects an owner visibility action without a token."""
+        client = Client(enforce_csrf_checks=True)
+        login_as(client, self.owner)
+
+        response = client.post(self.url, {"intent": "publish"})
+
+        self.assertEqual(response.status_code, 403)
+        self.owner.refresh_from_db()
+        self.assertFalse(self.owner.is_public)
+
+
+class ProfileAutoCreationTests(TestCase):
+    """Surface-created profiles retain Ledger's private default."""
+
+    def test_get_or_create_freelancer_does_not_override_private_default(self):
+        """The Surface auth call site creates a profile with is_public false."""
+        user = get_or_create_freelancer("private-by-default@example.com")
+
+        self.assertFalse(user.profile.is_public)
+
+
 class RecordRedirectViewTests(TestCase):
     """Authenticated redirect from dashboard record entry point."""
 
@@ -1559,6 +1795,43 @@ class RecordRedirectViewTests(TestCase):
         response = Client().get(reverse("surface:record"))
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("surface:login-request"), response.url)
+
+    def test_private_owner_record_redirect_lands_on_usable_preview(self):
+        """Following /record/ as a private-profile owner yields a 200 preview, not 404."""
+        owner = make_profile(handle="private-record-owner")
+        client = Client()
+        login_as(client, owner)
+
+        response = client.get(reverse("surface:record"), follow=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Not published")
+        self.assertContains(response, "only you can see this private preview")
+        self.assertEqual(response["X-Robots-Tag"], "noindex")
+
+
+class ProjectDetailPublicRecordLinkTests(TestCase):
+    """Project detail link to the owner's Capability Record."""
+
+    def test_project_detail_public_record_link_works_when_unpublished(self):
+        """Owner following the attested-project link reaches their private preview."""
+        owner = make_profile(handle="detail-link-owner")
+        project = make_draft_project(owner=owner)
+        sign_project_via_service(project)
+        client = Client()
+        login_as(client, owner)
+        record_url = reverse("surface:public-record", kwargs={"handle": owner.handle})
+
+        detail = client.get(
+            reverse("surface:project-detail", kwargs={"project_pk": project.pk})
+        )
+
+        self.assertContains(detail, "View the public record")
+        self.assertContains(detail, record_url)
+        record_response = client.get(record_url)
+        self.assertEqual(record_response.status_code, 200)
+        self.assertContains(record_response, "Not published")
+        self.assertContains(record_response, project.title)
 
 
 class ProjectEntitlementTests(TestCase):

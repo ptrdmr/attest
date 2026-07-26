@@ -18,6 +18,7 @@ class Profile(models.Model):
     handle = models.SlugField(unique=True)
     display_name = models.CharField(max_length=255)
     headline = models.CharField(max_length=255, blank=True)
+    is_public = models.BooleanField(default=False)
     created_at = models.DateTimeField(default=timezone.now, editable=False)
 
     def __str__(self):

@@ -106,6 +106,11 @@ urlpatterns = [
         name="public-record",
     ),
     path(
+        "u/<slug:handle>/visibility/",
+        views.ProfileVisibilityView.as_view(),
+        name="profile-visibility",
+    ),
+    path(
         "record/",
         views.RecordRedirectView.as_view(),
         name="record",

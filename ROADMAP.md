@@ -139,7 +139,12 @@ exists to remove.
 
 ## Next Maneuver
 
-Sequence is now M7a (shared cache — DONE) → M7b (public-record opt-in) → I1a/I1b
-(per-item criteria) → I2 (notes) → I3 (portal) → I4 (branding), with I5 (directory and
-search) parallelizable and owning `surface/urls.py` plus the `base.html` nav at
-dispatch. Milestone definitions and file boundaries are in `PLAN.md`.
+Both prerequisites are landed: M7a (shared cache) and M7b (public-record opt-in).
+Sequence from here is I1a/I1b (per-item criteria) → I2 (notes) → I3 (portal) →
+I4 (branding), with I5 (directory and search) parallelizable and owning
+`surface/urls.py` plus the `base.html` nav at dispatch. Milestone definitions and
+file boundaries are in `PLAN.md`.
+
+One small fix goes first: the flaky `test_save_raises_when_signed_at_changed` has
+now misfired for two independent agents, and a suite that gets rerun until it
+passes is worthless as the project's only evidence. Details in `PLAN.md`.
