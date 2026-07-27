@@ -1,13 +1,14 @@
 """Verifier tests for the Ledger core (M1)."""
 
-import hashlib
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
+from datetime import timezone as datetime_timezone
 
 from django.contrib.auth.models import User
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase
+from django.utils import timezone
 
 from ledger.models import (
     AcceptanceItem,
@@ -21,32 +22,58 @@ from ledger.models import (
 from ledger.services import (
     InvalidSignatureMeta,
     InvalidTransition,
+    acceptance_item_locked,
     amend_attestation,
+    approve_acceptance_item,
+    approve_acceptance_items,
     approve_change_order,
     approve_criteria,
     canonical_payload,
     compute_payload_hash,
     criteria_locked,
     decline_change_order,
+    delete_acceptance_item,
     disputed_count,
     flag_dispute,
     has_open_change_orders,
     mark_delivered,
     propose_change_order,
     public_attestations,
+    pull_back_acceptance_item,
     recompute_capability_tags,
     reopen_active,
     resolve_dispute,
+    resume_acceptance_item,
     set_profile_visibility,
     sign_attestation,
+    submit_acceptance_item_for_approval,
+    submit_acceptance_items_for_approval,
     submit_criteria_for_approval,
+    suspend_acceptance_item,
     verify_payload_hash,
+    withdraw_acceptance_item,
 )
 
 
 def safe_signature_meta():
     """Return signature metadata that passes service validation."""
     return {"user_agent": "TestAgent/1.0", "ip_hash": "abc123def456"}
+
+
+DRAFT_SUBMITTED_BLOCK_DELIVERY = (
+    "Draft or submitted acceptance items block delivery."
+)
+VACUOUS_DELIVERY = (
+    "At least one approved acceptance item is required before delivery."
+)
+DRAFT_SUBMITTED_BLOCK_SIGNING = (
+    "Draft or submitted acceptance items block signing."
+)
+VACUOUS_SIGNING = (
+    "At least one approved acceptance item is required before signing."
+)
+DELIVERY_FAILED_ITEM = "Every delivery item must pass before delivery."
+SIGNING_FAILED_ITEM = "Every acceptance item must pass before signing."
 
 
 _profile_counter = 0
@@ -79,17 +106,38 @@ def make_project_with_items(status=Project.Status.DRAFT, skills_csv="", owner=No
         skills_csv=skills_csv,
         status=status,
     )
+    item_state = AcceptanceItem.State.DRAFT
+    submitted_at = None
+    approved_at = None
+    state_timestamp = timezone.now()
+    if status == Project.Status.CRITERIA_PENDING:
+        item_state = AcceptanceItem.State.SUBMITTED
+        submitted_at = state_timestamp
+    elif status in {
+        Project.Status.ACTIVE,
+        Project.Status.DELIVERED,
+        Project.Status.ATTESTED,
+        Project.Status.DISPUTED,
+    }:
+        item_state = AcceptanceItem.State.APPROVED
+        submitted_at = state_timestamp
+        approved_at = state_timestamp
+    item_fields = {
+        "project": project,
+        "state": item_state,
+        "submitted_at": submitted_at,
+        "approved_at": approved_at,
+        "is_passed": None,
+    }
     AcceptanceItem.objects.create(
-        project=project,
         text="Criterion one",
         order=1,
-        is_passed=None,
+        **item_fields,
     )
     AcceptanceItem.objects.create(
-        project=project,
         text="Criterion two",
         order=2,
-        is_passed=None,
+        **item_fields,
     )
     return project
 
@@ -108,8 +156,14 @@ def advance_to_delivered(project):
 
 
 def mark_all_items_passed(project):
-    """Mark every acceptance item on the project as passed."""
-    project.acceptance_items.update(is_passed=True)
+    """Mark every acceptance item approved and passed."""
+    state_timestamp = timezone.now()
+    project.acceptance_items.update(
+        state=AcceptanceItem.State.APPROVED,
+        submitted_at=state_timestamp,
+        approved_at=state_timestamp,
+        is_passed=True,
+    )
 
 
 def sign_project(project, client_email="signer@acme.com", client_name="Signer Name"):
@@ -243,6 +297,138 @@ class ProfileIsPublicMigrationTests(TransactionTestCase):
             {field.name for field in ReversedProfile._meta.get_fields()},
         )
         self.assertNotIn("is_public", profile_columns())
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, latest_migration)])
+
+
+class AcceptanceItemStateMigrationTests(TransactionTestCase):
+    """Migration 0003 truthfully derives existing item approval state."""
+
+    def test_0003_backfills_each_project_status_and_reverses(self):
+        """Every legacy project status maps to the specified item state."""
+        executor = MigrationExecutor(connection)
+        app_label = "ledger"
+        before_migration = "0002_profile_is_public"
+        item_state_migration = (
+            "0003_acceptanceitem_approved_at_acceptanceitem_state_and_more"
+        )
+        latest_migration = next(
+            name
+            for app, name in executor.loader.graph.leaf_nodes()
+            if app == app_label
+        )
+        executor.migrate([(app_label, before_migration)])
+        before_state = executor.loader.project_state(
+            (app_label, before_migration)
+        )
+        HistoricalProfile = before_state.apps.get_model(app_label, "Profile")
+        HistoricalProject = before_state.apps.get_model(app_label, "Project")
+        HistoricalItem = before_state.apps.get_model(
+            app_label,
+            "AcceptanceItem",
+        )
+        user = User.objects.create_user(username="migration-owner")
+        profile = HistoricalProfile.objects.create(
+            user_id=user.pk,
+            handle="migration-owner",
+            display_name="Migration Owner",
+        )
+        statuses = (
+            "draft",
+            "criteria_pending",
+            "active",
+            "delivered",
+            "attested",
+            "disputed",
+        )
+        project_updates = {}
+        for order, status in enumerate(statuses, start=1):
+            project = HistoricalProject.objects.create(
+                owner_id=profile.pk,
+                title=f"Migration {status}",
+                client_name="Client",
+                client_email=f"{status}@example.com",
+                brief="Legacy project",
+                status=status,
+            )
+            project_updates[status] = project.updated_at
+            HistoricalItem.objects.create(
+                project_id=project.pk,
+                text=status,
+                order=order,
+            )
+        HistoricalProject.objects.create(
+            owner_id=profile.pk,
+            title="Migration zero items",
+            client_name="Client",
+            client_email="zero-items@example.com",
+            brief="Legacy project without criteria",
+            status="active",
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, item_state_migration)])
+        applied_state = executor.loader.project_state(
+            (app_label, item_state_migration)
+        )
+        AppliedItem = applied_state.apps.get_model(
+            app_label,
+            "AcceptanceItem",
+        )
+        AppliedProject = applied_state.apps.get_model(
+            app_label,
+            "Project",
+        )
+        items = {
+            item.text: item
+            for item in AppliedItem.objects.order_by("text")
+        }
+        self.assertEqual(items["draft"].state, "draft")
+        self.assertIsNone(items["draft"].submitted_at)
+        self.assertIsNone(items["draft"].approved_at)
+        self.assertEqual(items["criteria_pending"].state, "submitted")
+        self.assertEqual(
+            items["criteria_pending"].submitted_at,
+            project_updates["criteria_pending"],
+        )
+        self.assertIsNone(items["criteria_pending"].approved_at)
+        for status in ("active", "delivered", "attested", "disputed"):
+            self.assertEqual(items[status].state, "approved")
+            self.assertEqual(
+                items[status].submitted_at,
+                project_updates[status],
+            )
+            self.assertEqual(
+                items[status].approved_at,
+                project_updates[status],
+            )
+        self.assertEqual(
+            AppliedProject.objects.filter(title="Migration zero items").count(),
+            1,
+        )
+        self.assertEqual(
+            AppliedItem.objects.filter(
+                project__title="Migration zero items",
+            ).count(),
+            0,
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, before_migration)])
+        reversed_state = executor.loader.project_state(
+            (app_label, before_migration)
+        )
+        ReversedItem = reversed_state.apps.get_model(
+            app_label,
+            "AcceptanceItem",
+        )
+        reversed_fields = {
+            field.name for field in ReversedItem._meta.get_fields()
+        }
+        self.assertNotIn("state", reversed_fields)
+        self.assertNotIn("submitted_at", reversed_fields)
+        self.assertNotIn("approved_at", reversed_fields)
 
         executor = MigrationExecutor(connection)
         executor.migrate([(app_label, latest_migration)])
@@ -382,6 +568,713 @@ class StatusMachineTests(TestCase):
         self.assertEqual(project.status, Project.Status.ACTIVE)
 
 
+class AcceptanceItemStateMachineTests(TestCase):
+    """Exhaustive per-item lifecycle and compatibility-bridge coverage."""
+
+    def setUp(self):
+        """Create one draft item for each state-machine test."""
+        self.project = make_project_with_items()
+        self.item = self.project.acceptance_items.order_by("order").first()
+
+    def set_state(self, state, *, submitted=False, approved=False):
+        """Put the fixture in a deliberate state without exercising services."""
+        fixed_time = datetime(
+            2026,
+            1,
+            2,
+            3,
+            4,
+            5,
+            tzinfo=datetime_timezone.utc,
+        )
+        self.item.state = state
+        self.item.submitted_at = fixed_time if submitted else None
+        self.item.approved_at = fixed_time if approved else None
+        self.item.save(
+            update_fields=("state", "submitted_at", "approved_at"),
+        )
+        return fixed_time
+
+    def test_draft_submitted_pullback_and_resubmit_edges(self):
+        """draft→submitted→draft→submitted is legal and timestamped."""
+        submit_acceptance_item_for_approval(self.item)
+        first_submission = self.item.submitted_at
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUBMITTED)
+        self.assertIsNotNone(first_submission)
+
+        pull_back_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.DRAFT)
+        self.assertIsNone(self.item.submitted_at)
+        self.assertTrue(acceptance_item_locked(self.item) is False)
+
+        submit_acceptance_item_for_approval(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUBMITTED)
+        self.assertIsNotNone(self.item.submitted_at)
+
+    def test_submitted_path_suspend_resume_round_trip(self):
+        """draft→submitted→draft→submitted→suspended→resume stays submitted."""
+        submit_acceptance_item_for_approval(self.item)
+        pull_back_acceptance_item(self.item)
+        submit_acceptance_item_for_approval(self.item)
+        submitted_at = self.item.submitted_at
+        self.assertIsNone(self.item.approved_at)
+
+        suspend_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUSPENDED)
+
+        resume_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUBMITTED)
+        self.assertIsNone(self.item.approved_at)
+        self.assertEqual(self.item.submitted_at, submitted_at)
+
+    def test_submitted_to_approved_edge(self):
+        """submitted→approved retains submission time and records approval."""
+        submitted_at = self.set_state(
+            AcceptanceItem.State.SUBMITTED,
+            submitted=True,
+        )
+        approve_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(self.item.submitted_at, submitted_at)
+        self.assertIsNotNone(self.item.approved_at)
+
+    def test_submitted_suspend_and_resume_edge(self):
+        """submitted→suspended→submitted retains historical timestamps."""
+        submitted_at = self.set_state(
+            AcceptanceItem.State.SUBMITTED,
+            submitted=True,
+        )
+        suspend_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUSPENDED)
+        self.assertEqual(self.item.submitted_at, submitted_at)
+        self.assertIsNone(self.item.approved_at)
+
+        resume_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUBMITTED)
+        self.assertEqual(self.item.submitted_at, submitted_at)
+
+    def test_approved_suspend_resume_and_withdraw_edges(self):
+        """Approved suspension resumes approved; withdrawal is terminal."""
+        approved_at = self.set_state(
+            AcceptanceItem.State.APPROVED,
+            submitted=True,
+            approved=True,
+        )
+        submitted_at = self.item.submitted_at
+        suspend_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUSPENDED)
+        self.assertEqual(self.item.submitted_at, submitted_at)
+        self.assertEqual(self.item.approved_at, approved_at)
+
+        resume_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.APPROVED)
+        withdraw_acceptance_item(self.item)
+        self.assertEqual(self.item.state, AcceptanceItem.State.WITHDRAWN)
+        self.assertEqual(self.item.submitted_at, submitted_at)
+        self.assertEqual(self.item.approved_at, approved_at)
+
+    def test_every_unsupported_service_edge_is_rejected(self):
+        """Each service rejects every source state outside its legal edges."""
+        all_states = {
+            AcceptanceItem.State.DRAFT,
+            AcceptanceItem.State.SUBMITTED,
+            AcceptanceItem.State.APPROVED,
+            AcceptanceItem.State.SUSPENDED,
+            AcceptanceItem.State.WITHDRAWN,
+        }
+        cases = (
+            (
+                submit_acceptance_item_for_approval,
+                {AcceptanceItem.State.DRAFT},
+            ),
+            (
+                pull_back_acceptance_item,
+                {AcceptanceItem.State.SUBMITTED},
+            ),
+            (
+                approve_acceptance_item,
+                {AcceptanceItem.State.SUBMITTED},
+            ),
+            (
+                suspend_acceptance_item,
+                {
+                    AcceptanceItem.State.SUBMITTED,
+                    AcceptanceItem.State.APPROVED,
+                },
+            ),
+            (
+                resume_acceptance_item,
+                {AcceptanceItem.State.SUSPENDED},
+            ),
+            (
+                withdraw_acceptance_item,
+                {AcceptanceItem.State.APPROVED},
+            ),
+        )
+        for service, legal_sources in cases:
+            for source_state in all_states - legal_sources:
+                with self.subTest(
+                    service=service.__name__,
+                    source_state=source_state,
+                ):
+                    self.set_state(
+                        source_state,
+                        submitted=source_state
+                        != AcceptanceItem.State.DRAFT,
+                        approved=source_state
+                        in {
+                            AcceptanceItem.State.APPROVED,
+                            AcceptanceItem.State.WITHDRAWN,
+                        },
+                    )
+                    with self.assertRaises(InvalidTransition):
+                        service(self.item)
+                    self.item.refresh_from_db()
+                    self.assertEqual(self.item.state, source_state)
+
+    def test_subset_batch_operations_leave_unselected_items_unchanged(self):
+        """Submission and approval batch services affect only their subset."""
+        items = list(self.project.acceptance_items.order_by("order"))
+        submit_acceptance_items_for_approval([items[0]])
+        items[0].refresh_from_db()
+        items[1].refresh_from_db()
+        self.assertEqual(items[0].state, AcceptanceItem.State.SUBMITTED)
+        self.assertEqual(items[1].state, AcceptanceItem.State.DRAFT)
+
+        approve_acceptance_items([items[0]])
+        items[0].refresh_from_db()
+        items[1].refresh_from_db()
+        self.assertEqual(items[0].state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(items[1].state, AcceptanceItem.State.DRAFT)
+
+    def test_item_lock_is_false_only_for_draft(self):
+        """Only draft criteria are editable through the per-item API."""
+        for state in AcceptanceItem.State.values:
+            with self.subTest(state=state):
+                self.set_state(state)
+                self.assertEqual(
+                    acceptance_item_locked(self.item),
+                    state != AcceptanceItem.State.DRAFT,
+                )
+
+    def test_delete_allows_never_approved_and_rejects_approved_history(self):
+        """Hard delete follows approved_at even while an item is suspended."""
+        self.set_state(
+            AcceptanceItem.State.SUSPENDED,
+            submitted=True,
+            approved=False,
+        )
+        deletable_pk = self.item.pk
+        delete_acceptance_item(self.item)
+        self.assertFalse(
+            AcceptanceItem.objects.filter(pk=deletable_pk).exists()
+        )
+
+        approved_item = self.project.acceptance_items.order_by("order").last()
+        approved_item.state = AcceptanceItem.State.SUSPENDED
+        approved_item.submitted_at = timezone.now()
+        approved_item.approved_at = timezone.now()
+        approved_item.save(
+            update_fields=("state", "submitted_at", "approved_at"),
+        )
+        with self.assertRaises(InvalidTransition):
+            delete_acceptance_item(approved_item)
+        self.assertTrue(
+            AcceptanceItem.objects.filter(pk=approved_item.pk).exists()
+        )
+
+    def test_project_level_bridge_reaches_attested_with_default_items(self):
+        """The untouched Surface-shaped project flow remains end-to-end valid."""
+        project = Project.objects.create(
+            owner=make_profile(),
+            title="Compatibility project",
+            client_name="Compatibility Client",
+            client_email="compatibility@example.com",
+            brief="Exercise the pre-I1b path",
+        )
+        for order in (1, 2):
+            AcceptanceItem.objects.create(
+                project=project,
+                text=f"Compatibility criterion {order}",
+                order=order,
+            )
+        self.assertTrue(
+            all(
+                item.state == AcceptanceItem.State.DRAFT
+                for item in project.acceptance_items.all()
+            )
+        )
+
+        submit_criteria_for_approval(project)
+        self.assertFalse(
+            project.acceptance_items.exclude(
+                state=AcceptanceItem.State.SUBMITTED,
+            ).exists()
+        )
+        approve_criteria(project)
+        self.assertFalse(
+            project.acceptance_items.exclude(
+                state=AcceptanceItem.State.APPROVED,
+            ).exists()
+        )
+        mark_all_items_passed(project)
+        mark_delivered(project)
+        sign_attestation(
+            project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.ATTESTED)
+
+    def test_submit_criteria_rollback_on_invalid_transition(self):
+        """Bulk item submit rolls back when the project transition fails."""
+        project = make_project_with_items(status=Project.Status.ACTIVE)
+        items = list(project.acceptance_items.order_by("order"))
+        items[1].state = AcceptanceItem.State.DRAFT
+        items[1].submitted_at = None
+        items[1].approved_at = None
+        items[1].save(
+            update_fields=("state", "submitted_at", "approved_at"),
+        )
+        before = {
+            item.pk: (item.state, item.submitted_at, item.approved_at)
+            for item in project.acceptance_items.order_by("order")
+        }
+
+        with self.assertRaises(InvalidTransition):
+            submit_criteria_for_approval(project)
+
+        for item in project.acceptance_items.order_by("order"):
+            self.assertEqual(
+                (item.state, item.submitted_at, item.approved_at),
+                before[item.pk],
+            )
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.ACTIVE)
+
+    def test_approve_criteria_rollback_on_invalid_transition(self):
+        """Bulk item approval rolls back when the project transition fails."""
+        project = make_project_with_items(status=Project.Status.DRAFT)
+        timestamp = timezone.now()
+        before = {}
+        for item in project.acceptance_items.order_by("order"):
+            item.state = AcceptanceItem.State.SUBMITTED
+            item.submitted_at = timestamp
+            item.approved_at = None
+            item.save(
+                update_fields=("state", "submitted_at", "approved_at"),
+            )
+            before[item.pk] = (
+                item.state,
+                item.submitted_at,
+                item.approved_at,
+            )
+
+        with self.assertRaises(InvalidTransition):
+            approve_criteria(project)
+
+        for item in project.acceptance_items.order_by("order"):
+            self.assertEqual(
+                (item.state, item.submitted_at, item.approved_at),
+                before[item.pk],
+            )
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.DRAFT)
+
+
+class AcceptanceItemGateTests(TestCase):
+    """Delivery and signing gates across every acceptance-item state."""
+
+    def set_item_state(self, project, state, is_passed):
+        """Set both fixture items to one gate scenario."""
+        timestamp = timezone.now()
+        project.acceptance_items.update(
+            state=state,
+            submitted_at=(
+                None if state == AcceptanceItem.State.DRAFT else timestamp
+            ),
+            approved_at=(
+                timestamp
+                if state
+                in {
+                    AcceptanceItem.State.APPROVED,
+                    AcceptanceItem.State.WITHDRAWN,
+                }
+                else None
+            ),
+            is_passed=is_passed,
+        )
+
+    def add_approved_peer(self, project):
+        """Keep one passed approved item beside a parked-state fixture."""
+        timestamp = timezone.now()
+        item = project.acceptance_items.order_by("order").first()
+        item.state = AcceptanceItem.State.APPROVED
+        item.submitted_at = timestamp
+        item.approved_at = timestamp
+        item.is_passed = True
+        item.save(
+            update_fields=("state", "submitted_at", "approved_at", "is_passed"),
+        )
+
+    def set_blocker_item(self, project, state, is_passed):
+        """Pair one approved peer with a second item in the blocker state."""
+        self.add_approved_peer(project)
+        timestamp = timezone.now()
+        item = project.acceptance_items.order_by("order").last()
+        item.state = state
+        item.submitted_at = (
+            None if state == AcceptanceItem.State.DRAFT else timestamp
+        )
+        item.approved_at = (
+            timestamp
+            if state
+            in {
+                AcceptanceItem.State.APPROVED,
+                AcceptanceItem.State.WITHDRAWN,
+            }
+            else None
+        )
+        item.is_passed = is_passed
+        item.save(
+            update_fields=("state", "submitted_at", "approved_at", "is_passed"),
+        )
+
+    def test_delivery_blocks_draft_item_beside_approved_peer(self):
+        """Delivery rejects draft items even when another item is approved."""
+        project = make_project_with_items(status=Project.Status.ACTIVE)
+        self.set_blocker_item(project, AcceptanceItem.State.DRAFT, None)
+
+        with self.assertRaises(InvalidTransition) as raised:
+            mark_delivered(project)
+
+        self.assertEqual(str(raised.exception), DRAFT_SUBMITTED_BLOCK_DELIVERY)
+
+    def test_delivery_blocks_submitted_item_beside_approved_peer(self):
+        """Delivery rejects submitted items even when another item is approved."""
+        project = make_project_with_items(status=Project.Status.ACTIVE)
+        self.set_blocker_item(project, AcceptanceItem.State.SUBMITTED, True)
+
+        with self.assertRaises(InvalidTransition) as raised:
+            mark_delivered(project)
+
+        self.assertEqual(str(raised.exception), DRAFT_SUBMITTED_BLOCK_DELIVERY)
+
+    def test_signing_blocks_draft_item_beside_approved_peer(self):
+        """Signing rejects draft items even when another item is approved."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        self.set_blocker_item(project, AcceptanceItem.State.DRAFT, True)
+
+        with self.assertRaises(InvalidTransition) as raised:
+            sign_attestation(
+                project,
+                "signer@acme.com",
+                "Signer",
+                safe_signature_meta(),
+            )
+
+        self.assertEqual(str(raised.exception), DRAFT_SUBMITTED_BLOCK_SIGNING)
+
+    def test_signing_blocks_submitted_item_beside_approved_peer(self):
+        """Signing rejects submitted items even when another item is approved."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        self.set_blocker_item(project, AcceptanceItem.State.SUBMITTED, True)
+
+        with self.assertRaises(InvalidTransition) as raised:
+            sign_attestation(
+                project,
+                "signer@acme.com",
+                "Signer",
+                safe_signature_meta(),
+            )
+
+        self.assertEqual(str(raised.exception), DRAFT_SUBMITTED_BLOCK_SIGNING)
+
+    def test_delivery_gate_covers_all_five_states(self):
+        """Draft/submitted and failed approved block; parked states do not."""
+        cases = (
+            (AcceptanceItem.State.DRAFT, None, True),
+            (AcceptanceItem.State.SUBMITTED, True, True),
+            (AcceptanceItem.State.APPROVED, False, True),
+            (AcceptanceItem.State.SUSPENDED, None, False),
+            (AcceptanceItem.State.WITHDRAWN, False, False),
+        )
+        for state, is_passed, should_block in cases:
+            with self.subTest(state=state):
+                project = make_project_with_items(
+                    status=Project.Status.ACTIVE,
+                )
+                if state in {
+                    AcceptanceItem.State.DRAFT,
+                    AcceptanceItem.State.SUBMITTED,
+                    AcceptanceItem.State.SUSPENDED,
+                    AcceptanceItem.State.WITHDRAWN,
+                }:
+                    self.set_blocker_item(project, state, is_passed)
+                    expected_message = (
+                        DRAFT_SUBMITTED_BLOCK_DELIVERY
+                        if state
+                        in {
+                            AcceptanceItem.State.DRAFT,
+                            AcceptanceItem.State.SUBMITTED,
+                        }
+                        else None
+                    )
+                else:
+                    self.set_item_state(project, state, is_passed)
+                    expected_message = DELIVERY_FAILED_ITEM
+                if should_block:
+                    with self.assertRaises(InvalidTransition) as raised:
+                        mark_delivered(project)
+                    self.assertEqual(str(raised.exception), expected_message)
+                else:
+                    mark_delivered(project)
+                    project.refresh_from_db()
+                    self.assertEqual(
+                        project.status,
+                        Project.Status.DELIVERED,
+                    )
+
+    def test_approved_null_result_preserves_delivery_null_semantics(self):
+        """An approved undecided result remains non-blocking for delivery."""
+        project = make_project_with_items(status=Project.Status.ACTIVE)
+        self.set_item_state(
+            project,
+            AcceptanceItem.State.APPROVED,
+            None,
+        )
+        mark_delivered(project)
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.DELIVERED)
+
+    def test_signing_gate_covers_all_five_states(self):
+        """Only passed approved items attest; parked states are ignored."""
+        cases = (
+            (AcceptanceItem.State.DRAFT, True, True),
+            (AcceptanceItem.State.SUBMITTED, True, True),
+            (AcceptanceItem.State.APPROVED, True, False),
+            (AcceptanceItem.State.SUSPENDED, None, False),
+            (AcceptanceItem.State.WITHDRAWN, False, False),
+        )
+        for state, is_passed, should_block in cases:
+            with self.subTest(state=state):
+                project = make_project_with_items(
+                    status=Project.Status.DELIVERED,
+                )
+                if state in {
+                    AcceptanceItem.State.DRAFT,
+                    AcceptanceItem.State.SUBMITTED,
+                    AcceptanceItem.State.SUSPENDED,
+                    AcceptanceItem.State.WITHDRAWN,
+                }:
+                    self.set_blocker_item(project, state, is_passed)
+                    expected_message = (
+                        DRAFT_SUBMITTED_BLOCK_SIGNING
+                        if state
+                        in {
+                            AcceptanceItem.State.DRAFT,
+                            AcceptanceItem.State.SUBMITTED,
+                        }
+                        else None
+                    )
+                else:
+                    self.set_item_state(project, state, is_passed)
+                    expected_message = None
+                if should_block:
+                    with self.assertRaises(InvalidTransition) as raised:
+                        sign_attestation(
+                            project,
+                            "signer@acme.com",
+                            "Signer",
+                            safe_signature_meta(),
+                        )
+                    if state == AcceptanceItem.State.APPROVED:
+                        self.assertEqual(
+                            str(raised.exception),
+                            SIGNING_FAILED_ITEM,
+                        )
+                    else:
+                        self.assertEqual(
+                            str(raised.exception),
+                            expected_message,
+                        )
+                else:
+                    sign_attestation(
+                        project,
+                        "signer@acme.com",
+                        "Signer",
+                        safe_signature_meta(),
+                    )
+                    project.refresh_from_db()
+                    self.assertEqual(
+                        project.status,
+                        Project.Status.ATTESTED,
+                    )
+
+    def test_signing_rejects_approved_null_and_false_results(self):
+        """Both undecided and failed approved items block signing."""
+        for is_passed in (None, False):
+            with self.subTest(is_passed=is_passed):
+                project = make_project_with_items(
+                    status=Project.Status.DELIVERED,
+                )
+                self.set_item_state(
+                    project,
+                    AcceptanceItem.State.APPROVED,
+                    is_passed,
+                )
+                with self.assertRaises(InvalidTransition) as raised:
+                    sign_attestation(
+                        project,
+                        "signer@acme.com",
+                        "Signer",
+                        safe_signature_meta(),
+                    )
+                self.assertEqual(str(raised.exception), SIGNING_FAILED_ITEM)
+
+
+class VacuousSigningTests(TestCase):
+    """An attestation must cover at least one approved, passed criterion."""
+
+    def _park_all_items(self, project, *, state):
+        """Move every item to a non-attesting terminal or parked state."""
+        timestamp = timezone.now()
+        project.acceptance_items.update(
+            state=state,
+            submitted_at=timestamp,
+            approved_at=(
+                timestamp
+                if state == AcceptanceItem.State.WITHDRAWN
+                else None
+            ),
+            is_passed=False if state == AcceptanceItem.State.WITHDRAWN else None,
+        )
+
+    def test_all_suspended_items_cannot_be_delivered_or_signed(self):
+        """Suspended-only projects must not attest to zero approved criteria."""
+        active = make_project_with_items(status=Project.Status.ACTIVE)
+        self._park_all_items(active, state=AcceptanceItem.State.SUSPENDED)
+        with self.assertRaises(InvalidTransition) as raised:
+            mark_delivered(active)
+        self.assertEqual(str(raised.exception), VACUOUS_DELIVERY)
+
+        delivered = make_project_with_items(status=Project.Status.DELIVERED)
+        self._park_all_items(delivered, state=AcceptanceItem.State.SUSPENDED)
+        with self.assertRaises(InvalidTransition) as raised:
+            sign_attestation(
+                delivered,
+                "signer@acme.com",
+                "Signer",
+                safe_signature_meta(),
+            )
+        self.assertEqual(str(raised.exception), VACUOUS_SIGNING)
+        self.assertFalse(delivered.attestations.exists())
+
+    def test_all_withdrawn_items_cannot_be_delivered_or_signed(self):
+        """Withdrawn-only projects must not produce empty attestations."""
+        active = make_project_with_items(status=Project.Status.ACTIVE)
+        self._park_all_items(active, state=AcceptanceItem.State.WITHDRAWN)
+        with self.assertRaises(InvalidTransition) as raised:
+            mark_delivered(active)
+        self.assertEqual(str(raised.exception), VACUOUS_DELIVERY)
+
+        delivered = make_project_with_items(status=Project.Status.DELIVERED)
+        self._park_all_items(delivered, state=AcceptanceItem.State.WITHDRAWN)
+        with self.assertRaises(InvalidTransition) as raised:
+            sign_attestation(
+                delivered,
+                "signer@acme.com",
+                "Signer",
+                safe_signature_meta(),
+            )
+        self.assertEqual(str(raised.exception), VACUOUS_SIGNING)
+        self.assertFalse(delivered.attestations.exists())
+
+    def test_mixed_suspended_and_withdrawn_items_cannot_be_delivered_or_signed(
+        self,
+    ):
+        """A mix of parked states with zero approved items must still block."""
+        active = make_project_with_items(status=Project.Status.ACTIVE)
+        items = list(active.acceptance_items.order_by("order"))
+        timestamp = timezone.now()
+        items[0].state = AcceptanceItem.State.SUSPENDED
+        items[0].submitted_at = timestamp
+        items[0].approved_at = None
+        items[0].is_passed = None
+        items[0].save(
+            update_fields=("state", "submitted_at", "approved_at", "is_passed"),
+        )
+        items[1].state = AcceptanceItem.State.WITHDRAWN
+        items[1].submitted_at = timestamp
+        items[1].approved_at = timestamp
+        items[1].is_passed = False
+        items[1].save(
+            update_fields=("state", "submitted_at", "approved_at", "is_passed"),
+        )
+        with self.assertRaises(InvalidTransition) as raised:
+            mark_delivered(active)
+        self.assertEqual(str(raised.exception), VACUOUS_DELIVERY)
+
+        delivered = make_project_with_items(status=Project.Status.DELIVERED)
+        items = list(delivered.acceptance_items.order_by("order"))
+        items[0].state = AcceptanceItem.State.SUSPENDED
+        items[0].submitted_at = timestamp
+        items[0].approved_at = None
+        items[0].is_passed = None
+        items[0].save(
+            update_fields=("state", "submitted_at", "approved_at", "is_passed"),
+        )
+        items[1].state = AcceptanceItem.State.WITHDRAWN
+        items[1].submitted_at = timestamp
+        items[1].approved_at = timestamp
+        items[1].is_passed = False
+        items[1].save(
+            update_fields=("state", "submitted_at", "approved_at", "is_passed"),
+        )
+        with self.assertRaises(InvalidTransition) as raised:
+            sign_attestation(
+                delivered,
+                "signer@acme.com",
+                "Signer",
+                safe_signature_meta(),
+            )
+        self.assertEqual(str(raised.exception), VACUOUS_SIGNING)
+
+    def test_zero_acceptance_items_cannot_be_delivered_or_signed(self):
+        """Projects with no criteria must not reach attested status."""
+        owner = make_profile()
+        active = Project.objects.create(
+            owner=owner,
+            title="Empty active project",
+            client_name="Client",
+            client_email="empty-active@example.com",
+            brief="No criteria",
+            status=Project.Status.ACTIVE,
+        )
+        with self.assertRaises(InvalidTransition) as raised:
+            mark_delivered(active)
+        self.assertEqual(str(raised.exception), VACUOUS_DELIVERY)
+
+        delivered = Project.objects.create(
+            owner=owner,
+            title="Empty delivered project",
+            client_name="Client",
+            client_email="empty-delivered@example.com",
+            brief="No criteria",
+            status=Project.Status.DELIVERED,
+        )
+        with self.assertRaises(InvalidTransition) as raised:
+            sign_attestation(
+                delivered,
+                "signer@acme.com",
+                "Signer",
+                safe_signature_meta(),
+            )
+        self.assertEqual(str(raised.exception), VACUOUS_SIGNING)
+
+
 class ChangeOrderServiceTests(TestCase):
     """Change-order proposal, decision, and delivery guards."""
 
@@ -519,6 +1412,55 @@ class ChangeOrderServiceTests(TestCase):
         self.project.refresh_from_db()
         self.assertEqual(self.project.status, Project.Status.DELIVERED)
 
+    def test_proposed_change_order_blocks_delivery_with_item_state_gate(self):
+        """Open change orders still block delivery when items are approved."""
+        mark_all_items_passed(self.project)
+        propose_change_order(self.project, "Pending work", 100, 1)
+
+        with self.assertRaises(InvalidTransition):
+            mark_delivered(self.project)
+
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+
+    def test_approved_change_order_and_item_state_both_enter_signed_payload(self):
+        """Approved change orders and per-item state coexist in the payload."""
+        change_order = propose_change_order(
+            self.project,
+            "Approved export work",
+            15000,
+            3,
+        )
+        approve_change_order(change_order)
+        mark_all_items_passed(self.project)
+        mark_delivered(self.project)
+        items = list(self.project.acceptance_items.order_by("order"))
+        items[1].state = AcceptanceItem.State.WITHDRAWN
+        items[1].save(update_fields=("state",))
+
+        attestation = sign_attestation(
+            self.project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+
+        payload = attestation.payload
+        self.assertEqual(
+            payload["approved_change_orders"],
+            [
+                {
+                    "description": "Approved export work",
+                    "amount_cents": 15000,
+                }
+            ],
+        )
+        payload_items = {
+            item["text"]: item for item in payload["acceptance_items"]
+        }
+        self.assertEqual(payload_items["Criterion one"]["state"], "approved")
+        self.assertEqual(payload_items["Criterion two"]["state"], "withdrawn")
+
 
 class PayloadHashTests(TestCase):
     """Deterministic hashing and canonical payload stability."""
@@ -534,25 +1476,97 @@ class PayloadHashTests(TestCase):
         self.assertRegex(first, r"^[0-9a-f]{64}$")
 
     def test_golden_hash_matches_sorted_canonical_json(self):
-        """Hash equals SHA-256 of the key-sorted, compact JSON string."""
-        payload = {
-            "title": "Golden Project",
-            "brief": "Fixed brief",
-            "revision_limit": 2,
-            "skills": ["django", "python"],
-            "acceptance_items": [
-                {"text": "A", "is_passed": True, "evidence_url": ""},
-            ],
-            "approved_change_orders": [],
-        }
-        canonical_json = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
+        """A literal digest pins the complete canonical payload shape."""
+        project = Project.objects.create(
+            owner=make_profile(),
+            title="Golden Project",
+            client_name="Golden Client",
+            client_email="golden@example.com",
+            brief="Fixed brief",
+            skills_csv="Python, Django",
+            status=Project.Status.DELIVERED,
         )
-        expected = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-        self.assertEqual(compute_payload_hash(payload), expected)
+        AcceptanceItem.objects.create(
+            project=project,
+            text="A",
+            order=1,
+            state=AcceptanceItem.State.APPROVED,
+            submitted_at=datetime(
+                2026,
+                1,
+                2,
+                3,
+                4,
+                5,
+                tzinfo=datetime_timezone.utc,
+            ),
+            approved_at=datetime(
+                2026,
+                1,
+                3,
+                4,
+                5,
+                6,
+                tzinfo=datetime_timezone.utc,
+            ),
+            is_passed=True,
+        )
+
+        self.assertEqual(
+            compute_payload_hash(canonical_payload(project)),
+            "302fc585ff14c2b1fda0c67375100b4ec8d802368bbf92306815cd56ef53dc19",
+        )
+
+    def test_canonical_payload_serializes_item_state_and_timestamps(self):
+        """Per-item datetimes become ISO strings and null remains JSON-safe."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        items = list(project.acceptance_items.order_by("order"))
+        fixed_submitted_at = datetime(
+            2026,
+            2,
+            3,
+            4,
+            5,
+            6,
+            tzinfo=datetime_timezone.utc,
+        )
+        fixed_approved_at = datetime(
+            2026,
+            2,
+            4,
+            5,
+            6,
+            7,
+            tzinfo=datetime_timezone.utc,
+        )
+        items[0].submitted_at = fixed_submitted_at
+        items[0].approved_at = fixed_approved_at
+        items[0].save(update_fields=("submitted_at", "approved_at"))
+        items[1].state = AcceptanceItem.State.SUSPENDED
+        items[1].submitted_at = fixed_submitted_at
+        items[1].approved_at = None
+        items[1].save(
+            update_fields=("state", "submitted_at", "approved_at"),
+        )
+
+        payload_items = canonical_payload(project)["acceptance_items"]
+        self.assertEqual(
+            payload_items[0],
+            {
+                "text": "Criterion one",
+                "is_passed": None,
+                "evidence_url": "",
+                "state": "approved",
+                "submitted_at": "2026-02-03T04:05:06+00:00",
+                "approved_at": "2026-02-04T05:06:07+00:00",
+            },
+        )
+        self.assertEqual(payload_items[1]["state"], "suspended")
+        self.assertEqual(
+            payload_items[1]["submitted_at"],
+            "2026-02-03T04:05:06+00:00",
+        )
+        self.assertIsNone(payload_items[1]["approved_at"])
 
     def test_key_insertion_order_does_not_change_hash(self):
         """Two dicts with identical content but different key order hash equal."""
@@ -608,22 +1622,23 @@ class PayloadHashTests(TestCase):
 class SignAttestationTests(TestCase):
     """Guards, side effects, and atomicity of sign_attestation."""
 
-    def test_raises_when_any_acceptance_item_is_unverified(self):
-        """is_passed=None on any item blocks signing."""
+    def test_raises_when_approved_item_is_unverified(self):
+        """An approved item with is_passed=None blocks signing."""
         project = make_project_with_items(status=Project.Status.DELIVERED)
         items = list(project.acceptance_items.order_by("order"))
         items[0].is_passed = True
         items[0].save(update_fields=("is_passed",))
-        with self.assertRaises(InvalidTransition):
+        with self.assertRaises(InvalidTransition) as raised:
             sign_attestation(
                 project,
                 "signer@acme.com",
                 "Signer",
                 safe_signature_meta(),
             )
+        self.assertEqual(str(raised.exception), SIGNING_FAILED_ITEM)
 
-    def test_raises_when_any_acceptance_item_failed(self):
-        """is_passed=False on any item blocks signing."""
+    def test_raises_when_approved_item_failed(self):
+        """An approved item with is_passed=False blocks signing."""
         project = make_project_with_items(status=Project.Status.DELIVERED)
         items = list(project.acceptance_items.order_by("order"))
         items[0].is_passed = True
@@ -631,13 +1646,14 @@ class SignAttestationTests(TestCase):
         items[1].is_passed = False
         items[1].save(update_fields=("is_passed",))
 
-        with self.assertRaises(InvalidTransition):
+        with self.assertRaises(InvalidTransition) as raised:
             sign_attestation(
                 project,
                 "signer@acme.com",
                 "Signer",
                 safe_signature_meta(),
             )
+        self.assertEqual(str(raised.exception), SIGNING_FAILED_ITEM)
 
         self.assertFalse(project.attestations.exists())
 
@@ -720,6 +1736,60 @@ class SignAttestationTests(TestCase):
                 safe_signature_meta(),
             )
         self.assertEqual(project.attestations.count(), 0)
+
+    def test_suspended_item_does_not_block_signing_when_other_items_pass(self):
+        """One suspended item must not block signing for passed approved peers."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        items = list(project.acceptance_items.order_by("order"))
+        items[0].is_passed = True
+        items[0].save(update_fields=("is_passed",))
+        items[1].state = AcceptanceItem.State.SUSPENDED
+        items[1].submitted_at = timezone.now()
+        items[1].approved_at = None
+        items[1].is_passed = None
+        items[1].save(
+            update_fields=("state", "submitted_at", "approved_at", "is_passed"),
+        )
+
+        attestation = sign_attestation(
+            project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.ATTESTED)
+        payload_items = {
+            item["text"]: item for item in attestation.payload["acceptance_items"]
+        }
+        self.assertEqual(payload_items["Criterion one"]["state"], "approved")
+        self.assertEqual(payload_items["Criterion two"]["state"], "suspended")
+
+    def test_withdrawn_item_remains_in_signed_payload_with_state(self):
+        """Withdrawn criteria stay in the signed record instead of vanishing."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        items = list(project.acceptance_items.order_by("order"))
+        items[0].is_passed = True
+        items[0].save(update_fields=("is_passed",))
+        items[1].state = AcceptanceItem.State.WITHDRAWN
+        items[1].is_passed = False
+        items[1].save(update_fields=("state", "is_passed"))
+
+        attestation = sign_attestation(
+            project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+
+        payload_items = attestation.payload["acceptance_items"]
+        self.assertEqual(len(payload_items), 2)
+        withdrawn_rows = [
+            item for item in payload_items if item["state"] == "withdrawn"
+        ]
+        self.assertEqual(len(withdrawn_rows), 1)
+        self.assertEqual(withdrawn_rows[0]["text"], "Criterion two")
 
 
 class AttestationImmutabilityTests(TestCase):
@@ -893,6 +1963,68 @@ class AmendmentTests(TestCase):
         self.assertEqual(original_skills, [])
         self.assertEqual(amendment.payload["skills"], ["django", "fast-api"])
 
+    def test_amendment_reflects_item_state_change_while_original_stays_immutable(
+        self,
+    ):
+        """Post-sign withdrawal updates only the amendment snapshot."""
+        original_payload = dict(self.original.payload)
+        original_hash = self.original.payload_hash
+        item = self.project.acceptance_items.order_by("order").first()
+        withdraw_acceptance_item(item)
+
+        amendment = amend_attestation(
+            self.original,
+            "amended@acme.com",
+            "Amended Signer",
+            safe_signature_meta(),
+        )
+        self.original.refresh_from_db()
+
+        self.assertEqual(self.original.payload, original_payload)
+        self.assertEqual(self.original.payload_hash, original_hash)
+        self.assertTrue(verify_payload_hash(self.original))
+        self.assertFalse(self.original.is_current)
+        self.assertTrue(amendment.is_current)
+        self.assertEqual(amendment.amended_from_id, self.original.pk)
+
+        amended_items = {
+            row["text"]: row
+            for row in amendment.payload["acceptance_items"]
+        }
+        self.assertEqual(
+            amended_items["Criterion one"]["state"],
+            AcceptanceItem.State.WITHDRAWN,
+        )
+        self.assertEqual(
+            amended_items["Criterion two"]["state"],
+            AcceptanceItem.State.APPROVED,
+        )
+
+    def test_amendment_reflects_suspended_item_after_signing(self):
+        """Post-sign suspension appears only on the amendment snapshot."""
+        original_payload = dict(self.original.payload)
+        item = self.project.acceptance_items.order_by("order").first()
+        suspend_acceptance_item(item)
+
+        amendment = amend_attestation(
+            self.original,
+            "amended@acme.com",
+            "Amended Signer",
+            safe_signature_meta(),
+        )
+        self.original.refresh_from_db()
+
+        self.assertEqual(self.original.payload, original_payload)
+        self.assertTrue(verify_payload_hash(self.original))
+        amended_items = {
+            row["text"]: row
+            for row in amendment.payload["acceptance_items"]
+        }
+        self.assertEqual(
+            amended_items["Criterion one"]["state"],
+            AcceptanceItem.State.SUSPENDED,
+        )
+
 
 class PublicDisplayTests(TestCase):
     """Public record queries respect dispute freeze and current-row rules."""
@@ -958,6 +2090,20 @@ class PublicDisplayTests(TestCase):
         """disputed_count tracks current rows flagged as disputed."""
         self.assertEqual(disputed_count(self.profile), 0)
         flag_dispute(self.project)
+        self.assertEqual(disputed_count(self.profile), 1)
+
+    def test_i1a_payload_hidden_when_is_disputed_on_attested_project(self):
+        """is_disputed alone freezes I1a-shaped payloads on attested projects."""
+        payload_items = self.attestation.payload["acceptance_items"]
+        self.assertTrue(all("state" in item for item in payload_items))
+
+        self.attestation.is_disputed = True
+        self.attestation.disputed_at = timezone.now()
+        self.attestation.save(update_fields=("is_disputed", "disputed_at"))
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.ATTESTED)
+
+        self.assertEqual(len(public_attestations(self.profile)), 0)
         self.assertEqual(disputed_count(self.profile), 1)
 
     def test_dispute_freeze_and_restore_on_public_record(self):
@@ -1043,6 +2189,112 @@ class CapabilityTagTests(TestCase):
                 )
             ),
             ["django", "htmx"],
+        )
+
+    def test_pre_i1a_payload_still_verifies_and_contributes_tags(self):
+        """An old signed shape remains valid and derives its stored skills."""
+        legacy_project = Project.objects.create(
+            owner=self.profile,
+            title="Legacy signed project",
+            client_name="Legacy Client",
+            client_email="legacy@example.com",
+            brief="Signed before per-item state",
+            skills_csv="changed-after-signing",
+            status=Project.Status.ATTESTED,
+        )
+        legacy_payload = {
+            "acceptance_items": [
+                {
+                    "text": "Legacy criterion",
+                    "is_passed": True,
+                    "evidence_url": "",
+                }
+            ],
+            "approved_change_orders": [],
+            "brief": "Signed before per-item state",
+            "revision_limit": 2,
+            "skills": ["django", "legacy-skill"],
+            "title": "Legacy signed project",
+        }
+        attestation = Attestation.objects.create(
+            project=legacy_project,
+            payload=legacy_payload,
+            payload_hash=compute_payload_hash(legacy_payload),
+            client_email="legacy@example.com",
+            client_name_typed="Legacy Signer",
+            signature_meta=safe_signature_meta(),
+        )
+
+        self.assertTrue(verify_payload_hash(attestation))
+        self.assertNotIn(
+            "state",
+            attestation.payload["acceptance_items"][0],
+        )
+        recompute_capability_tags(self.profile)
+        self.assertEqual(
+            list(
+                CapabilityTag.objects.filter(profile=self.profile)
+                .order_by("name")
+                .values_list("name", flat=True)
+            ),
+            ["django", "legacy-skill"],
+        )
+        attestation.refresh_from_db()
+        self.assertEqual(attestation.payload, legacy_payload)
+        self.assertTrue(verify_payload_hash(attestation))
+        public = list(public_attestations(self.profile))
+        self.assertEqual(len(public), 1)
+        self.assertEqual(public[0].pk, attestation.pk)
+
+    def test_legacy_and_i1a_attestations_combine_capability_tags(self):
+        """Pre-I1a and new-shaped attestations both contribute capability tags."""
+        legacy_project = Project.objects.create(
+            owner=self.profile,
+            title="Legacy signed project",
+            client_name="Legacy Client",
+            client_email="legacy@example.com",
+            brief="Signed before per-item state",
+            skills_csv="changed-after-signing",
+            status=Project.Status.ATTESTED,
+        )
+        legacy_payload = {
+            "acceptance_items": [
+                {
+                    "text": "Legacy criterion",
+                    "is_passed": True,
+                    "evidence_url": "",
+                }
+            ],
+            "approved_change_orders": [],
+            "brief": "Signed before per-item state",
+            "revision_limit": 2,
+            "skills": ["django", "legacy-skill"],
+            "title": "Legacy signed project",
+        }
+        Attestation.objects.create(
+            project=legacy_project,
+            payload=legacy_payload,
+            payload_hash=compute_payload_hash(legacy_payload),
+            client_email="legacy@example.com",
+            client_name_typed="Legacy Signer",
+            signature_meta=safe_signature_meta(),
+        )
+
+        sign_attestation(
+            self.project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+
+        tags = CapabilityTag.objects.filter(profile=self.profile).order_by("name")
+        self.assertEqual(
+            list(tags.values_list("name", "attested_count")),
+            [
+                ("django", 2),
+                ("htmx", 1),
+                ("legacy-skill", 1),
+            ],
         )
 
     def test_dispute_removes_capability_tags(self):

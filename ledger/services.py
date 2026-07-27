@@ -7,6 +7,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 
 from .models import (
+    AcceptanceItem,
     Attestation,
     CapabilityTag,
     ChangeOrder,
@@ -43,8 +44,16 @@ def _transition(project, expected_status, target_status):
     return project
 
 
+@transaction.atomic
 def submit_criteria_for_approval(project):
-    """Move a draft project to client criteria review."""
+    """Submit all draft items and move a draft project to client review."""
+    submitted_at = timezone.now()
+    project.acceptance_items.filter(
+        state=AcceptanceItem.State.DRAFT,
+    ).update(
+        state=AcceptanceItem.State.SUBMITTED,
+        submitted_at=submitted_at,
+    )
     return _transition(
         project,
         Project.Status.DRAFT,
@@ -52,13 +61,135 @@ def submit_criteria_for_approval(project):
     )
 
 
+@transaction.atomic
 def approve_criteria(project):
-    """Activate a project whose criteria have been approved."""
+    """Approve all submitted items and activate their pending project."""
+    approved_at = timezone.now()
+    project.acceptance_items.filter(
+        state=AcceptanceItem.State.SUBMITTED,
+    ).update(
+        state=AcceptanceItem.State.APPROVED,
+        approved_at=approved_at,
+    )
     return _transition(
         project,
         Project.Status.CRITERIA_PENDING,
         Project.Status.ACTIVE,
     )
+
+
+def _transition_acceptance_item(item, expected_states, target_state):
+    """Move an acceptance item across one explicitly permitted edge."""
+    if item.state not in expected_states:
+        raise InvalidTransition(
+            f"Cannot transition acceptance item from {item.state} "
+            f"to {target_state}."
+        )
+    item.state = target_state
+    return item
+
+
+def submit_acceptance_item_for_approval(item):
+    """Submit one draft acceptance item for client approval."""
+    _transition_acceptance_item(
+        item,
+        {AcceptanceItem.State.DRAFT},
+        AcceptanceItem.State.SUBMITTED,
+    )
+    item.submitted_at = timezone.now()
+    item.save(update_fields=("state", "submitted_at"))
+    return item
+
+
+@transaction.atomic
+def submit_acceptance_items_for_approval(items):
+    """Submit an atomic subset of draft acceptance items."""
+    return [submit_acceptance_item_for_approval(item) for item in items]
+
+
+def pull_back_acceptance_item(item):
+    """Return one submitted acceptance item to editable draft state."""
+    _transition_acceptance_item(
+        item,
+        {AcceptanceItem.State.SUBMITTED},
+        AcceptanceItem.State.DRAFT,
+    )
+    item.submitted_at = None
+    item.save(update_fields=("state", "submitted_at"))
+    return item
+
+
+def approve_acceptance_item(item):
+    """Approve one submitted acceptance item."""
+    _transition_acceptance_item(
+        item,
+        {AcceptanceItem.State.SUBMITTED},
+        AcceptanceItem.State.APPROVED,
+    )
+    item.approved_at = timezone.now()
+    item.save(update_fields=("state", "approved_at"))
+    return item
+
+
+@transaction.atomic
+def approve_acceptance_items(items):
+    """Approve an atomic subset of submitted acceptance items."""
+    return [approve_acceptance_item(item) for item in items]
+
+
+def suspend_acceptance_item(item):
+    """Suspend one submitted or approved acceptance item."""
+    _transition_acceptance_item(
+        item,
+        {
+            AcceptanceItem.State.SUBMITTED,
+            AcceptanceItem.State.APPROVED,
+        },
+        AcceptanceItem.State.SUSPENDED,
+    )
+    item.save(update_fields=("state",))
+    return item
+
+
+def resume_acceptance_item(item):
+    """Resume a suspended item to its timestamp-derived prior state."""
+    target_state = (
+        AcceptanceItem.State.APPROVED
+        if item.approved_at is not None
+        else AcceptanceItem.State.SUBMITTED
+    )
+    _transition_acceptance_item(
+        item,
+        {AcceptanceItem.State.SUSPENDED},
+        target_state,
+    )
+    item.save(update_fields=("state",))
+    return item
+
+
+def withdraw_acceptance_item(item):
+    """Withdraw one approved acceptance item permanently."""
+    _transition_acceptance_item(
+        item,
+        {AcceptanceItem.State.APPROVED},
+        AcceptanceItem.State.WITHDRAWN,
+    )
+    item.save(update_fields=("state",))
+    return item
+
+
+def acceptance_item_locked(item):
+    """Return whether an acceptance item's criterion is not editable."""
+    return item.state != AcceptanceItem.State.DRAFT
+
+
+def delete_acceptance_item(item):
+    """Delete an item only when it has never received client approval."""
+    if item.approved_at is not None:
+        raise InvalidTransition(
+            "Client-approved acceptance items cannot be deleted."
+        )
+    item.delete()
 
 
 def mark_delivered(project):
@@ -67,7 +198,25 @@ def mark_delivered(project):
         raise InvalidTransition(
             f"Cannot transition from {project.status} to {Project.Status.DELIVERED}."
         )
-    if project.acceptance_items.filter(is_passed=False).exists():
+    if project.acceptance_items.filter(
+        state__in=(
+            AcceptanceItem.State.DRAFT,
+            AcceptanceItem.State.SUBMITTED,
+        )
+    ).exists():
+        raise InvalidTransition(
+            "Draft or submitted acceptance items block delivery."
+        )
+    if not project.acceptance_items.filter(
+        state=AcceptanceItem.State.APPROVED,
+    ).exists():
+        raise InvalidTransition(
+            "At least one approved acceptance item is required before delivery."
+        )
+    if project.acceptance_items.filter(
+        state=AcceptanceItem.State.APPROVED,
+        is_passed=False,
+    ).exists():
         raise InvalidTransition("Every delivery item must pass before delivery.")
     if has_open_change_orders(project):
         raise InvalidTransition(
@@ -161,13 +310,27 @@ def _normalized_skills(skills_csv):
 
 def canonical_payload(project):
     """Build the deterministic signed snapshot for a project."""
-    acceptance_items = list(
-        project.acceptance_items.order_by("order", "pk").values(
-            "text",
-            "is_passed",
-            "evidence_url",
-        )
+    acceptance_items = []
+    item_rows = project.acceptance_items.order_by("order", "pk").values(
+        "text",
+        "is_passed",
+        "evidence_url",
+        "state",
+        "submitted_at",
+        "approved_at",
     )
+    for item_row in item_rows:
+        item_row["submitted_at"] = (
+            item_row["submitted_at"].isoformat()
+            if item_row["submitted_at"] is not None
+            else None
+        )
+        item_row["approved_at"] = (
+            item_row["approved_at"].isoformat()
+            if item_row["approved_at"] is not None
+            else None
+        )
+        acceptance_items.append(item_row)
     change_orders = list(
         project.change_orders.filter(status=ChangeOrder.Status.APPROVED)
         .order_by("pk")
@@ -220,7 +383,24 @@ def sign_attestation(
     """Sign a delivered project snapshot and move it to attested."""
     if project.status != Project.Status.DELIVERED:
         raise InvalidTransition("Only delivered projects can be attested.")
-    if project.acceptance_items.exclude(is_passed=True).exists():
+    if project.acceptance_items.filter(
+        state__in=(
+            AcceptanceItem.State.DRAFT,
+            AcceptanceItem.State.SUBMITTED,
+        )
+    ).exists():
+        raise InvalidTransition(
+            "Draft or submitted acceptance items block signing."
+        )
+    if not project.acceptance_items.filter(
+        state=AcceptanceItem.State.APPROVED,
+    ).exists():
+        raise InvalidTransition(
+            "At least one approved acceptance item is required before signing."
+        )
+    if project.acceptance_items.filter(
+        state=AcceptanceItem.State.APPROVED,
+    ).exclude(is_passed=True).exists():
         raise InvalidTransition("Every acceptance item must pass before signing.")
 
     payload = canonical_payload(project)

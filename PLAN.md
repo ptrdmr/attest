@@ -215,8 +215,11 @@ hazard: signing payload; full dispatch)
   `submit_criteria_for_approval(project)` is called by `SubmitCriteriaView`.
   Both keep their current signature and behaviour; I1a *adds* the per-item
   equivalents alongside them. I1b switches Surface over and retires the
-  project-level pair. A signature change in I1a would break Surface at seven
-  sites that I1a is not allowed to touch.
+  project-level pair. A signature change in I1a would break Surface at eight
+  sites that I1a is not allowed to touch (five `criteria_locked` calls in
+  `surface/views.py`, one in the criteria partial, plus the two project-level
+  services). An earlier draft of this line said seven; the adversary caught
+  the undercount.
 - Pre-M7 attestations keep the old payload shape; per the M6b ruling the only
   legitimate repair is a client-re-signed amendment, never a payload edit.
 - Boundaries: `ledger/models.py`, `ledger/migrations/`, `ledger/services.py`,
@@ -301,6 +304,32 @@ are now made and are binding on the Implementer.
 
 ### I1b — Per-item criteria: Surface (owning: Surface; consult: Ledger;
 hazard: client tokens; full dispatch)
+- **BINDING PRECONDITION, found by the I1a adversary.** Today "approved items
+  are never hard-deleted" is true only by coincidence, not by enforcement.
+  `AcceptanceItemDeleteView` calls `item.delete()` directly, bypassing
+  `delete_acceptance_item`, and is gated only by the project-level
+  `criteria_locked`. It happens to be safe right now because the only way an
+  item reaches `approved` is `approve_criteria`, which in the same transaction
+  flips the project to `active` and thereby locks the view. **The moment I1b
+  lets an item be approved while the project is still `criteria_pending`, that
+  view becomes a live path to hard-deleting a client-approved item, silently
+  violating ruling 4.** I1b must close this before its Surface wiring lands —
+  either route deletion through `delete_acceptance_item` or gate the view on
+  `approved_at`. `acceptance_item_locked` already exists in `ledger/services.py`
+  for this purpose and is currently unused by Surface.
+- **Decision needed, raised by the I1a Gate.** An approved item with
+  `is_passed=False` correctly blocks delivery — but *suspending* it clears
+  both gates and the project signs. That is not a false attestation: the
+  payload records the item verbatim as `state: "suspended", is_passed: false`,
+  and the plan deliberately requires both gates to ignore suspended items or a
+  parked item would block signing forever. The problem is visibility.
+  `templates/surface/record/detail.html` renders only `payload.title`,
+  `payload.skills`, and `payload_hash`, never per-item data, so a public
+  reader cannot see that a criterion was parked as failed. Today `suspend` has
+  no Surface call site; I1b gives it one, and it will be freelancer-driven.
+  I1b must decide whether the public record surfaces parked-as-failed
+  criteria, or whether suspending a failed item requires something more than
+  a freelancer's unilateral click.
 - Criteria builder per-item submit/suspend/withdraw controls; client review
   page batches newly-submitted items; `ClientApproveView` approves a batch.
 - Split from I1a rather than granting a Ledger-owned waiver: the Surface
@@ -491,6 +520,52 @@ hazard: client tokens; full dispatch)
   both survive a full revert: each pins an actor whose experience this feature
   intentionally leaves unchanged, so neither can be a revert-detector by
   definition, and both were mutation-proven to catch real leakage regressions.
+- 2026-07-26: I1a executed (Ledger half of per-item criteria). Planner
+  (orchestrator) → Planner-adversary (Sonnet) REJECT iter 1: all five factual
+  reconnaissance claims confirmed, but the plan had not decided what happens at
+  the seam between old project-level approval and new per-item state, which
+  would have broken the existing 68-test Ledger suite on day one. Seven
+  decisions recorded above closed it.
+  Builder (Sol) → Implementer-adversary (Sonnet) ACCEPT iter 1, 6/6 checklist
+  PASS. It independently reproduced the pinned golden digest via .NET SHA-256
+  rather than trusting the builder — exact match, so the guard is load-bearing
+  rather than self-referential. Two findings logged: the I1b delete
+  precondition above, and the deliberately preserved approved-plus-NULL
+  delivery gap.
+  Verifier (Composer) found a genuine defect: **vacuous signing.** With both
+  gates rescoped onto item state, a project whose items were all suspended or
+  all withdrawn — or which had no items at all — passed both gates and could
+  be signed, producing an attestation attesting to zero approved criteria.
+  Correctly reported with failing tests rather than papered over. Ruled in
+  scope for I1a rather than logged: before this milestone there was no way to
+  park an item, so the all-parked case is a state the rescoping newly created,
+  and you clean what you made. Builder added an "at least one approved item"
+  guard to both gates, ordered after the draft/submitted check so the more
+  useful error still surfaces first.
+  Verifier-adversary (Grok) REJECT iter 1 with the sharpest finding of the
+  initiative: **the new guard masked the tests above it.** Every gate test set
+  all items to draft or submitted, so after the guard landed they raised for
+  "zero approved" instead — and deleting the draft/submitted checks from both
+  gates left the entire 218-test suite green. Claims that delivery and signing
+  block draft and submitted items were undefended. Also caught an untested
+  transaction rollback on the compatibility bridge and three softballs. Fixed
+  with mixed approved-plus-blocker fixtures asserting the discriminating
+  message. Verified by the orchestrator directly: the same mutation that
+  previously produced zero failures now produces four.
+  Full suite 225 green (190 → 225, +35).
+- **Orchestrator incident, recorded because process lessons are the point of
+  this log.** While verifying the Grok fix, the orchestrator mutated
+  `ledger/services.py` and reverted with `git checkout -- ledger/services.py`.
+  That restores from HEAD, so it discarded roughly 200 lines of uncommitted
+  I1a service work, not just the mutation. Recovered by reconstructing the
+  file from the verbatim diffs captured earlier in the session; the pinned
+  golden digest then verified the payload reconstruction byte-for-byte, and
+  all 225 tests passed. **Lesson: `git checkout --` is only safe as a mutation
+  revert when the file is otherwise clean at HEAD. With uncommitted work in
+  the file, use an explicit inverse edit, or stage the work first so
+  `checkout` has something to restore to.** The earlier M7a/M7b uses were safe
+  precisely because those files were clean; the habit did not survive contact
+  with a large uncommitted diff.
 - Refit candidates (new): three pre-existing ruff `I001` import-order errors
   in `surface/auth.py`, `surface/tests.py`, `surface/views.py` (`django.core`
   sorted after `django.core.cache`) — untouched per the cleanup doctrine,

@@ -66,6 +66,15 @@ class Project(models.Model):
 class AcceptanceItem(models.Model):
     """Store one ordered, verifiable acceptance criterion."""
 
+    class State(models.TextChoices):
+        """Enumerate valid per-item approval states."""
+
+        DRAFT = "draft", "Draft"
+        SUBMITTED = "submitted", "Submitted"
+        APPROVED = "approved", "Approved"
+        SUSPENDED = "suspended", "Suspended"
+        WITHDRAWN = "withdrawn", "Withdrawn"
+
     project = models.ForeignKey(
         Project,
         on_delete=models.CASCADE,
@@ -73,6 +82,13 @@ class AcceptanceItem(models.Model):
     )
     text = models.TextField()
     order = models.PositiveIntegerField()
+    state = models.CharField(
+        max_length=10,
+        choices=State.choices,
+        default=State.DRAFT,
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
     is_passed = models.BooleanField(null=True, blank=True)
     evidence_url = models.URLField(blank=True)
     created_at = models.DateTimeField(default=timezone.now, editable=False)
