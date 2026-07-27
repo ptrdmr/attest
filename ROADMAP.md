@@ -163,10 +163,16 @@ diff, so the side of a boundary you did *not* move is invisible to it. Any
 milestone that moves a status gate needs the Verifier-adversary seat kept
 separate, to ask what the gate still refuses and whether that is pinned.
 
-Next candidate is the `AcceptanceItemDeleteView` Refit logged in `PLAN.md`: it
-has no project-status gate, so a parked criterion can be deleted from a
-delivered project awaiting signature, taking the scope disclosure with it.
-After that, the sequence is I2 (notes) → I3 (portal) → I4 (branding), with I5
+**I1c (2026-07-27) closed that hazard.** Acceptance items could be deleted from
+a project delivered but not yet signed, and because the disclosure is derived
+from the payload built at signing time, a deleted parked criterion published as
+a clean delivery. Deletion is now frozen outside `draft`, `criteria_pending` and
+`active`, enforced in Ledger inside the same filtered DELETE. The gate proved
+the guarantee holds against all nineteen owner-facing routes, and recorded
+`reopen_active` in `PLAN.md` as a latent bypass for whoever builds a reopen
+feature. Suite is at 269.
+
+The sequence from here is I2 (notes) → I3 (portal) → I4 (branding), with I5
 (directory and search) parallelizable and owning `surface/urls.py` plus the
 `base.html` nav at dispatch. Milestone definitions and file boundaries are in
 `PLAN.md`.
