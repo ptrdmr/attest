@@ -147,12 +147,26 @@ approval), I1b-1 (public disclosure of parked criteria), and I1b-2 (per-item
 UI and the client consent seam). Sequence from here is I2 (notes) → I3
 (portal) → I4 (branding), with I5 (directory and search) parallelizable and
 owning `surface/urls.py` plus the `base.html` nav at dispatch. The two
-consent-seam follow-ups the I1b-2 gate raised are now closed by I1a-3 and
-I1b-3. The two cosmetic ones remain logged at the end of `PLAN.md`: an
-imprecise "cannot be marked delivered" message, and the client signing page
-still rendering parked criteria as "Not passed". Milestone definitions and
-file boundaries are in `PLAN.md`.
+consent-seam follow-ups the I1b-2 gate raised are closed by I1a-3 and I1b-3.
 
-One small fix goes first: the flaky `test_save_raises_when_signed_at_changed` has
-now misfired for two independent agents, and a suite that gets rerun until it
-passes is worthless as the project's only evidence. Details in `PLAN.md`.
+**I1b-4 (2026-07-27) closed two defects that only a human walkthrough could
+find.** The first hand-driven smoke test this project has ever had was run
+against a suite of 254 passing tests, and found the client signing page
+presenting a parked criterion as "Not passed" at the moment of signature, and
+the freelancer locked out of every per-item control for the whole
+`criteria_pending` window. The second was also a latent deadlock. Both are
+fixed; suite is at 263. The signing-page defect had been logged as cosmetic —
+that ranking was wrong, and the correction is recorded in `PLAN.md`.
+
+**Standing lesson from that milestone:** an implementer-adversary reviews a
+diff, so the side of a boundary you did *not* move is invisible to it. Any
+milestone that moves a status gate needs the Verifier-adversary seat kept
+separate, to ask what the gate still refuses and whether that is pinned.
+
+Next candidate is the `AcceptanceItemDeleteView` Refit logged in `PLAN.md`: it
+has no project-status gate, so a parked criterion can be deleted from a
+delivered project awaiting signature, taking the scope disclosure with it.
+After that, the sequence is I2 (notes) → I3 (portal) → I4 (branding), with I5
+(directory and search) parallelizable and owning `surface/urls.py` plus the
+`base.html` nav at dispatch. Milestone definitions and file boundaries are in
+`PLAN.md`.
