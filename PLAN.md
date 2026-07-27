@@ -886,6 +886,65 @@ for leaving the client-consent seam as prose. These decisions are binding.
 - Compliance Gate (Opus 5, fresh context) PASS, eight items, verified by
   running five throwaway probes rather than by trusting any report.
 
+#### I1a-3 / I1b-3 — Closing the two consent-seam follow-ups (fast path)
+
+Two separate tasks with two owning departments and two commits. Both are small
+and precisely understood, so the orchestrator takes the builder seat, with the
+floor intact: an adversary pass on the diff, tests that demonstrably can fail,
+and a docs-impact check before each commit.
+
+- **I1a-3 (owning: Ledger).** `delete_acceptance_item` reads `approved_at` in
+  Python and then calls an unguarded `item.delete()`, so an approval committing
+  between the two destroys the row and the approval with it. This is the last
+  known instance of the bug class I1a-2 fixed. Fix: a filtered delete on
+  `approved_at__isnull=True` whose affected-row count is checked, raising the
+  existing `InvalidTransition` when it is zero, so the guard is enforced by the
+  database rather than by a stale read. Boundaries: `ledger/services.py`,
+  `ledger/tests.py`. No schema change.
+- **I1b-3 (owning: Surface).** `ClientApproveView` catches `InvalidTransition`
+  from a lost race, flashes "These criteria were already handled", and still
+  renders `thanks.html`. Both halves are wrong: the criteria were not handled,
+  they were pulled back, and the client is told an approval landed when the
+  savepoint rolled back and nothing was recorded. Fix: return the existing
+  `_review_response(..., stale_batch=True)`, whose notice already says exactly
+  the right thing — the criteria changed, please re-review. Boundaries:
+  `surface/views.py`, `surface/tests.py`.
+- Why the second one matters more than its size suggests: every other part of
+  this seam was built so a client can trust what the page tells them. A false
+  confirmation is the one failure that cannot be detected by the person it
+  misleads.
+
+##### I1a-3 / I1b-3 execution log
+
+- Both fixes landed as planned and were mutation-proven by reverting each and
+  watching the matching test fail. The reverted Surface run printed the bug
+  verbatim — "Thank you. The project criteria are recorded." beside a flash
+  saying the criteria were already handled, over a rolled-back transaction that
+  recorded nothing.
+- Implementer-adversary (Sonnet) ACCEPT, six checklist items, having
+  re-verified both mutations itself rather than trusting the report.
+- **It found a latent hazard worth fixing rather than logging.** The two
+  approval writes sat in one `try` but only `approve_acceptance_items` carried
+  a savepoint. The adversary proved by probe that a failure in
+  `approve_criteria` would commit the item approvals and *still* tell the
+  client to re-review — a partial commit presented as nothing having happened,
+  worse than the bug being fixed. It is unreachable today only because the
+  view's `status == criteria_pending` check and `approve_criteria`'s own check
+  read the same in-memory object, making the inner one a tautology. That is a
+  landmine for whoever hardens `approve_criteria` with a real database guard,
+  exactly as I1a-2 did for item transitions.
+- Fixed rather than logged: one savepoint now spans both writes, so a client is
+  either told their approval landed and all of it did, or told to re-review and
+  none of it did. Mutation-proven — removing the savepoint leaves the items
+  approved while the page asks the client to re-review.
+- Two [minor] findings accepted as-is with reasons. The zero-row delete reports
+  "cannot be deleted" even for a concurrently deleted row, but the only caller
+  converts `InvalidTransition` to a bare 404 and no user or test ever sees the
+  text, so a disambiguating query would buy a message nobody reads. And the
+  mock in the race test stands in for a collaborator, not for the code under
+  test; the adversary confirmed the two assertions together pin *review
+  re-rendered with the stale notice* rather than merely "did not say thanks".
+
 ##### Follow-ups the I1b-2 gate surfaced (none blocking, ordered by seriousness)
 
 1. **A client whose approval loses a race is still shown the thanks page.** If

@@ -669,6 +669,23 @@ class AcceptanceItemStateMachineTests(TestCase):
             ).exists()
         )
 
+    def test_stale_delete_cannot_destroy_competing_client_approval(self):
+        """A delayed delete cannot remove an item approved in the meantime."""
+        self.set_state(
+            AcceptanceItem.State.SUBMITTED,
+            submitted=True,
+        )
+        stale_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        competing_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        approve_acceptance_item(competing_item)
+
+        with self.assertRaises(InvalidTransition):
+            delete_acceptance_item(stale_item)
+
+        persisted_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        self.assertEqual(persisted_item.state, AcceptanceItem.State.APPROVED)
+        self.assertIsNotNone(persisted_item.approved_at)
+
     def test_stale_resume_cannot_downgrade_new_client_approval(self):
         """Resume guards the approval timestamp used to choose its target."""
         submit_acceptance_item_for_approval(self.item)

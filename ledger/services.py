@@ -201,11 +201,14 @@ def acceptance_item_locked(item):
 
 def delete_acceptance_item(item):
     """Delete an item only when it has never received client approval."""
-    if item.approved_at is not None:
+    deleted_count, _ = AcceptanceItem.objects.filter(
+        pk=item.pk,
+        approved_at__isnull=True,
+    ).delete()
+    if deleted_count == 0:
         raise InvalidTransition(
             "Client-approved acceptance items cannot be deleted."
         )
-    item.delete()
 
 
 def mark_delivered(project):
