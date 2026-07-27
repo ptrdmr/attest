@@ -174,15 +174,130 @@ hazard: signing payload; full dispatch)
 - `criteria_locked` becomes per-item rather than per-project;
   `submit_criteria_for_approval` accepts a subset; new suspend / resume /
   withdraw services.
-- **Rescope the gates:** `mark_delivered` and `sign_attestation` currently use
-  `is_passed=False` / `exclude(is_passed=True)`, which match NULL. A suspended
-  item has no result and would block signing forever. Both must consider only
-  approved items, and block while any item is still `draft` or `submitted`.
-- `canonical_payload` carries item state and timestamps. The golden-hash test
-  must be re-pinned to an independently derived digest, never updated to
-  whatever the new code emits.
+- **Rescope the gates.** The earlier claim here — that both gates "match NULL"
+  — was wrong for one of them, and the corrected semantics are verified from
+  generated SQL, not reasoned about:
+  - `mark_delivered` uses `filter(is_passed=False)` → `WHERE NOT is_passed`.
+    Under SQL three-valued logic `NOT NULL` is NULL, not TRUE, so **undecided
+    items do not block delivery today.** A project can reach `delivered` with
+    items nobody has judged. Pre-existing gap; only the Surface view hides the
+    button.
+  - `sign_attestation` uses `exclude(is_passed=True)` →
+    `WHERE NOT (is_passed AND is_passed IS NOT NULL)`, which **does** match
+    NULL, so undecided items correctly block signing.
+  - After I1a both gates must consider only `approved` items, block while any
+    item is `draft` or `submitted`, and ignore `suspended` and `withdrawn`
+    items entirely — a suspended item has no result and would otherwise block
+    signing forever.
+- **`canonical_payload` gains per-item state and timestamps.** Two hard
+  constraints from reconnaissance:
+  - The top-level `skills` key must keep its name, position, and shape.
+    `_tag_dates_by_name` reads `payload.get("skills", [])` directly, so moving
+    or renaming it would silently drop every historical attestation's
+    capability tags to zero.
+  - Old attestations are **safe**, verified rather than assumed:
+    `verify_payload_hash` rehashes the *stored* `attestation.payload`, never a
+    payload rebuilt from live project data. A shape change therefore cannot
+    retroactively invalidate signed rows or evict them from the public record.
+- **The golden-hash test does not currently pin anything.** Reconnaissance
+  found `test_golden_hash_matches_sorted_canonical_json` builds a literal dict
+  and recomputes the expected digest with the *same* `json.dumps` arguments,
+  so it only proves `compute_payload_hash` uses `sort_keys` and compact
+  separators. It never calls `canonical_payload` and pins no digest, so the
+  payload *shape* is currently unguarded — the project believes it has a
+  golden-hash guard and does not. I1a must add a real one: a literal SHA-256
+  digest, derived independently of the implementation, pinned against a fixed
+  fixture built through `canonical_payload`. Never update it to whatever the
+  new code emits.
+- **Backward compatibility is required so I1a can ship without I1b.**
+  `criteria_locked(project)` has five call sites in `surface/views.py` plus
+  one in `templates/surface/partials/criteria.html`, and
+  `submit_criteria_for_approval(project)` is called by `SubmitCriteriaView`.
+  Both keep their current signature and behaviour; I1a *adds* the per-item
+  equivalents alongside them. I1b switches Surface over and retires the
+  project-level pair. A signature change in I1a would break Surface at seven
+  sites that I1a is not allowed to touch.
 - Pre-M7 attestations keep the old payload shape; per the M6b ruling the only
   legitimate repair is a client-re-signed amendment, never a payload edit.
+- Boundaries: `ledger/models.py`, `ledger/migrations/`, `ledger/services.py`,
+  `ledger/tests.py`. All of `surface/` and `templates/` is read-only consult —
+  that footprint is I1b's.
+- Test strategy: state-machine coverage for every legal and illegal item
+  transition; both gates against each of the five states, including the
+  suspended-item-blocks-signing-forever regression and the NULL delivery gap
+  above; payload shape pinned by the new golden digest; a signed pre-I1a
+  attestation still verifying and still contributing capability tags after the
+  shape change.
+
+#### Decisions closing the Planner-adversary review (rejected iter 1)
+
+The adversary confirmed all five factual claims above against generated SQL
+and running code, and rejected the plan for leaving the seam between the old
+project-level approval and the new per-item state undecided. Those decisions
+are now made and are binding on the Implementer.
+
+- **The project-level services become the batch operations over item state.**
+  This is the compatibility bridge, and it is why I1a can ship alone.
+  `submit_criteria_for_approval(project)` also flips that project's `draft`
+  items to `submitted`; `approve_criteria(project)` also flips its `submitted`
+  items to `approved`. Both keep their existing signature and their existing
+  project-status transition, so the seven untouched Surface call sites keep
+  working and reach a gate-passing state without any I1b change.
+- **Field default is `draft`** — the truthful state for a newly created item.
+  **The migration backfills existing rows from project status** rather than
+  blanket-defaulting: items on a `draft` project become `draft`, items on a
+  `criteria_pending` project become `submitted`, and items on `active`,
+  `delivered`, `attested`, or `disputed` projects become `approved`, because
+  those projects demonstrably passed client criteria approval already. A
+  blanket default would have been a lie about half the existing rows.
+- **`ledger/tests.py` helpers must be updated in the same milestone.**
+  `make_project_with_items` builds projects directly at a target status
+  without routing through services, and `mark_all_items_passed` sets only
+  `is_passed` via a queryset update, so neither would set item state. The
+  adversary is right that the existing 68-test Ledger suite would otherwise
+  fail on day one. Helpers are in-boundary; fixing them is part of the work,
+  not a licence to weaken any assertion.
+- **`is_passed` and `state` are orthogonal and BOTH gate signing.** `state`
+  records whether the client agreed the criterion is in scope; `is_passed`
+  records whether the delivered work satisfies it. `sign_attestation` requires
+  `state == approved AND is_passed is True` for every non-suspended,
+  non-withdrawn item. The alternative reading — gate on `state` alone — would
+  allow signing an attestation covering a criterion explicitly marked failed,
+  which is not what an attestation means. Not a close call; recorded because
+  the plan previously left it inferable either way.
+- **Payload serialization is explicit, because the naive implementation
+  crashes.** Adding `submitted_at`/`approved_at` to the existing `.values(...)`
+  call would put raw `datetime` objects into `json.dumps`, which raises
+  `TypeError` and would break `sign_attestation` and `amend_attestation`
+  outright. Timestamps enter the payload as `.isoformat()` strings, or JSON
+  `null` when unset. Suspended and withdrawn items **retain** their timestamps
+  — they are historical facts about what happened, and clearing them would
+  destroy history inside a signed record. The golden-hash fixture uses
+  hardcoded explicit datetime values, never `timezone.now()`, or it cannot be
+  a pinned digest.
+- **State machine edges, exhaustively.** Legal: `draft → submitted`
+  (freelancer submits), `submitted → draft` (freelancer pulls back to edit,
+  per ruling 5), `submitted → approved` (client approves), `submitted →
+  suspended`, `approved → suspended`, `suspended → ` its prior state (resume),
+  and `approved → withdrawn`. Everything else is rejected, including
+  `draft → suspended` (a draft item is already invisible to the client, so
+  parking it is meaningless) and every edge out of `withdrawn`, which is
+  terminal.
+- **Resume derives the prior state from the timestamps** rather than adding a
+  field to remember it: an item with `approved_at` set resumes to `approved`,
+  otherwise to `submitted`. This keeps the schema authorization to the three
+  fields already granted.
+- **Editing is legal only in `draft`**, and **hard delete only while
+  `approved_at is None`** — which is precisely ruling 4's "items the client
+  never approved", expressed as a checkable condition rather than a state
+  list, so it stays correct for an item suspended after approval.
+- **One more required test**, which the adversary correctly noted the strategy
+  omitted: a regression walking the unmodified Surface-shaped path end to end
+  — create items with no state set, `submit_criteria_for_approval`,
+  `approve_criteria`, `mark_delivered`, `sign_attestation` — asserting the
+  project still reaches `attested`. That is the scenario the seam breaks, and
+  its absence from the first draft was itself the evidence the interaction had
+  not been traced.
 
 ### I1b — Per-item criteria: Surface (owning: Surface; consult: Ledger;
 hazard: client tokens; full dispatch)
