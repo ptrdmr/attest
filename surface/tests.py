@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
 from ledger.services import (
+    InvalidTransition,
     approve_criteria,
     compute_payload_hash,
     flag_dispute,
@@ -1103,6 +1104,51 @@ class ClientApproveViewTests(TestCase):
         self.assertContains(response, "No criteria are currently awaiting approval.")
         self.assertContains(response, "These criteria have already been handled.")
         self.assertNotContains(response, "criteria changed after this page was shown")
+
+    def test_approval_losing_a_race_is_not_reported_as_thanks(self):
+        """A rolled-back approval re-renders review instead of confirming."""
+        fingerprint = review_fingerprint(self.client, self.token)
+        with patch(
+            "surface.views.services.approve_acceptance_items",
+            side_effect=InvalidTransition("state changed"),
+        ):
+            response = self.client.post(
+                reverse("surface:client-approve", kwargs={"token": self.token}),
+                {"batch_fingerprint": fingerprint},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Thank you")
+        self.assertContains(response, "criteria changed after this page was shown")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_failure_after_items_approved_commits_nothing(self):
+        """A late failure rolls the whole approval back, not just its own step."""
+        fingerprint = review_fingerprint(self.client, self.token)
+        with patch(
+            "surface.views.services.approve_criteria",
+            side_effect=InvalidTransition("status changed"),
+        ):
+            response = self.client.post(
+                reverse("surface:client-approve", kwargs={"token": self.token}),
+                {"batch_fingerprint": fingerprint},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "criteria changed after this page was shown")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
 
     def test_null_submitted_at_is_stable_on_review_and_approval(self):
         """Admin-malformed submitted rows remain consent-bound without crashing."""

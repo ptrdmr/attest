@@ -957,11 +957,15 @@ class ClientApproveView(ClientTokenMixin, View):
             if form.cleaned_data["batch_fingerprint"] != current_fingerprint:
                 return self._review_response(request, token, stale_batch=True)
             try:
-                services.approve_acceptance_items(submitted_items)
-                if self.project.status == Project.Status.CRITERIA_PENDING:
-                    services.approve_criteria(self.project)
+                # One savepoint over both writes: a client is either told their
+                # approval landed and all of it did, or told to re-review and
+                # none of it did.
+                with transaction.atomic():
+                    services.approve_acceptance_items(submitted_items)
+                    if self.project.status == Project.Status.CRITERIA_PENDING:
+                        services.approve_criteria(self.project)
             except services.InvalidTransition:
-                messages.info(request, "These criteria were already handled.")
+                return self._review_response(request, token, stale_batch=True)
         return render(request, "surface/client/thanks.html", {"project": self.project})
 
     def _review_response(self, request, token, *, stale_batch):
