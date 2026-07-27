@@ -146,9 +146,11 @@ adversary proved a concurrent pull-back could erase a recorded client
 approval), I1b-1 (public disclosure of parked criteria), and I1b-2 (per-item
 UI and the client consent seam). Sequence from here is I2 (notes) → I3
 (portal) → I4 (branding), with I5 (directory and search) parallelizable and
-owning `surface/urls.py` plus the `base.html` nav at dispatch. Four
-non-blocking follow-ups from the I1b-2 gate are logged at the end of
-`PLAN.md`; the first two are worth clearing before I2. Milestone definitions and
+owning `surface/urls.py` plus the `base.html` nav at dispatch. The two
+consent-seam follow-ups the I1b-2 gate raised are now closed by I1a-3 and
+I1b-3. The two cosmetic ones remain logged at the end of `PLAN.md`: an
+imprecise "cannot be marked delivered" message, and the client signing page
+still rendering parked criteria as "Not passed". Milestone definitions and
 file boundaries are in `PLAN.md`.
 
 One small fix goes first: the flaky `test_save_raises_when_signed_at_changed` has
