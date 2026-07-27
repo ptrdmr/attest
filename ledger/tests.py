@@ -8,6 +8,7 @@ from django.contrib.auth.models import User
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from ledger.models import (
@@ -78,6 +79,12 @@ STALE_ACCEPTANCE_ITEM_TRANSITION = (
     "Acceptance item state changed before transition could be saved."
 )
 DELETED_ACCEPTANCE_ITEM_TRANSITION = "Acceptance item no longer exists."
+APPROVED_ITEM_DELETE_REFUSAL = (
+    "Client-approved acceptance items cannot be deleted."
+)
+FROZEN_SCOPE_DELETE_REFUSAL = (
+    "Acceptance items cannot be deleted after project delivery."
+)
 
 
 _profile_counter = 0
@@ -876,19 +883,56 @@ class AcceptanceItemStateMachineTests(TestCase):
                     state != AcceptanceItem.State.DRAFT,
                 )
 
-    def test_delete_allows_never_approved_and_rejects_approved_history(self):
-        """Hard delete follows approved_at even while an item is suspended."""
-        self.set_state(
-            AcceptanceItem.State.SUSPENDED,
-            submitted=True,
-            approved=False,
-        )
-        deletable_pk = self.item.pk
-        delete_acceptance_item(self.item)
-        self.assertFalse(
-            AcceptanceItem.objects.filter(pk=deletable_pk).exists()
-        )
+    def test_delete_works_in_every_mutable_project_status(self):
+        """Never-approved scope remains deletable before delivery."""
+        for status in (
+            Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+        ):
+            with self.subTest(status=status):
+                project = make_project_with_items(status=status)
+                item = project.acceptance_items.order_by("order").first()
+                item.state = AcceptanceItem.State.DRAFT
+                item.submitted_at = None
+                item.approved_at = None
+                item.save(
+                    update_fields=("state", "submitted_at", "approved_at"),
+                )
+                item_pk = item.pk
 
+                delete_acceptance_item(item)
+
+                self.assertFalse(
+                    AcceptanceItem.objects.filter(pk=item_pk).exists()
+                )
+
+    def test_delete_refuses_every_frozen_project_status(self):
+        """Never-approved scope cannot be deleted from delivery onward."""
+        for status in (
+            Project.Status.DELIVERED,
+            Project.Status.ATTESTED,
+            Project.Status.DISPUTED,
+        ):
+            with self.subTest(status=status):
+                project = make_project_with_items(status=status)
+                item = project.acceptance_items.order_by("order").first()
+                item.state = AcceptanceItem.State.SUSPENDED
+                item.approved_at = None
+                item.save(update_fields=("state", "approved_at"))
+
+                with self.assertRaisesMessage(
+                    InvalidTransition,
+                    FROZEN_SCOPE_DELETE_REFUSAL,
+                ):
+                    delete_acceptance_item(item)
+
+                self.assertTrue(
+                    AcceptanceItem.objects.filter(pk=item.pk).exists()
+                )
+
+    def test_delete_refusal_message_identifies_approved_history(self):
+        """Approved history reports its own rule instead of the scope freeze."""
         approved_item = self.project.acceptance_items.order_by("order").last()
         approved_item.state = AcceptanceItem.State.SUSPENDED
         approved_item.submitted_at = timezone.now()
@@ -896,10 +940,50 @@ class AcceptanceItemStateMachineTests(TestCase):
         approved_item.save(
             update_fields=("state", "submitted_at", "approved_at"),
         )
-        with self.assertRaises(InvalidTransition):
+        with self.assertRaisesMessage(
+            InvalidTransition,
+            APPROVED_ITEM_DELETE_REFUSAL,
+        ):
             delete_acceptance_item(approved_item)
         self.assertTrue(
             AcceptanceItem.objects.filter(pk=approved_item.pk).exists()
+        )
+
+    def test_successful_delete_uses_one_guarded_database_query(self):
+        """Approval and project-status guards execute in the DELETE query."""
+        item_pk = self.item.pk
+
+        with CaptureQueriesContext(connection) as captured_queries:
+            delete_acceptance_item(self.item)
+
+        self.assertEqual(len(captured_queries), 1)
+        self.assertFalse(
+            AcceptanceItem.objects.filter(pk=item_pk).exists()
+        )
+
+    def test_delete_rechecks_database_status_after_stale_related_status_read(self):
+        """A stale active relation cannot bypass the current delivery freeze."""
+        project = make_project_with_items(status=Project.Status.ACTIVE)
+        project.acceptance_items.update(is_passed=True)
+        parked_item = project.acceptance_items.order_by("order").last()
+        parked_item.state = AcceptanceItem.State.SUSPENDED
+        parked_item.approved_at = None
+        parked_item.save(update_fields=("state", "approved_at"))
+        stale_item = AcceptanceItem.objects.select_related("project").get(
+            pk=parked_item.pk
+        )
+        self.assertEqual(stale_item.project.status, Project.Status.ACTIVE)
+
+        competing_project = Project.objects.get(pk=project.pk)
+        mark_delivered(competing_project)
+        with self.assertRaisesMessage(
+            InvalidTransition,
+            FROZEN_SCOPE_DELETE_REFUSAL,
+        ):
+            delete_acceptance_item(stale_item)
+
+        self.assertTrue(
+            AcceptanceItem.objects.filter(pk=parked_item.pk).exists()
         )
 
     def test_project_level_bridge_reaches_attested_with_default_items(self):

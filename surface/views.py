@@ -622,6 +622,12 @@ class AcceptanceItemDeleteView(OwnedProjectMixin, View):
 
     def post(self, request, project_pk, item_pk):
         """Validate and remove a criterion owned through the project."""
+        if self.project.status not in {
+            Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+        }:
+            raise Http404
         form = ActionForm(request.POST)
         if not form.is_valid():
             raise Http404

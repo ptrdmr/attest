@@ -200,14 +200,28 @@ def acceptance_item_locked(item):
 
 
 def delete_acceptance_item(item):
-    """Delete an item only when it has never received client approval."""
+    """Delete never-approved scope only while its project remains mutable."""
     deleted_count, _ = AcceptanceItem.objects.filter(
         pk=item.pk,
         approved_at__isnull=True,
+        project__status__in=(
+            Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+        ),
     ).delete()
     if deleted_count == 0:
+        current_item = AcceptanceItem.objects.filter(pk=item.pk).values(
+            "approved_at",
+        ).first()
+        if current_item is None:
+            raise InvalidTransition("Acceptance item no longer exists.")
+        if current_item["approved_at"] is not None:
+            raise InvalidTransition(
+                "Client-approved acceptance items cannot be deleted."
+            )
         raise InvalidTransition(
-            "Client-approved acceptance items cannot be deleted."
+            "Acceptance items cannot be deleted after project delivery."
         )
 
 

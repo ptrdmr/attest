@@ -1474,6 +1474,52 @@ class CriteriaActionGateAgreementTests(TestCase):
 
         self.assertEqual(checks, 72)
 
+    def test_delete_endpoint_agrees_with_scope_mutability_across_statuses(self):
+        """The delete route is reachable only before project delivery."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner)
+        mutable_statuses = {
+            Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+        }
+        for status in Project.Status.values:
+            with self.subTest(status=status):
+                project = make_draft_project(owner=owner)
+                project.status = status
+                project.save(update_fields=("status",))
+                item = project.acceptance_items.get()
+                item.state = AcceptanceItem.State.SUSPENDED
+                item.submitted_at = timezone.now()
+                item.save(update_fields=("state", "submitted_at"))
+
+                delete_url = reverse(
+                    "surface:criterion-delete",
+                    kwargs={"project_pk": project.pk, "item_pk": item.pk},
+                )
+                if status in mutable_statuses:
+                    response = client.post(
+                        delete_url,
+                        HTTP_HX_REQUEST="true",
+                    )
+                else:
+                    with patch(
+                        "surface.views.services.delete_acceptance_item"
+                    ) as delete_service:
+                        response = client.post(
+                            delete_url,
+                            HTTP_HX_REQUEST="true",
+                        )
+                    delete_service.assert_not_called()
+
+                expected_status = 200 if status in mutable_statuses else 404
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(
+                    AcceptanceItem.objects.filter(pk=item.pk).exists(),
+                    status not in mutable_statuses,
+                )
+
 
 class PerItemCriteriaWorkflowTests(TestCase):
     """Freelancer item controls and server-bound client consent."""
@@ -2648,6 +2694,46 @@ class PublicRecordViewTests(TestCase):
         )
         markup = self.attestation_markup(self.get_public_record(), project.title)
         self.assertIn("Scope adjusted", markup)
+
+    def test_delivered_project_cannot_delete_parked_scope_before_signing(self):
+        """Delivered scope remains frozen into the signed public disclosure."""
+        project = make_draft_project(owner=self.owner)
+        project.title = "Frozen Scope Pipeline Project"
+        project.save(update_fields=("title",))
+        parked_item = AcceptanceItem.objects.create(
+            project=project,
+            text="Parked before delivery",
+            order=2,
+        )
+        submit_criteria_for_approval(project)
+        parked_item.refresh_from_db()
+        suspend_acceptance_item(parked_item)
+        approve_criteria(project)
+        project.acceptance_items.filter(
+            state=AcceptanceItem.State.APPROVED,
+        ).update(is_passed=True)
+        mark_delivered(project)
+
+        login_as(self.client, self.owner)
+        delete_response = self.client.post(
+            reverse(
+                "surface:criterion-delete",
+                kwargs={"project_pk": project.pk, "item_pk": parked_item.pk},
+            )
+        )
+        sign_attestation(
+            project,
+            project.client_email,
+            "Frozen Scope Signer",
+            {},
+        )
+
+        markup = self.attestation_markup(self.get_public_record(), project.title)
+        self.assertIn("Scope adjusted", markup)
+        self.assertEqual(delete_response.status_code, 404)
+        self.assertTrue(
+            AcceptanceItem.objects.filter(pk=parked_item.pk).exists()
+        )
 
     def test_anonymous_unpublished_record_returns_404(self):
         """Anonymous visitors cannot discover an unpublished record."""

@@ -1056,7 +1056,118 @@ the tests never entered.
   template and view together.
 - Final: **263 tests**, ruff at the 3 documented pre-existing `I001`.
 
-##### Refit candidate — `AcceptanceItemDeleteView` has no project-status gate
+### I1c — Freeze scope at delivery (owning: Ledger; consult: Surface; full dispatch)
+
+Promoted from the Refit candidate below after the human ruled it ahead of I2.
+Cross-department and it touches the Capability Record disclosure guarantee, so
+full dispatch, and **the Verifier-adversary seat stays separate** per the
+standing lesson from I1b-4 — this milestone adds a status gate, which is exactly
+the case where an implementer-adversary is structurally blind.
+
+#### The hole, stated precisely
+
+`delete_acceptance_item` guards only `approved_at__isnull=True`, and
+`AcceptanceItemDeleteView` applies no project-status check at all. An item that
+went `submitted → suspended` never receives an `approved_at`, so it stays
+deletable at every project status.
+
+**The damaging window is `delivered` but not yet signed.** The public record's
+disclosure is computed from the attestation payload, and that payload is built
+from live items at `sign_attestation` time. So deleting a parked criterion while
+the delivery record is out for signature means it never enters the payload, no
+"Scope adjusted" badge is ever derived, and a narrowed delivery is published as
+a clean one. Deleting *after* signing is harmless by comparison, because the
+payload is already a frozen JSON snapshot — worth knowing so the fix is aimed at
+the right window rather than at the scarier-sounding one.
+
+It also lets the freelancer change what the client is looking at between opening
+the signing page and signing it.
+
+#### Decisions
+
+- **Deletion is legal only while scope is still mutable: `draft`,
+  `criteria_pending`, `active`.** Same set the create and action gates now use,
+  so all three agree and there is one rule to remember rather than three.
+- **Enforce in Ledger, not only in Surface.** This is domain law — the scope of
+  a delivery that is out for signature cannot change — so the service must
+  refuse regardless of caller. The Surface gate is then for a coherent UI, not
+  for safety.
+- **Make the guard atomic, in the style I1a-3 established.** Fold the project
+  status into the same filtered delete rather than reading status and then
+  deleting, so it cannot race a concurrent `mark_delivered`. A separate check
+  would reintroduce exactly the TOCTOU shape I1a-2 and I1a-3 removed.
+- Ruling 6 in `ROADMAP.md` says hard delete stays legal for items the client
+  never approved. That still holds; this narrows *when*, not *which*. The ruling
+  predates the I1b-1 disclosure guarantee and did not contemplate it.
+- Already covered and not to be re-guarded: items that were ever approved,
+  including `withdrawn` ones and suspended-from-approved ones, carry an
+  `approved_at` and the existing guard stops them.
+
+- Boundaries: `ledger/services.py`, `ledger/tests.py`, `surface/views.py`,
+  `surface/tests.py`. No model or migration change — project status and
+  `approved_at` are both already present.
+- Test strategy: prove the damaging window directly rather than by proxy — park
+  a criterion, deliver, delete it, sign, and assert the public record has lost
+  its disclosure. That test must fail before the fix. Then pin the gate at both
+  bounds, deletion still working in all three mutable statuses, and add the
+  interleaving case where `mark_delivered` commits between a caller reading
+  status and issuing the delete.
+
+#### I1c execution log
+
+- Builder wrote the end-to-end harm test first and **confirmed it failed before
+  fixing anything** — `'Scope adjusted' not found` — so the hole was proven
+  exploitable rather than argued. Suite 263 → 268.
+- **Implementer-adversary ACCEPT.** Captured the emitted SQL and confirmed one
+  statement carrying both guards, so the TOCTOU shape really is absent. Its most
+  useful finding was that the Surface end-to-end test still passes with the
+  Ledger predicate alone reverted, because the view gate intercepts first — the
+  isolated proof of Ledger enforcement lives in `ledger/tests.py`, and the
+  Surface test is a combined-layers pin. Worth remembering before anyone trims
+  what looks like duplicate coverage.
+- **Verifier-adversary REJECT**, and keeping this seat separate paid for itself
+  immediately. `test_delete_rechecks_project_status_atomically_after_delivery_race`
+  did not test its own name: a check-then-act implementation doing a *fresh*
+  status read passed it, and only a stale-read version failed. It pinned "do not
+  trust a stale related object", not "the predicate is in the DELETE".
+  Fixed by asserting the successful delete emits **exactly one query** — a
+  discriminator that is backend-independent, unlike asserting SQL text, which
+  matters because this eventually runs on Postgres. Verified failing `2 != 1`
+  against the adversary's own mutation. The stale-read test was kept and its
+  name narrowed. Suite 269.
+- **Compliance Gate PASS**, and it went well beyond the brief. Asked whether the
+  fix protects the guarantee or only the one route we happened to find, it built
+  a delivered project holding a parked criterion, snapshotted the canonical
+  payload, and POSTed **all nineteen owner-facing routes with valid form data**
+  so validation could not be what saved it. Every one refused; the payload hash
+  was byte-identical after each; the sweep was repeated against an attested
+  project. It also showed the protection is structural rather than lucky: every
+  field `canonical_payload` reads is already frozen by a status gate at
+  delivery, including the bulk `acceptance_items.all().delete()` inside
+  `AiDraftConfirmView`, which is `DRAFT`-only. Single-item deletion was the only
+  hole.
+
+##### Roadmap item — `reopen_active` is a latent bypass of I1c
+
+Found by the I1c gate. `reopen_active` in `ledger/services.py` lowers
+`DELIVERED` back to `ACTIVE` with no guard, which by construction re-opens the
+deletion window this milestone just closed. The gate proved the whole chain:
+reopen, delete the parked criterion, re-deliver, sign — parked count in the
+signed payload is zero and a narrowed delivery publishes clean.
+
+**Not exploitable today**: it has no view, no URL, and no caller anywhere except
+one Ledger test. Deliberately not fixed, because any real "reopen for more work"
+feature needs its own design — not least what it means for an attestation that
+may already exist — and guarding an unreachable service now would be
+speculative.
+
+The honest statement of where the guarantee rests: the guard itself is durable,
+because it is a database-side predicate binding every caller, but **the set of
+statuses it trusts is only as good as nothing lowering the status after
+delivery.** The day someone wires a Reopen button, I1c is bypassed and no test
+fails. Whoever builds that reads this first.
+
+##### Refit candidate — `AcceptanceItemDeleteView` has no project-status gate — CLOSED by I1c
 
 Found while verifying the gate's findings; **pre-existing, so logged rather than
 fixed under I1b-4**, but it is the strongest candidate for the next milestone
