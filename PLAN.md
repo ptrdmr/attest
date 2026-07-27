@@ -725,6 +725,49 @@ for leaving the client-consent seam as prose. These decisions are binding.
   datetime precision surviving the round trip on both SQLite and Postgres,
   and this fix exists to remove a precision-dependent flake. Reintroducing a
   precision dependency to catch a guard nobody would write is a bad trade.
+#### I1b-1 execution log (public disclosure of parked criteria)
+
+- Shipped: `_parked_acceptance_count` in `surface/views.py` counts `suspended`
+  and `withdrawn` items **per attestation** (state belongs to each immutable
+  payload, not to the profile), and `templates/surface/record/detail.html`
+  renders a "Scope adjusted" badge and count following the existing
+  `disputed_count` notice precedent. Six new tests; suite 225 → 231.
+- Implementer-adversary (Sonnet) ACCEPT, two [minor], both fixed: a dead
+  `attestations` context key the diff itself orphaned, and three defensive
+  `isinstance` guards.
+- **Orchestrator ruling — the defensive guards were deleted, not kept.** The
+  adversary proved they guarded shapes no code path can produce. The decisive
+  argument was separate: had they ever fired they would have returned 0 and
+  **silently suppressed the very disclosure this milestone exists to produce**,
+  rendering a corrupt payload as a clean record. Fail-open is the wrong default
+  for a trustworthiness disclosure — a visible 500 beats an invisible lie on
+  this page. `.get()` for the missing-`state` case stays, because that is the
+  permanent legacy contract rather than defensive coding.
+- Verifier-adversary (Grok) ACCEPT, three [minor], one fixed. It closed the
+  question the two coarse mutations left open by proving both **negative**
+  tests fail under false-positive mutations, not merely under feature deletion.
+  Fixed: the legacy fixture now asserts its own precondition (no `state` key on
+  any item), because deleting the guards made that single test the sole
+  guarantee that immutable pre-I1a payloads still render at all. Declined with
+  reasons: assertion-style drift between the suspended and withdrawn tests
+  (both proven to catch off-by-one and single-state counting, so churn without
+  coverage), and fixtures omitting `submitted_at`/`approved_at` (real drift
+  from `canonical_payload`, but inert — neither helper nor template reads them).
+- Compliance Gate (Opus 5, fresh context) PASS, eight checklist items.
+- **The gate earned its seat.** It found what two adversary passes and the
+  orchestrator missed: every test built payloads by hand, so the suite proved
+  the *renderer* but never the *pipeline*. It wrote a throwaway probe driving
+  real services — failed criterion suspended, then delivered and signed — and
+  confirmed the law holds end to end, then deleted the probe. Final acceptance
+  required that scenario become permanent as
+  `test_failed_criterion_suspended_before_signing_is_disclosed_on_public_record`,
+  double-mutation-proven against both the renderer and `canonical_payload`
+  dropping `state`. Without it, a future change that stopped emitting `state`
+  would make the disclosure unreachable with the whole suite still green.
+- Process lesson: hand-built fixtures for an immutable legacy shape are correct
+  and unavoidable, but they quietly decouple the tests from the writer. When a
+  milestone's fixtures bypass the production serializer, at least one test must
+  drive the real path or the serializer is unguarded.
 - Refit/M7 candidates (earlier): per-IP rate limiting on login
   request; CSRF-denial test (enforce_csrf_checks) for the confirm POST;
   unused show_console_hint context key (confirmed still set in views.py and

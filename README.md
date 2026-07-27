@@ -10,6 +10,11 @@ The Capability Record is private by default and published only when the
 freelancer explicitly opts in. Until then it 404s for everyone but its owner,
 who can preview it from `/record/`, and it carries `X-Robots-Tag: noindex`.
 
+A published record never shows a signed attestation as a clean sweep when it
+was not one. Acceptance criteria that were parked or withdrawn before signing
+are disclosed on the record as a "Scope adjusted" badge and a count, so a
+reader can tell that the delivered scope differs from the scope agreed.
+
 ## Stack
 
 - Django 6 + SQLite (dev) / Postgres via `DATABASE_URL` (prod)

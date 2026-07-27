@@ -51,19 +51,26 @@
   <section>
     <h2>Signed attestations</h2>
     <div class="stack">
-      {% for attestation in attestations %}
+      {% for row in attestation_rows %}
         <article class="card">
           <div class="record-heading">
-            <h3>{{ attestation.payload.title }}</h3>
+            <h3>{{ row.attestation.payload.title }}</h3>
             <span class="badge">Verified</span>
           </div>
-          <p>Signed {{ attestation.signed_at|date:"M j, Y" }}</p>
-          {% if attestation.payload.skills %}
-            <p><strong>Skills:</strong> {{ attestation.payload.skills|join:", " }}</p>
+          <p>Signed {{ row.attestation.signed_at|date:"M j, Y" }}</p>
+          {% if row.parked_count %}
+            <p class="dispute-notice" role="status">
+              <span class="badge">Scope adjusted</span>
+              {{ row.parked_count }} acceptance {{ row.parked_count|pluralize:"criterion,criteria" }}
+              {% if row.parked_count == 1 %}was{% else %}were{% endif %} parked or withdrawn from this signed record.
+            </p>
+          {% endif %}
+          {% if row.attestation.payload.skills %}
+            <p><strong>Skills:</strong> {{ row.attestation.payload.skills|join:", " }}</p>
           {% endif %}
           <dl>
             <dt>SHA-256 record hash</dt>
-            <dd class="break-word record-hash">{{ attestation.payload_hash }}</dd>
+            <dd class="break-word record-hash">{{ row.attestation.payload_hash }}</dd>
           </dl>
         </article>
       {% empty %}

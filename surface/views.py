@@ -161,6 +161,20 @@ def _client_token_error(request):
     return render(request, "surface/client/token_error.html", status=410)
 
 
+def _parked_acceptance_count(payload):
+    """Count suspended or withdrawn items in a signed payload."""
+    acceptance_items = payload.get("acceptance_items", [])
+    parked_states = {
+        AcceptanceItem.State.SUSPENDED,
+        AcceptanceItem.State.WITHDRAWN,
+    }
+    return sum(
+        1
+        for item in acceptance_items
+        if item.get("state") in parked_states
+    )
+
+
 class HomeView(View):
     """Show marketing landing for visitors and route signed-in users to projects."""
 
@@ -903,10 +917,17 @@ class PublicRecordView(TemplateView):
         """Build public record data through Ledger derivation services."""
         context = super().get_context_data(**kwargs)
         attestations = services.public_attestations(self.profile)
+        attestation_rows = [
+            {
+                "attestation": attestation,
+                "parked_count": _parked_acceptance_count(attestation.payload),
+            }
+            for attestation in attestations
+        ]
         context.update(
             {
                 "profile": self.profile,
-                "attestations": attestations,
+                "attestation_rows": attestation_rows,
                 "capability_tags": self.profile.capability_tags.all(),
                 "last_shipped": attestations[0].signed_at if attestations else None,
                 "disputed_count": services.disputed_count(self.profile),

@@ -15,11 +15,13 @@ from django.urls import reverse
 from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
 from ledger.services import (
     approve_criteria,
+    compute_payload_hash,
     flag_dispute,
     mark_delivered,
     set_profile_visibility,
     sign_attestation,
     submit_criteria_for_approval,
+    suspend_acceptance_item,
 )
 from surface import billing
 from surface.auth import (
@@ -1510,6 +1512,206 @@ class PublicRecordViewTests(TestCase):
         self.review_token = make_client_token(self.clean_project, "review")
         self.sign_token = make_client_token(self.clean_project, "sign")
         self.client = Client()
+
+    def create_payload_attestation(self, title, acceptance_items):
+        """Create a current attestation from an explicit signed payload fixture."""
+        project = Project.objects.create(
+            owner=self.owner,
+            title=title,
+            client_name="Payload Fixture Client",
+            client_email="payload-fixture@example.com",
+            brief="Payload fixture brief",
+            skills_csv="",
+            status=Project.Status.ATTESTED,
+        )
+        payload = {
+            "acceptance_items": acceptance_items,
+            "approved_change_orders": [],
+            "brief": project.brief,
+            "revision_limit": project.revision_limit,
+            "skills": [],
+            "title": title,
+        }
+        return project.attestations.create(
+            payload=payload,
+            payload_hash=compute_payload_hash(payload),
+            client_email=project.client_email,
+            client_name_typed="Payload Fixture Signer",
+            signature_meta={},
+        )
+
+    def get_public_record(self):
+        """Render the published record for this test profile."""
+        return self.client.get(
+            reverse("surface:public-record", kwargs={"handle": self.owner.handle})
+        )
+
+    def attestation_markup(self, response, title):
+        """Return the rendered article content following one attestation title."""
+        return response.content.decode().split(title, 1)[1].split("</article>", 1)[0]
+
+    def test_legacy_payload_without_state_renders_without_parked_notice(self):
+        """Missing legacy item state is treated as active, not parked."""
+        title = "Legacy Payload Project"
+        legacy_attestation = self.create_payload_attestation(
+            title,
+            [
+                {
+                    "text": "Legacy criterion",
+                    "is_passed": True,
+                    "evidence_url": "",
+                }
+            ],
+        )
+        for item in legacy_attestation.payload["acceptance_items"]:
+            self.assertNotIn("state", item)
+
+        response = self.get_public_record()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, title)
+        self.assertNotIn("Scope adjusted", self.attestation_markup(response, title))
+
+    def test_suspended_item_discloses_parked_criterion_count(self):
+        """A suspended payload item produces the generic scope-adjustment notice."""
+        title = "Suspended Payload Project"
+        self.create_payload_attestation(
+            title,
+            [
+                {
+                    "text": "Parked criterion",
+                    "state": AcceptanceItem.State.SUSPENDED,
+                    "is_passed": False,
+                    "evidence_url": "",
+                }
+            ],
+        )
+
+        markup = self.attestation_markup(self.get_public_record(), title)
+
+        self.assertIn("Scope adjusted", markup)
+        self.assertIn(
+            "1 acceptance criterion\n              was parked or withdrawn",
+            markup,
+        )
+
+    def test_withdrawn_item_discloses_parked_criterion_count(self):
+        """A withdrawn payload item produces the generic scope-adjustment notice."""
+        title = "Withdrawn Payload Project"
+        self.create_payload_attestation(
+            title,
+            [
+                {
+                    "text": "Withdrawn criterion",
+                    "state": AcceptanceItem.State.WITHDRAWN,
+                    "is_passed": False,
+                    "evidence_url": "",
+                }
+            ],
+        )
+
+        markup = self.attestation_markup(self.get_public_record(), title)
+
+        self.assertIn("Scope adjusted", markup)
+        self.assertIn("1 acceptance criterion", markup)
+        self.assertIn("was parked or withdrawn", markup)
+
+    def test_all_approved_items_show_no_parked_notice(self):
+        """Approved payload items do not imply any signed scope adjustment."""
+        title = "Approved Payload Project"
+        self.create_payload_attestation(
+            title,
+            [
+                {
+                    "text": "Approved criterion",
+                    "state": AcceptanceItem.State.APPROVED,
+                    "is_passed": True,
+                    "evidence_url": "",
+                }
+            ],
+        )
+
+        response = self.get_public_record()
+
+        self.assertContains(response, title)
+        self.assertNotIn("Scope adjusted", self.attestation_markup(response, title))
+
+    def test_legacy_and_new_payloads_disclose_only_parked_attestation(self):
+        """Mixed payload generations are counted independently per attestation."""
+        legacy_title = "Mixed Legacy Payload"
+        parked_title = "Mixed Parked Payload"
+        self.create_payload_attestation(
+            legacy_title,
+            [{"text": "Legacy", "is_passed": True, "evidence_url": ""}],
+        )
+        self.create_payload_attestation(
+            parked_title,
+            [
+                {
+                    "text": "Suspended",
+                    "state": AcceptanceItem.State.SUSPENDED,
+                    "is_passed": False,
+                    "evidence_url": "",
+                },
+                {
+                    "text": "Withdrawn",
+                    "state": AcceptanceItem.State.WITHDRAWN,
+                    "is_passed": True,
+                    "evidence_url": "",
+                },
+            ],
+        )
+
+        response = self.get_public_record()
+
+        self.assertNotIn(
+            "Scope adjusted",
+            self.attestation_markup(response, legacy_title),
+        )
+        parked_markup = self.attestation_markup(response, parked_title)
+        self.assertIn("Scope adjusted", parked_markup)
+        self.assertIn("2 acceptance criteria", parked_markup)
+        self.assertIn("were parked or withdrawn", parked_markup)
+
+    def test_failed_criterion_suspended_before_signing_is_disclosed_on_public_record(self):
+        """A signed project cannot hide a failed criterion that was suspended."""
+        project = make_draft_project(owner=self.owner)
+        project.title = "Suspended Failure Pipeline Project"
+        project.save(update_fields=("title",))
+        AcceptanceItem.objects.create(
+            project=project,
+            text="Second criterion",
+            order=2,
+        )
+        submit_criteria_for_approval(project)
+        approve_criteria(project)
+        passed_item, failed_item = project.acceptance_items.order_by("order")
+        passed_item.is_passed = True
+        passed_item.save(update_fields=("is_passed",))
+        failed_item.is_passed = False
+        failed_item.save(update_fields=("is_passed",))
+        suspend_acceptance_item(failed_item)
+        mark_delivered(project)
+
+        attestation = sign_attestation(
+            project,
+            project.client_email,
+            "Pipeline Test Signer",
+            {},
+        )
+
+        self.assertEqual(
+            [
+                item.get("state")
+                for item in attestation.payload["acceptance_items"]
+            ],
+            [
+                AcceptanceItem.State.APPROVED,
+                AcceptanceItem.State.SUSPENDED,
+            ],
+        )
+        markup = self.attestation_markup(self.get_public_record(), project.title)
+        self.assertIn("Scope adjusted", markup)
 
     def test_anonymous_unpublished_record_returns_404(self):
         """Anonymous visitors cannot discover an unpublished record."""
