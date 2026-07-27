@@ -539,9 +539,217 @@ for leaving the client-consent seam as prose. These decisions are binding.
   window" phrasing was too strong. Admin readonly for item state is logged as
   a Refit candidate rather than fixed here.
 
-### I2 — Per-criterion to-do/notes (owning: Ledger + Surface)
-- Notes and client-visible acknowledgements per acceptance item. Depends on
-  I1a's per-item granularity and on I3's client identity for attribution.
+### I2 — Per-criterion steps (owning: Ledger, then Surface; full dispatch)
+
+Planned 2026-07-27. An acceptance criterion is often broad ("build a page for
+current and past customer projects"), and the freelancer wants to record the
+granular steps underneath it so the client can see what the work actually
+involves.
+
+**Human ruling: the client sees the steps, and they enter the signed record.**
+The alternative — client-visible but unsigned — was put to the human and
+rejected on the orchestrator's recommendation, because it recreates in a new
+place the exact defect I1b-1, I1b-3 and I1b-4 each existed to close: a client
+reads something, approves on the strength of it, and the permanent record does
+not contain it. If the client sees it, it is signed.
+
+The old stub said this depends on I3 for client identity. **It does not.** That
+dependency only existed for attributing notes to a client author. Steps are
+freelancer-authored and client-*visible*; nobody needs an identity to read them.
+I3 is no longer a prerequisite.
+
+#### Decisions
+
+- **Name and shape.** `AcceptanceStep`, FK to `AcceptanceItem`
+  (`related_name="steps"`), with `text`, `order`, `is_done`, `created_at`.
+  Mirrors `AcceptanceItem`'s own shape, including a unique-order-per-parent
+  constraint and `ordering = ("order", "pk")`. Called "steps" rather than
+  "notes" in the UI because the done flag makes them tasks, and because a client
+  reading a signed record should see a list of work, not marginalia.
+- **Structure locks with the parent; progress does not.** Adding, editing,
+  reordering and deleting steps is permitted only while the parent item is
+  `draft`. Ticking `is_done` is permitted only when the parent item is
+  `approved` **and** the project is `active`. This is the crux of the design: a
+  step's wording can never change after a client approved it, so the approval
+  cannot go stale in the dangerous direction, while the freelancer can still
+  track progress during the work.
+- **The `is_done` predicate is stated exactly, not by analogy.** An earlier draft
+  of this plan said "while the project is `active`, exactly as `is_passed`
+  already is", and the Planner-adversary caught that those are different things:
+  `DeliveryItemUpdateView` gates `is_passed` on project `active` **and**
+  `get_object_or_404(..., state=APPROVED)`. The loose phrasing would have let
+  `is_done` be toggled on a `submitted` item sitting in a client's live review
+  batch. The binding rule is the conjunction above: **project `active` AND parent
+  item `approved`.** Consequently steps on `draft`, `submitted`, `suspended` and
+  `withdrawn` items cannot be ticked at all — a parked item's progress freezes
+  until it is resumed, which is the intended reading of parking.
+- **Steps enter `canonical_payload`, nested under their item**, serialising
+  `text` and `is_done` in `order, pk` sequence. Order is positional, matching how
+  acceptance items already omit `order` and `pk`.
+- **Items with no steps serialise `"steps": []`,** so live payload shape is
+  uniform and readers never branch on key presence for current data. Only
+  pre-I2 stored payloads lack the key entirely.
+- **`canonical_payload` fetches steps in one additional query, not per item.**
+  It currently builds items from a single flat `.values()`; nesting must not turn
+  that into N+1 in a function that runs at every signature. Fetch every step for
+  the project ordered by `(item_id, order, pk)` and group in Python: two queries
+  total, deterministic ordering.
+- **The golden digest changes exactly once, deliberately.**
+  `test_golden_hash_matches_sorted_canonical_json` pins
+  `302fc585ff14c2b1fda0c67375100b4ec8d802368bbf92306815cd56ef53dc19`. Adding a
+  key to every item's payload dict changes it. The new literal must be recomputed
+  and re-pinned in the same commit, and the fixture extended to include an item
+  that actually has steps — a digest re-pinned over a fixture with no steps would
+  pin nothing.
+- **A second test asserts the exact per-item dict and will also break.**
+  `test_canonical_payload_serializes_item_state_and_timestamps` asserts full
+  equality against a six-key dict with no `steps`. The Planner-adversary found
+  this by grepping after the first draft claimed the golden digest was the only
+  stored value at risk; that claim was wrong. Both tests are inside I2a's
+  boundary and both must be updated deliberately rather than discovered.
+- **No backfill, and legacy payloads must render.** Existing signed attestations
+  keep their payloads untouched; the constitution forbids otherwise. Anything
+  reading a payload must tolerate items with no `steps` key, the way I1b-1
+  already tolerates items with no `state`.
+- **Steps do not gate delivery or signing.** They are granular acknowledgement,
+  not acceptance conditions, and gating on them would invite exactly the deadlock
+  family I1b-4 and I1c spent a day closing. A criterion may be marked passed with
+  steps outstanding; the signing page shows both facts and lets the client weigh
+  them. Whether the freelancer should get a soft warning in that case is logged
+  as a follow-up, not built.
+- **The fingerprint is specified exactly.** `_submitted_batch_fingerprint`
+  currently emits `json.dumps` of a sorted list of `[item_pk, submitted_at_iso]`,
+  with `"__missing_submitted_at__"` as the null sentinel. Each entry gains a
+  third element: the item's steps ordered by `(order, pk)`, each as
+  `[step_pk, step_text, step_order, step_is_done]`. **Return a SHA-256 hex digest
+  of that JSON rather than the JSON itself**, because the value round-trips
+  through a hidden form field and step text would otherwise grow it without
+  bound. Existing tests read the fingerprint out of the rendered form rather than
+  reconstructing it, so they are format-agnostic; confirm that rather than
+  assuming it.
+- **Step text is in the fingerprint even though the lock model says it cannot
+  change.** Under the rules above nothing about a submitted item's steps is
+  mutable, so in principle the fingerprint need only cover existence. Include
+  text and `is_done` anyway. The whole point of pinning is to stop relying on an
+  invariant enforced somewhere else — this project has now been bitten three
+  times by exactly that reasoning, most recently when a race test passed against
+  a check-then-act implementation because it trusted a guarantee it did not test.
+- **The public Capability Record does not change.** It never listed criterion
+  text and will not list steps; it continues to show title, skills, hash and the
+  parked-scope notice. Steps live in the payload for the signer's benefit and for
+  the record's integrity, not for public display.
+
+#### The service surface, named
+
+The first draft named no functions at all, which is the third time a plan in
+this project has left the implementer to invent an API. I1a's plan is the
+standard to match: it enumerated every transition individually. These are the
+functions I2a creates in `ledger/services.py`, and the implementer adds no
+others without escalating:
+
+| Function | Guard | Raises |
+|---|---|---|
+| `create_acceptance_step(item, text, order)` | parent item `draft` | `InvalidTransition` |
+| `update_acceptance_step(step, text, order)` | parent item `draft` | `InvalidTransition` |
+| `delete_acceptance_step(step)` | parent item `draft` | `InvalidTransition` |
+| `set_acceptance_step_done(step, is_done)` | parent item `approved` and project `active` | `InvalidTransition` |
+| `acceptance_step_locked(step)` | — | returns bool, mirrors `acceptance_item_locked` |
+
+- **`create_acceptance_step` is the one exception to the idiom below**, because
+  there is no conditional INSERT: it checks the parent lock and then creates,
+  matching `AcceptanceItemCreateView`'s existing shape including the unique-order
+  savepoint. The other three mutations use the guarded-statement idiom.
+- **The unique-order constraint raises `IntegrityError`, not
+  `InvalidTransition`,** and it can fire independently of every guard above.
+  Surface catches it exactly as it already does for duplicate acceptance-item
+  order — `try` / `transaction.atomic()` / `except IntegrityError` returning an
+  inline form error — so a duplicate step position never surfaces as a 500.
+- **Every other mutation is a database-side guarded statement, not a
+  read-then-write.**
+  Follow the `delete_acceptance_item` and `_transition_acceptance_item` idiom:
+  fold the parent-state condition into the same filtered `update()` or
+  `delete()`, check the affected-row count, and raise on zero. Do **not** inherit
+  the existing read-then-save shape in `AcceptanceItemUpdateView`, which the
+  Planner-adversary correctly identified as a live TOCTOU window of the same
+  family that I1a-2, I1a-3 and I1c were each written to close. Carrying that
+  pattern into new payload-bound content would be a deliberate regression, and
+  silence in the first draft was itself a decision made by omission.
+- On refusal, distinguish the causes the way `delete_acceptance_item` does:
+  parent locked, parent not approved, project not active, row gone.
+- **Step text has no length cap and step count is unbounded**, matching how
+  acceptance item text and count already behave. Stated so nobody invents a
+  limit. `text` is `TextField`, required, non-blank after strip.
+
+#### Milestones
+
+- **I2a — Ledger.** Model, migration, the five services above,
+  `canonical_payload`, and the two test updates. Boundaries:
+  `ledger/models.py`, `ledger/migrations/**`, `ledger/services.py`,
+  `ledger/tests.py`. Migration explicitly authorized: additive, no data
+  migration, because no existing row needs a step.
+- **`AcceptanceStep` is deliberately NOT registered in the Django admin**, and
+  `ledger/admin.py` is therefore **out** of I2a's boundary. The adversary noted
+  that a default registration would be worse than the standing
+  `AcceptanceItemAdmin` gap: editing `step.text` through the admin would not
+  touch the parent's `submitted_at`, so the review fingerprint would show no
+  staleness even though locked, client-visible, payload-bound text had changed.
+  Nothing needs admin access to steps. Not registering is the smallest safe
+  choice and is trivially reversible.
+- **I2b — Surface.** Freelancer step editor under each draft criterion, done
+  ticking on approved items of active projects, step display on the client
+  review and signing pages, and the fingerprint change. Boundaries:
+  `surface/views.py`, `surface/forms.py`, `surface/urls.py`,
+  `surface/tests.py`, `templates/surface/partials/**`,
+  `templates/surface/client/review.html`,
+  `templates/surface/client/sign.html`, and `static/css/app.css` — the last
+  granted up front because I1b-4 had to extend its boundary mid-milestone for
+  exactly this kind of nested-list styling. Reuse existing `criterion`, `badge`,
+  `muted` and `stack` conventions; add a class only where none fits.
+- URL and view naming follows the established child-resource convention:
+  `projects/<project_pk>/criteria/<item_pk>/steps/...`, names
+  `criterion-step-<action>`, `OwnedProjectMixin` for ownership, HTMX partial
+  responses via the existing `_is_htmx` and `_render_criteria` helpers.
+
+#### Role sequence and test strategy
+
+Planner → Implementer → Verifier for each milestone, with **the
+Verifier-adversary seat kept separate throughout** — I2b moves editing
+permissions, which is the case where an implementer-adversary is structurally
+blind, per the I1b-4 lesson.
+
+Tests must cover:
+
+- The golden digest changing exactly as intended and not otherwise, over a
+  fixture that actually contains steps.
+- A legacy payload with no `steps` key still rendering everywhere a payload is
+  read, following the I1b-1 precedent for payloads with no `state`.
+- Structure edits refused once the parent item leaves `draft`, **enumerated
+  across every item state**, at both the service and the view layer.
+- `is_done` writable exactly when the parent is `approved` and the project is
+  `active`, and refused in every other combination — both bounds pinned, not
+  just the permitted one. This is the I1b-4 lesson: the side of a gate you did
+  not move is the side nobody tests.
+- A step change changing the fingerprint — **as a unit test on
+  `_submitted_batch_fingerprint` itself**, feeding it two item-plus-step inputs
+  identical except for step content and asserting the digests differ. It cannot
+  be an end-to-end test: the lock model means a submitted item's steps cannot
+  change while `submitted_at` holds, so any end-to-end version would be driven
+  by the timestamp and would still pass if steps were silently dropped from the
+  hash. That is precisely the softball this project's Verifier-adversary
+  checklist exists to catch, and the adversary caught it in the plan instead.
+- The signing page showing a criterion passed with an outstanding step honestly,
+  disclosing both facts rather than hiding either.
+- `AiDraftConfirmView`'s bulk delete cascading to steps. The adversary verified
+  this path is safe by construction — it is `draft`-only, and `mark_delivered`
+  refuses while any item is `draft`, so cascaded steps can never have been
+  client-visible — but safe-by-construction and tested are different things.
+
+**A hand-driven walkthrough is part of this initiative's definition of done, not
+an optional extra.** I1b-4 exists because 254 passing tests sat over two real
+defects that twenty minutes of clicking found immediately. Steps introduce a
+nested list on four different pages with different audiences; at minimum, look
+at the freelancer editor, the client review page and the signing page in a real
+browser before the Compliance Gate runs.
 
 ### I3 — Client portal (owning: Surface; hazard: auth; full dispatch)
 - Client identity keyed to `client_email`, own magic-link flow, persistent
@@ -1146,6 +1354,21 @@ the signing page and signing it.
   delivery, including the bulk `acceptance_items.all().delete()` inside
   `AiDraftConfirmView`, which is `DRAFT`-only. Single-item deletion was the only
   hole.
+
+##### Refit candidate — `AcceptanceItemUpdateView` reads the lock, then saves
+
+Found by the I2 Planner-adversary. `AcceptanceItemUpdateView.post` calls
+`services.acceptance_item_locked(item)` and then separately calls `form.save()`,
+leaving a window between the check and the write. It is the same read-then-write
+family that I1a-2, I1a-3 and I1c each closed elsewhere with database-side
+guarded statements.
+
+Deliberately not fixed under I2, per the cleanup doctrine: it is pre-existing,
+outside I2's boundary, and I2's own step mutations use the guarded idiom rather
+than inheriting this one. The adversary was asked directly whether writing
+guarded code beside an unguarded neighbour is incoherent enough to force the
+issue, and ruled that it is not. Logged here so the deferral is a decision on
+the record rather than an inline aside.
 
 ##### Roadmap item — `reopen_active` is a latent bypass of I1c
 
