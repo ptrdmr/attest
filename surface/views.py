@@ -1,6 +1,7 @@
 """HTTP views for projects, delivery, signing, and public records."""
 
 from hashlib import sha256
+import json
 import smtplib
 
 from urllib.parse import urlencode
@@ -37,6 +38,7 @@ from .forms import (
     AiDumpForm,
     ChangeOrderDecisionForm,
     ChangeOrderForm,
+    ClientApprovalForm,
     DeliveryItemForm,
     MagicLinkRequestForm,
     ProfileVisibilityForm,
@@ -110,6 +112,20 @@ def _send_signing_link(request, project):
     )
 
 
+def _send_review_link(request, project):
+    """Email a fresh purpose-bound criteria review URL."""
+    review_token = make_client_token(project, "review")
+    review_url = request.build_absolute_uri(
+        reverse("surface:client-review", kwargs={"token": review_token})
+    )
+    return _send_email(
+        request,
+        subject="Review project criteria",
+        body=review_url,
+        recipient=project.client_email,
+    )
+
+
 def _send_change_order_link(request, change_order):
     """Email a proposal URL without rendering its token."""
     token = make_change_order_token(change_order)
@@ -126,14 +142,23 @@ def _send_change_order_link(request, change_order):
 
 def _project_context(project, **extra):
     """Build the common project-detail template context."""
+    acceptance_items = list(project.acceptance_items.all())
+    criteria_rows = [
+        {
+            "item": item,
+            "locked": services.acceptance_item_locked(item),
+        }
+        for item in acceptance_items
+    ]
     delivery_rows = [
         {"item": item, "form": DeliveryItemForm(instance=item)}
-        for item in project.acceptance_items.all()
+        for item in acceptance_items
+        if item.state == AcceptanceItem.State.APPROVED
     ]
     context = {
         "project": project,
-        "acceptance_items": project.acceptance_items.all(),
-        "criteria_locked": services.criteria_locked(project),
+        "acceptance_items": acceptance_items,
+        "criteria_rows": criteria_rows,
         "acceptance_form": AcceptanceItemForm(),
         "ai_dump_form": AiDumpForm(),
         "change_order_form": ChangeOrderForm(),
@@ -159,6 +184,44 @@ def _render_criteria(request, project, *, form=None, status=200):
 def _client_token_error(request):
     """Return the friendly gone page for an invalid or expired client token."""
     return render(request, "surface/client/token_error.html", status=410)
+
+
+def _submitted_batch_fingerprint(items):
+    """Serialize item identity and submission time as a stable set fingerprint."""
+    submitted_pairs = sorted(
+        (
+            item.pk,
+            (
+                item.submitted_at.isoformat()
+                if item.submitted_at is not None
+                else "__missing_submitted_at__"
+            ),
+        )
+        for item in items
+    )
+    return json.dumps(submitted_pairs, separators=(",", ":"))
+
+
+def _client_review_context(project, token, *, stale_batch=False):
+    """Build client review context from the project's current item states."""
+    pending_items = list(
+        project.acceptance_items.filter(state=AcceptanceItem.State.SUBMITTED)
+    )
+    return {
+        "project": project,
+        "token": token,
+        "pending_acceptance_items": pending_items,
+        "approved_acceptance_items": project.acceptance_items.filter(
+            state=AcceptanceItem.State.APPROVED
+        ),
+        "approval_form": ClientApprovalForm(
+            initial={
+                "batch_fingerprint": _submitted_batch_fingerprint(pending_items),
+            }
+        ),
+        "action_form": ActionForm(),
+        "stale_batch": stale_batch,
+    }
 
 
 def _parked_acceptance_count(payload):
@@ -463,7 +526,10 @@ class AcceptanceItemCreateView(OwnedProjectMixin, View):
 
     def post(self, request, project_pk):
         """Validate and create an ordered acceptance item."""
-        if services.criteria_locked(self.project):
+        if self.project.status not in {
+            Project.Status.DRAFT,
+            Project.Status.ACTIVE,
+        }:
             raise Http404
         item = AcceptanceItem(project=self.project)
         form = AcceptanceItemForm(request.POST, instance=item)
@@ -501,9 +567,9 @@ class AcceptanceItemUpdateView(OwnedProjectMixin, View):
 
     def get(self, request, project_pk, item_pk):
         """Render an inline form for the selected criterion."""
-        if services.criteria_locked(self.project):
-            raise Http404
         item = get_object_or_404(AcceptanceItem, pk=item_pk, project=self.project)
+        if services.acceptance_item_locked(item):
+            raise Http404
         form = AcceptanceItemForm(instance=item)
         return render(
             request,
@@ -513,9 +579,9 @@ class AcceptanceItemUpdateView(OwnedProjectMixin, View):
 
     def post(self, request, project_pk, item_pk):
         """Validate and persist criterion edits."""
-        if services.criteria_locked(self.project):
-            raise Http404
         item = get_object_or_404(AcceptanceItem, pk=item_pk, project=self.project)
+        if services.acceptance_item_locked(item):
+            raise Http404
         form = AcceptanceItemForm(request.POST, instance=item)
         if form.is_valid():
             try:
@@ -555,16 +621,87 @@ class AcceptanceItemDeleteView(OwnedProjectMixin, View):
 
     def post(self, request, project_pk, item_pk):
         """Validate and remove a criterion owned through the project."""
-        if services.criteria_locked(self.project):
-            raise Http404
         form = ActionForm(request.POST)
         if not form.is_valid():
             raise Http404
         item = get_object_or_404(AcceptanceItem, pk=item_pk, project=self.project)
-        item.delete()
+        try:
+            services.delete_acceptance_item(item)
+        except services.InvalidTransition:
+            raise Http404 from None
         if _is_htmx(request):
             return _render_criteria(request, self.project)
         return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
+class AcceptanceItemActionView(OwnedProjectMixin, View):
+    """Apply one legal per-item state transition for an active project."""
+
+    service = None
+    success_message = ""
+
+    def post(self, request, project_pk, item_pk):
+        """Validate the action and delegate the item transition to Ledger."""
+        if self.project.status != Project.Status.ACTIVE:
+            raise Http404
+        form = ActionForm(request.POST)
+        if not form.is_valid() or self.service is None:
+            raise Http404
+        item = get_object_or_404(
+            AcceptanceItem,
+            pk=item_pk,
+            project=self.project,
+        )
+        try:
+            self.service(item)
+        except services.InvalidTransition:
+            raise Http404 from None
+        if self.success_message:
+            messages.success(request, self.success_message)
+        if _is_htmx(request):
+            return _render_criteria(request, self.project)
+        return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
+class AcceptanceItemSubmitView(AcceptanceItemActionView):
+    """Submit one active-project draft item and invite client review."""
+
+    service = staticmethod(services.submit_acceptance_item_for_approval)
+
+    def post(self, request, project_pk, item_pk):
+        """Submit the item, email a fresh review link, and render its new state."""
+        response = super().post(request, project_pk, item_pk)
+        if _send_review_link(request, self.project):
+            messages.success(request, "Criterion sent for client approval.")
+        return response
+
+
+class AcceptanceItemPullBackView(AcceptanceItemActionView):
+    """Pull one submitted item back to editable draft state."""
+
+    service = staticmethod(services.pull_back_acceptance_item)
+    success_message = "Criterion pulled back to draft."
+
+
+class AcceptanceItemSuspendView(AcceptanceItemActionView):
+    """Suspend one submitted or approved acceptance item."""
+
+    service = staticmethod(services.suspend_acceptance_item)
+    success_message = "Criterion suspended."
+
+
+class AcceptanceItemResumeView(AcceptanceItemActionView):
+    """Resume one suspended acceptance item to its prior state."""
+
+    service = staticmethod(services.resume_acceptance_item)
+    success_message = "Criterion resumed."
+
+
+class AcceptanceItemWithdrawView(AcceptanceItemActionView):
+    """Withdraw one approved acceptance item permanently."""
+
+    service = staticmethod(services.withdraw_acceptance_item)
+    success_message = "Criterion withdrawn from scope."
 
 
 class SubmitCriteriaView(OwnedProjectMixin, View):
@@ -581,16 +718,7 @@ class SubmitCriteriaView(OwnedProjectMixin, View):
         except services.InvalidTransition:
             messages.error(request, "This project cannot be sent for approval now.")
             return redirect("surface:project-detail", project_pk=self.project.pk)
-        review_token = make_client_token(self.project, "review")
-        review_url = request.build_absolute_uri(
-            reverse("surface:client-review", kwargs={"token": review_token})
-        )
-        if _send_email(
-            request,
-            subject="Review project criteria",
-            body=review_url,
-            recipient=self.project.client_email,
-        ):
+        if _send_review_link(request, self.project):
             messages.success(request, "Criteria sent for client approval.")
         # Review token lives only in the email — never in the HTML response.
         return render(
@@ -644,6 +772,7 @@ class DeliveryItemUpdateView(OwnedProjectMixin, View):
             AcceptanceItem,
             pk=item_pk,
             project=self.project,
+            state=AcceptanceItem.State.APPROVED,
         )
         form = DeliveryItemForm(request.POST, instance=item)
         if form.is_valid():
@@ -657,6 +786,7 @@ class DeliveryItemUpdateView(OwnedProjectMixin, View):
                 "form": form if candidate.pk == item.pk else DeliveryItemForm(instance=candidate),
             }
             for candidate in self.project.acceptance_items.all()
+            if candidate.state == AcceptanceItem.State.APPROVED
         ]
         return render(
             request,
@@ -675,7 +805,9 @@ class MarkDeliveredView(OwnedProjectMixin, View):
     def post(self, request, project_pk):
         """Validate completion, transition through Ledger, and invite signing."""
         form = ActionForm(request.POST)
-        items = self.project.acceptance_items.all()
+        items = self.project.acceptance_items.filter(
+            state=AcceptanceItem.State.APPROVED
+        )
         if (
             not form.is_valid()
             or not items.exists()
@@ -795,11 +927,10 @@ class ClientReviewView(ClientTokenMixin, TemplateView):
         """Add read-only project review details."""
         context = super().get_context_data(**kwargs)
         context.update(
-            {
-                "project": self.project,
-                "acceptance_items": self.project.acceptance_items.all(),
-                "action_form": ActionForm(),
-            }
+            _client_review_context(
+                self.project,
+                self.kwargs["token"],
+            )
         )
         return context
 
@@ -810,15 +941,40 @@ class ClientApproveView(ClientTokenMixin, View):
     token_purpose = "review"
 
     def post(self, request, token):
-        """Validate the action and activate pending project criteria."""
-        form = ActionForm(request.POST)
+        """Approve the exact submitted batch whose fingerprint the client saw."""
+        form = ClientApprovalForm(request.POST)
         if not form.is_valid():
-            return _client_token_error(request)
-        try:
-            services.approve_criteria(self.project)
-        except services.InvalidTransition:
-            messages.info(request, "These criteria were already handled.")
+            return self._review_response(request, token, stale_batch=True)
+        with transaction.atomic():
+            submitted_items = list(
+                self.project.acceptance_items.select_for_update().filter(
+                    state=AcceptanceItem.State.SUBMITTED
+                )
+            )
+            current_fingerprint = _submitted_batch_fingerprint(submitted_items)
+            if not submitted_items:
+                return self._review_response(request, token, stale_batch=False)
+            if form.cleaned_data["batch_fingerprint"] != current_fingerprint:
+                return self._review_response(request, token, stale_batch=True)
+            try:
+                services.approve_acceptance_items(submitted_items)
+                if self.project.status == Project.Status.CRITERIA_PENDING:
+                    services.approve_criteria(self.project)
+            except services.InvalidTransition:
+                messages.info(request, "These criteria were already handled.")
         return render(request, "surface/client/thanks.html", {"project": self.project})
+
+    def _review_response(self, request, token, *, stale_batch):
+        """Re-render current review scope with one accurate status notice."""
+        return render(
+            request,
+            "surface/client/review.html",
+            _client_review_context(
+                self.project,
+                token,
+                stale_batch=stale_batch,
+            ),
+        )
 
 
 class ClientRequestChangesView(ClientTokenMixin, View):

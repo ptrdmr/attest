@@ -8,27 +8,43 @@
     <p class="pre-line">{{ project.brief }}</p>
   </section>
   <section class="card">
-    <h2>Acceptance criteria</h2>
+    <h2>Criteria awaiting your approval</h2>
+    {% if stale_batch %}
+      <p class="notice" role="alert">
+        The criteria changed after this page was shown. Please re-review the current criteria before approving.
+      </p>
+    {% endif %}
     <ol>
-      {% for item in acceptance_items %}
+      {% for item in pending_acceptance_items %}
         <li class="pre-line">{{ item.text }}</li>
       {% empty %}
-        <li>No criteria were provided.</li>
+        <li>No criteria are currently awaiting approval.</li>
       {% endfor %}
     </ol>
-    {% if project.status == "criteria_pending" %}
+    {% if pending_acceptance_items %}
       <div class="actions">
-        <form method="post" action="{% url 'surface:client-approve' token=view.kwargs.token %}">
+        <form method="post" action="{% url 'surface:client-approve' token=token %}">
           {% csrf_token %}
+          {{ approval_form.batch_fingerprint }}
           <button type="submit">Approve criteria</button>
         </form>
-        <form method="post" action="{% url 'surface:client-request-changes' token=view.kwargs.token %}">
+        <form method="post" action="{% url 'surface:client-request-changes' token=token %}">
           {% csrf_token %}
           <button class="secondary" type="submit">Request changes</button>
         </form>
       </div>
-    {% else %}
+    {% elif not stale_batch %}
       <p class="notice">These criteria have already been handled.</p>
     {% endif %}
   </section>
+  {% if approved_acceptance_items %}
+    <section class="card">
+      <h2>Already-approved scope</h2>
+      <ol>
+        {% for item in approved_acceptance_items %}
+          <li class="pre-line">{{ item.text }}</li>
+        {% endfor %}
+      </ol>
+    </section>
+  {% endif %}
 {% endblock %}

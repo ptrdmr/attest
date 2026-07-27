@@ -60,6 +60,12 @@ class DeliveryItemForm(forms.ModelForm):
         widgets = {"evidence_url": forms.URLInput(attrs={"placeholder": "https://…"})}
 
 
+class ClientApprovalForm(forms.Form):
+    """Validate the rendered submitted-item batch fingerprint."""
+
+    batch_fingerprint = forms.CharField(widget=forms.HiddenInput)
+
+
 class ChangeOrderForm(forms.Form):
     """Validate a proposed project price and timeline adjustment."""
 

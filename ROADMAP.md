@@ -140,9 +140,15 @@ exists to remove.
 ## Next Maneuver
 
 Both prerequisites are landed: M7a (shared cache) and M7b (public-record opt-in).
-Sequence from here is I1a/I1b (per-item criteria) → I2 (notes) → I3 (portal) →
-I4 (branding), with I5 (directory and search) parallelizable and owning
-`surface/urls.py` plus the `base.html` nav at dispatch. Milestone definitions and
+**Initiative 1 is complete** as of 2026-07-26: I1a (Ledger state machine),
+I1a-2 (guarded compare-and-swap transitions, added mid-flight after an
+adversary proved a concurrent pull-back could erase a recorded client
+approval), I1b-1 (public disclosure of parked criteria), and I1b-2 (per-item
+UI and the client consent seam). Sequence from here is I2 (notes) → I3
+(portal) → I4 (branding), with I5 (directory and search) parallelizable and
+owning `surface/urls.py` plus the `base.html` nav at dispatch. Four
+non-blocking follow-ups from the I1b-2 gate are logged at the end of
+`PLAN.md`; the first two are worth clearing before I2. Milestone definitions and
 file boundaries are in `PLAN.md`.
 
 One small fix goes first: the flaky `test_save_raises_when_signed_at_changed` has

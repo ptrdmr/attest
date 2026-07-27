@@ -1,5 +1,6 @@
 """Verifier tests for the Surface layer (M2 + M3 + M5)."""
 
+from datetime import timedelta
 from hashlib import sha256
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -11,6 +12,7 @@ from django.core.cache.backends.db import DatabaseCache
 from django.core import mail, signing
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
 from ledger.services import (
@@ -22,6 +24,7 @@ from ledger.services import (
     sign_attestation,
     submit_criteria_for_approval,
     suspend_acceptance_item,
+    withdraw_acceptance_item,
 )
 from surface import billing
 from surface.auth import (
@@ -200,6 +203,22 @@ def criteria_panel_html(response):
     start = content.index('id="criteria-panel"')
     end = content.index("</section>", start)
     return content[start:end]
+
+
+def criterion_html(response, item):
+    """Return one criterion article from a project detail response."""
+    panel = criteria_panel_html(response)
+    start = panel.index(f'id="criterion-{item.pk}"')
+    end = panel.index("</article>", start)
+    return panel[start:end]
+
+
+def review_fingerprint(client, token):
+    """Render a client review and return its submitted-batch fingerprint."""
+    response = client.get(
+        reverse("surface:client-review", kwargs={"token": token})
+    )
+    return response.context["approval_form"]["batch_fingerprint"].value()
 
 
 def ai_dump_form_data(**overrides):
@@ -805,8 +824,8 @@ class CriteriaMutationTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(AcceptanceItem.objects.filter(pk=self.item.pk).exists())
 
-    def test_criterion_mutations_return_404_when_locked(self):
-        """Create, update, and delete return 404 after criteria are locked."""
+    def test_approved_item_is_locked_but_active_project_accepts_new_draft(self):
+        """Approved items stay immutable while active scope can gain a draft item."""
         submit_criteria_for_approval(self.project)
         approve_criteria(self.project)
         self.project.refresh_from_db()
@@ -829,11 +848,14 @@ class CriteriaMutationTests(TestCase):
         )
 
         self.assertEqual(
-            self.client.post(create_url, {"text": "Blocked", "order": 2}).status_code,
-            404,
+            self.client.post(create_url, {"text": "New scope", "order": 2}).status_code,
+            302,
         )
-        self.assertFalse(
-            self.project.acceptance_items.filter(text="Blocked").exists()
+        self.assertTrue(
+            self.project.acceptance_items.filter(
+                text="New scope",
+                state=AcceptanceItem.State.DRAFT,
+            ).exists()
         )
         self.assertEqual(
             self.client.post(
@@ -1043,8 +1065,10 @@ class ClientApproveViewTests(TestCase):
 
     def test_client_approve_activates_project(self):
         """Valid approve POST activates the project through ledger.services."""
+        fingerprint = review_fingerprint(self.client, self.token)
         response = self.client.post(
-            reverse("surface:client-approve", kwargs={"token": self.token})
+            reverse("surface:client-approve", kwargs={"token": self.token}),
+            {"batch_fingerprint": fingerprint},
         )
         self.project.refresh_from_db()
         self.assertEqual(self.project.status, Project.Status.ACTIVE)
@@ -1065,18 +1089,351 @@ class ClientApproveViewTests(TestCase):
         self.project.refresh_from_db()
         self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
 
-    def test_client_approve_already_handled_shows_thanks_and_info(self):
-        """A second approve shows an informational message and the thanks page."""
+    def test_client_approve_empty_handled_batch_rerenders_review(self):
+        """A handled batch re-renders review instead of approving empty scope."""
         approve_criteria(self.project)
         self.project.refresh_from_db()
         self.assertEqual(self.project.status, Project.Status.ACTIVE)
 
         response = self.client.post(
-            reverse("surface:client-approve", kwargs={"token": self.token})
+            reverse("surface:client-approve", kwargs={"token": self.token}),
+            {"batch_fingerprint": "[]"},
         )
         self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "No criteria are currently awaiting approval.")
+        self.assertContains(response, "These criteria have already been handled.")
+        self.assertNotContains(response, "criteria changed after this page was shown")
+
+    def test_null_submitted_at_is_stable_on_review_and_approval(self):
+        """Admin-malformed submitted rows remain consent-bound without crashing."""
+        item = self.project.acceptance_items.get()
+        # Surface services always stamp this field. Direct persistence models the
+        # independently editable admin fields that can create this malformed row.
+        item.submitted_at = None
+        item.save(update_fields=("submitted_at",))
+
+        review_response = self.client.get(
+            reverse("surface:client-review", kwargs={"token": self.token})
+        )
+        fingerprint = review_response.context["approval_form"][
+            "batch_fingerprint"
+        ].value()
+        self.assertEqual(review_response.status_code, 200)
+        self.assertContains(review_response, item.text)
+        self.assertIn("__missing_submitted_at__", fingerprint)
+
+        approve_response = self.client.post(
+            reverse("surface:client-approve", kwargs={"token": self.token}),
+            {"batch_fingerprint": fingerprint},
+        )
+        item.refresh_from_db()
+        self.project.refresh_from_db()
+        self.assertEqual(approve_response.status_code, 200)
+        self.assertEqual(item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+
+
+class PerItemCriteriaWorkflowTests(TestCase):
+    """Freelancer item controls and server-bound client consent."""
+
+    def setUp(self):
+        """Create one active owned project with an approved baseline item."""
+        self.owner = make_profile()
+        self.project = make_draft_project(owner=self.owner)
+        advance_to_active(self.project)
+        self.approved_item = self.project.acceptance_items.get()
+        self.client = Client()
+        login_as(self.client, self.owner)
+
+    def add_draft_item(self, *, text="Mid-project criterion", order=2):
+        """Create one draft item directly as setup for Surface transitions."""
+        return AcceptanceItem.objects.create(
+            project=self.project,
+            text=text,
+            order=order,
+        )
+
+    def action_url(self, action, item):
+        """Return one per-item action URL."""
+        return reverse(
+            f"surface:criterion-{action}",
+            kwargs={"project_pk": self.project.pk, "item_pk": item.pk},
+        )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_per_item_submit_emails_working_review_link(self):
+        """Active-project submit stamps the item and emails a usable review page."""
+        item = self.add_draft_item()
+
+        response = self.client.post(
+            self.action_url("submit", item),
+            HTTP_HX_REQUEST="true",
+        )
+
+        item.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(item.state, AcceptanceItem.State.SUBMITTED)
+        self.assertIsNotNone(item.submitted_at)
+        self.assertEqual(len(mail.outbox), 1)
+        review_path = urlparse(mail.outbox[0].body.strip()).path
+        review_response = Client().get(review_path)
+        self.assertEqual(review_response.status_code, 200)
+        self.assertContains(review_response, item.text)
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_per_item_submit_is_refused_before_project_is_active(self):
+        """The item endpoint cannot bypass initial package review from draft."""
+        draft_project = make_draft_project(owner=self.owner)
+        item = draft_project.acceptance_items.get()
+
+        response = self.client.post(
+            reverse(
+                "surface:criterion-submit",
+                kwargs={"project_pk": draft_project.pk, "item_pk": item.pk},
+            )
+        )
+
+        item.refresh_from_db()
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(item.state, AcceptanceItem.State.DRAFT)
+        self.assertEqual(len(mail.outbox), 0)
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_pull_back_submitted_item_through_ui(self):
+        """Pull-back returns submitted scope to editable draft and clears consent time."""
+        item = self.add_draft_item()
+        self.client.post(self.action_url("submit", item))
+
+        response = self.client.post(
+            self.action_url("pull-back", item),
+            HTTP_HX_REQUEST="true",
+        )
+
+        item.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(item.state, AcceptanceItem.State.DRAFT)
+        self.assertIsNone(item.submitted_at)
+        self.assertContains(response, "Edit")
+
+    def test_suspend_and_resume_approved_item_through_ui(self):
+        """Suspend parks approved scope and resume restores its approved state."""
+        suspend_response = self.client.post(
+            self.action_url("suspend", self.approved_item),
+            HTTP_HX_REQUEST="true",
+        )
+        self.approved_item.refresh_from_db()
+        self.assertEqual(suspend_response.status_code, 200)
+        self.assertEqual(self.approved_item.state, AcceptanceItem.State.SUSPENDED)
+        self.assertContains(suspend_response, "Resume")
+
+        resume_response = self.client.post(
+            self.action_url("resume", self.approved_item),
+            HTTP_HX_REQUEST="true",
+        )
+        self.approved_item.refresh_from_db()
+        self.assertEqual(resume_response.status_code, 200)
+        self.assertEqual(self.approved_item.state, AcceptanceItem.State.APPROVED)
+        self.assertContains(resume_response, "Withdraw")
+
+    def test_withdraw_approved_item_through_ui(self):
+        """Withdraw moves approved scope to its terminal visible state."""
+        response = self.client.post(
+            self.action_url("withdraw", self.approved_item),
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.approved_item.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.approved_item.state, AcceptanceItem.State.WITHDRAWN)
+        self.assertContains(response, "Withdrawn")
+        self.assertNotContains(response, ">Resume<")
+
+    def test_delete_refuses_item_that_was_client_approved(self):
+        """The delete route delegates the approved-history guard to Ledger."""
+        response = self.client.post(
+            self.action_url("delete", self.approved_item),
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(
+            AcceptanceItem.objects.filter(pk=self.approved_item.pk).exists()
+        )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_client_approves_current_submitted_batch_only(self):
+        """Approval covers rendered submitted scope, not approved or draft items."""
+        submitted_item = self.add_draft_item(text="Awaiting client")
+        untouched_draft = self.add_draft_item(text="Not yet sent", order=3)
+        self.client.post(self.action_url("submit", submitted_item))
+        token = make_client_token(self.project, "review")
+        anonymous_client = Client()
+        review_response = anonymous_client.get(
+            reverse("surface:client-review", kwargs={"token": token})
+        )
+        fingerprint = review_response.context["approval_form"][
+            "batch_fingerprint"
+        ].value()
+        self.assertContains(review_response, "Criteria awaiting your approval")
+        self.assertContains(review_response, "Already-approved scope")
+        self.assertContains(review_response, submitted_item.text)
+        self.assertContains(review_response, self.approved_item.text)
+        self.assertNotContains(review_response, untouched_draft.text)
+
+        response = anonymous_client.post(
+            reverse("surface:client-approve", kwargs={"token": token}),
+            {"batch_fingerprint": fingerprint},
+        )
+
+        submitted_item.refresh_from_db()
+        untouched_draft.refresh_from_db()
+        self.approved_item.refresh_from_db()
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Thank you")
-        self.assertContains(response, "These criteria were already handled.")
+        self.assertEqual(submitted_item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(untouched_draft.state, AcceptanceItem.State.DRAFT)
+        self.assertEqual(self.approved_item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_crafted_item_ids_cannot_widen_server_derived_batch(self):
+        """Posted ids never authorize approval beyond current submitted scope."""
+        submitted_item = self.add_draft_item(text="Server-derived scope")
+        same_project_draft = self.add_draft_item(text="Unshown draft", order=3)
+        other_project = make_draft_project(owner=self.owner)
+        other_project_item = other_project.acceptance_items.get()
+        self.client.post(self.action_url("submit", submitted_item))
+        token = make_client_token(self.project, "review")
+        anonymous_client = Client()
+        fingerprint = review_fingerprint(anonymous_client, token)
+
+        response = anonymous_client.post(
+            reverse("surface:client-approve", kwargs={"token": token}),
+            {
+                "batch_fingerprint": fingerprint,
+                "item_ids": [
+                    submitted_item.pk,
+                    same_project_draft.pk,
+                    other_project_item.pk,
+                ],
+            },
+        )
+
+        submitted_item.refresh_from_db()
+        same_project_draft.refresh_from_db()
+        other_project_item.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(submitted_item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(same_project_draft.state, AcceptanceItem.State.DRAFT)
+        self.assertEqual(other_project_item.state, AcceptanceItem.State.DRAFT)
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_stale_fingerprint_rejects_pull_back_and_resubmit_batch(self):
+        """A newly minted submitted_at invalidates the previously rendered consent."""
+        item = self.add_draft_item(text="Consent-bound criterion")
+        fixed_submission_time = timezone.now()
+        with patch(
+            "ledger.services.timezone.now",
+            return_value=fixed_submission_time,
+        ):
+            self.client.post(self.action_url("submit", item))
+            token = make_client_token(self.project, "review")
+            anonymous_client = Client()
+            stale_fingerprint = review_fingerprint(anonymous_client, token)
+            self.client.post(self.action_url("pull-back", item))
+            self.client.post(self.action_url("submit", item))
+        item.refresh_from_db()
+        # Avoid the known Windows timezone.now() resolution flake recorded in PLAN.
+        item.submitted_at += timedelta(seconds=1)
+        item.save(update_fields=("submitted_at",))
+        current_fingerprint = review_fingerprint(anonymous_client, token)
+        self.assertNotEqual(stale_fingerprint, current_fingerprint)
+
+        response = anonymous_client.post(
+            reverse("surface:client-approve", kwargs={"token": token}),
+            {"batch_fingerprint": stale_fingerprint},
+        )
+
+        item.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "criteria changed after this page was shown")
+        self.assertContains(response, "Please re-review")
+        self.assertEqual(item.state, AcceptanceItem.State.SUBMITTED)
+        self.assertIsNone(item.approved_at)
+
+        invalid_form_response = anonymous_client.post(
+            reverse("surface:client-approve", kwargs={"token": token}),
+            {},
+        )
+        self.assertEqual(invalid_form_response.status_code, 200)
+        self.assertContains(
+            invalid_form_response,
+            "criteria changed after this page was shown",
+        )
+        self.assertNotContains(
+            invalid_form_response,
+            "This review link is no longer available",
+        )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_one_stale_item_rejects_entire_submitted_batch(self):
+        """Partial staleness leaves both the changed item and its peers unapproved."""
+        items = [
+            self.add_draft_item(text=f"Batch criterion {order}", order=order)
+            for order in range(2, 5)
+        ]
+        for item in items:
+            self.client.post(self.action_url("submit", item))
+        token = make_client_token(self.project, "review")
+        anonymous_client = Client()
+        stale_fingerprint = review_fingerprint(anonymous_client, token)
+
+        changed_item = items[1]
+        self.client.post(self.action_url("pull-back", changed_item))
+        self.client.post(self.action_url("submit", changed_item))
+        changed_item.refresh_from_db()
+        changed_item.submitted_at += timedelta(seconds=1)
+        changed_item.save(update_fields=("submitted_at",))
+
+        response = anonymous_client.post(
+            reverse("surface:client-approve", kwargs={"token": token}),
+            {"batch_fingerprint": stale_fingerprint},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "criteria changed after this page was shown")
+        for item in items:
+            item.refresh_from_db()
+            self.assertEqual(item.state, AcceptanceItem.State.SUBMITTED)
+            self.assertIsNone(item.approved_at)
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_suspend_submitted_item_through_ui(self):
+        """Submitted scope can be parked through its rendered action endpoint."""
+        item = self.add_draft_item(text="Submitted then parked")
+        self.client.post(self.action_url("submit", item))
+
+        response = self.client.post(
+            self.action_url("suspend", item),
+            HTTP_HX_REQUEST="true",
+        )
+
+        item.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(item.state, AcceptanceItem.State.SUSPENDED)
+        self.assertIsNone(item.approved_at)
+        self.assertContains(response, "Resume")
+
+    def test_illegal_item_transition_returns_404(self):
+        """A new action endpoint deliberately conceals an illegal state edge."""
+        response = self.client.post(
+            self.action_url("submit", self.approved_item),
+        )
+
+        self.approved_item.refresh_from_db()
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.approved_item.state, AcceptanceItem.State.APPROVED)
 
 
 class ClientTokenPurposeIsolationTests(TestCase):
@@ -1231,6 +1588,24 @@ class DeliveryItemUpdateViewTests(TestCase):
         self.item.refresh_from_db()
         self.assertIsNone(self.item.is_passed)
 
+    def test_delivery_update_refuses_suspended_item(self):
+        """A parked item cannot be posted to the delivery ModelForm endpoint."""
+        suspend_acceptance_item(self.item)
+        login_as(self.client, self.owner)
+
+        response = self.client.post(
+            reverse(
+                "surface:delivery-item-update",
+                kwargs={"project_pk": self.project.pk, "item_pk": self.item.pk},
+            ),
+            delivery_form_data(),
+        )
+
+        self.item.refresh_from_db()
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.item.state, AcceptanceItem.State.SUSPENDED)
+        self.assertIsNone(self.item.is_passed)
+
 
 class ProjectDetailPanelTests(TestCase):
     """Two-column detail layout and the merged criteria/delivery panel."""
@@ -1282,7 +1657,7 @@ class ProjectDetailPanelTests(TestCase):
         self.assertIn("Save item", panel)
         self.assertIn("First criterion", panel)
         self.assertNotContains(response, "Delivery checklist")
-        self.assertNotContains(response, "Add criterion")
+        self.assertContains(response, "Add criterion")
 
     def test_delivered_detail_shows_read_only_results_with_evidence(self):
         """After delivery the panel lists results and evidence without forms."""
@@ -1298,6 +1673,67 @@ class ProjectDetailPanelTests(TestCase):
         self.assertIn("https://example.com/proof", panel)
         self.assertNotContains(response, "Save item")
         self.assertContains(response, "Awaiting signature")
+
+    def test_active_panel_renders_controls_for_every_item_state(self):
+        """Each item state exposes only its legal edit, review, and parking controls."""
+        advance_to_active(self.project)
+        timestamp = timezone.now()
+        draft_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Draft criterion",
+            order=2,
+        )
+        submitted_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Submitted criterion",
+            order=3,
+            state=AcceptanceItem.State.SUBMITTED,
+            submitted_at=timestamp,
+        )
+        suspended_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Suspended criterion",
+            order=4,
+            state=AcceptanceItem.State.SUSPENDED,
+            submitted_at=timestamp,
+            approved_at=timestamp,
+        )
+        withdrawn_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Withdrawn criterion",
+            order=5,
+            state=AcceptanceItem.State.WITHDRAWN,
+            submitted_at=timestamp,
+            approved_at=timestamp,
+        )
+
+        response = self.get_detail()
+        item_rows = {
+            "Draft": (draft_item, {"Edit", "Delete", "Send for approval"}),
+            "Submitted": (submitted_item, {"Pull back", "Suspend"}),
+            "Approved": (self.item, {"Save item", "Suspend", "Withdraw"}),
+            "Suspended": (suspended_item, {"Resume"}),
+            "Withdrawn": (withdrawn_item, set()),
+        }
+        all_controls = {
+            "Edit",
+            "Delete",
+            "Send for approval",
+            "Pull back",
+            "Suspend",
+            "Save item",
+            "Withdraw",
+            "Resume",
+        }
+        for state_label, (item, legal_controls) in item_rows.items():
+            item_html = criterion_html(response, item)
+            self.assertIn(state_label, item_html)
+            for control in all_controls:
+                control_markup = f">{control}</button>"
+                if control in legal_controls:
+                    self.assertIn(control_markup, item_html)
+                else:
+                    self.assertNotIn(control_markup, item_html)
 
 
 class MarkDeliveredViewTests(TestCase):
@@ -1382,6 +1818,54 @@ class MarkDeliveredViewTests(TestCase):
             response,
             "Every delivery item must pass before delivery.",
         )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_delivery_gating_ignores_suspended_and_withdrawn_items(self):
+        """Parked items neither disable the button nor block the delivery POST."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        approved_item = project.acceptance_items.get()
+        approved_item.is_passed = True
+        approved_item.save(update_fields=("is_passed",))
+        timestamp = timezone.now()
+        suspended_item = AcceptanceItem.objects.create(
+            project=project,
+            text="Parked temporarily",
+            order=2,
+            state=AcceptanceItem.State.APPROVED,
+            submitted_at=timestamp,
+            approved_at=timestamp,
+        )
+        withdrawn_item = AcceptanceItem.objects.create(
+            project=project,
+            text="Removed from scope",
+            order=3,
+            state=AcceptanceItem.State.APPROVED,
+            submitted_at=timestamp,
+            approved_at=timestamp,
+        )
+        suspend_acceptance_item(suspended_item)
+        withdraw_acceptance_item(withdrawn_item)
+        client = Client()
+        login_as(client, owner)
+
+        detail_response = client.get(
+            reverse("surface:project-detail", kwargs={"project_pk": project.pk})
+        )
+        self.assertNotContains(
+            detail_response,
+            '<button type="submit" disabled>Mark delivered and send</button>',
+            html=True,
+        )
+        response = client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk})
+        )
+
+        project.refresh_from_db()
+        self.assertEqual(project.status, Project.Status.DELIVERED)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(len(mail.outbox), 1)
 
     @override_settings(**LOCMem_EMAIL)
     def test_non_owner_cannot_mark_delivered(self):

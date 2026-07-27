@@ -843,6 +843,74 @@ for leaving the client-consent seam as prose. These decisions are binding.
   and unavoidable, but they quietly decouple the tests from the writer. When a
   milestone's fixtures bypass the production serializer, at least one test must
   drive the real path or the serializer is unguarded.
+#### I1b-2 execution log (per-item criteria UI)
+
+- Shipped: per-item submit, pull-back, suspend, resume and withdraw through the
+  UI; `templates/surface/partials/criteria.html` now branches on **item state**
+  instead of project status; the client review page separates the pending batch
+  from already-approved scope; mid-project submission mints a fresh review
+  token and email; the delete hole is closed through `delete_acceptance_item`
+  and `acceptance_item_locked`. Suite 247 → 251.
+- **The consent mechanism, as built:** `ClientApproveView` approves exactly the
+  items currently in `submitted` state, derived server-side from the
+  token-derived project. The page posts a fingerprint of `(item id,
+  submitted_at)` pairs which must match exactly or the whole batch is refused.
+  No token or schema change was needed, which was the point of choosing it.
+- Implementer-adversary (Sonnet) REJECT then satisfied. It confirmed by
+  executed attack that a crafted POST cannot widen the batch and that criterion
+  text cannot drift while an item is submitted. Blocker fixed: a null
+  `submitted_at` — reachable because admin can edit item state — crashed both
+  client endpoints with `AttributeError`.
+- **Orchestrator ruling on that blocker:** coerce the null to a sentinel and
+  keep the item **in** the fingerprint, rather than filtering it out. Filtering
+  would have converted a visible crash into a silent consent hole, because the
+  server-derived batch would still approve the item while the client's check no
+  longer covered it. The Verifier-adversary later confirmed the sentinel
+  assertion is the only thing that catches that substitution.
+- That pass also produced I1a-2: see its log above. The race it found was the
+  most serious defect of the session.
+- Verifier-adversary (Grok) REJECT then satisfied, with a per-test mutation
+  table. Two majors fixed: the server-side derivation rule had no failing test
+  (approving fingerprint-parsed ids left the whole consent suite green), and
+  the panel test asserted control *presence* without asserting illegal controls
+  were absent, so rendering Suspend on a draft item passed.
+- **Orchestrator ruling, promoted from a note to a fix:** the stale-fingerprint
+  test depended on two UI submits minting different `submitted_at` values. The
+  adversary rated it a red-flake risk rather than a false green. Promoted
+  because this project has already lost time to exactly that
+  `timezone.now()`-resolution flake on Windows, and a flaky *most important
+  test in the milestone* trains a reader to rerun and shrug — corrosive when a
+  green suite is the only evidence that exists. The pull-back and resubmit
+  still go through the real UI; only the timestamp advance is now by
+  construction. **That `+= timedelta(seconds=1)` is deliberate, not arbitrary.**
+- Compliance Gate (Opus 5, fresh context) PASS, eight items, verified by
+  running five throwaway probes rather than by trusting any report.
+
+##### Follow-ups the I1b-2 gate surfaced (none blocking, ordered by seriousness)
+
+1. **A client whose approval loses a race is still shown the thanks page.** If
+   a freelancer pulls an item back while the client's approve POST is in
+   flight, the batch correctly rolls back whole and nothing is recorded — but
+   the client is told their approval landed. Nothing is corrupted and no
+   approval is lost, so the gate did not block. It is still a false statement
+   to a client on the consent seam, and it is the top candidate for the next
+   pass.
+2. **Guarded delete in the Ledger.** `delete_acceptance_item` reads
+   `approved_at` in Python and then deletes unguarded, so an approval
+   committing in between destroys the row. The window is two queries inside one
+   request rather than a human's think time. It is the last known instance of
+   the bug class I1a-2 fixed. **Correction to the earlier routing note: this is
+   `ledger/services.py`, so it belongs to a Ledger follow-up, not to I1b-2,
+   whose boundary excludes it.** A filtered delete on
+   `approved_at__isnull=True` is the shape.
+3. A draft item added to an `active` project is invisible to
+   `MarkDeliveredView`'s pre-check, so the button looks live and the service
+   rejects with a generic message rather than naming the unapproved criterion.
+   Safe, imprecise.
+4. Refit candidate: `templates/surface/client/sign.html` renders parked
+   criteria as "Not passed". Harmless when suspension was admin-only; now that
+   the suspend UI exists it is routine and misleading.
+
 - Refit/M7 candidates (earlier): per-IP rate limiting on login
   request; CSRF-denial test (enforce_csrf_checks) for the confirm POST;
   unused show_console_hint context key (confirmed still set in views.py and
