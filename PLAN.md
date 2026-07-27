@@ -327,15 +327,142 @@ hazard: client tokens; full dispatch)
   `payload.skills`, and `payload_hash`, never per-item data, so a public
   reader cannot see that a criterion was parked as failed. Today `suspend` has
   no Surface call site; I1b gives it one, and it will be freelancer-driven.
-  I1b must decide whether the public record surfaces parked-as-failed
-  criteria, or whether suspending a failed item requires something more than
-  a freelancer's unilateral click.
-- Criteria builder per-item submit/suspend/withdraw controls; client review
-  page batches newly-submitted items; `ClientApproveView` approves a batch.
+  **RULED 2026-07-26: the public record discloses parked criteria.** An
+  attestation whose payload contains any `suspended` or `withdrawn` item says
+  so on the public Capability Record. Client consent to suspend was considered
+  and not chosen — it would reintroduce a round trip into the very flow I1
+  exists to keep moving, and disclosure solves the actual problem, which is
+  that a reader currently cannot tell. **Sequencing constraint: the suspend
+  control may not merge without the disclosure.** Since the disclosure is
+  harmless before any suspend UI exists, build it first within the milestone.
 - Split from I1a rather than granting a Ledger-owned waiver: the Surface
   footprint (four acceptance-item views, `_project_context`, criteria
   partials, client review template) is too wide for a waiver to mean anything.
   Follows the M4a/M4b precedent.
+- **I1b is itself split in two**, because reconnaissance showed the Surface
+  footprint is larger than I1a's and the I1a review chain found a real defect
+  at every single seat. Smaller diffs get better review.
+
+#### I1b-1 — Public disclosure of parked criteria (owning: Surface; hazard: public Capability Record; full dispatch)
+- Ships **first** and alone, satisfying the sequencing constraint above: the
+  disclosure is harmless while no suspend UI exists, and this ordering removes
+  any window where a freelancer can park a failed criterion invisibly.
+- `templates/surface/record/detail.html` renders only `payload.title`,
+  `payload.skills`, and `payload_hash` today. An attestation whose payload
+  contains any `suspended` or `withdrawn` item must say so.
+- **Read the payload defensively.** Pre-I1a attestations have no `state` key
+  on their items, and per the M6b ruling their payloads are immutable. The
+  template and any helper must treat a missing `state` as "not parked" and
+  must never assume the new shape. A `KeyError` or a false "parked" badge on a
+  legacy record is the failure mode to test for.
+- Boundaries: `surface/views.py`, `templates/surface/record/detail.html`,
+  `surface/tests.py`. No Ledger change: the data is already in the payload.
+- Tests: a legacy-shaped attestation renders cleanly with no parked badge; an
+  I1a-shaped attestation with a suspended item discloses it; one with a
+  withdrawn item discloses it; one with all items approved shows no notice.
+
+#### I1b-2 — Per-item criteria UI (owning: Surface; consult: Ledger; hazard: client tokens; full dispatch)
+- Freelancer and client halves ship **together**, not sequentially. They are
+  coupled: `approve_criteria` requires project status `criteria_pending`, so
+  if per-item submission shipped alone, an item submitted mid-project would
+  sit in `submitted` with no route to `approved` — and `submitted` items block
+  both gates. That is a broken intermediate state, not a milestone.
+- **`ClientApproveView` is the crux.** It currently calls
+  `approve_criteria(project)`, which both approves and transitions the project.
+  Mid-project the project is already `active`, so it must instead call
+  `approve_acceptance_items(batch)` over the items the client was actually
+  shown, and perform the project-level transition only in the initial
+  `criteria_pending` case.
+- **Ruling 7 is the security requirement here:** a client must never approve
+  text it was not shown. The batch approved must be derived from what the
+  review page rendered, not from "whatever is submitted right now".
+- `ClientReviewView` shows `acceptance_items.all()` today; it must show the
+  pending batch distinctly from already-approved scope.
+- Mid-project submission needs a fresh `review`-purpose client token and
+  email. `SubmitCriteriaView` only works from `draft` today.
+- **`templates/surface/partials/criteria.html` branches on *project* status**
+  — `not criteria_locked` / `active` / else. That branching must become
+  item-state-driven, which is the single largest piece of this milestone.
+- **Close the delete hole** (the binding precondition above): route
+  `AcceptanceItemDeleteView` through `delete_acceptance_item`, and gate the
+  per-item controls on `acceptance_item_locked` rather than the project-level
+  `criteria_locked`.
+- **Two consequences of per-item state that reconnaissance surfaced and the
+  Implementer must not miss:** `_project_context`'s `all_delivery_reviewed`
+  tests `is_passed is not None` across *all* items, so a suspended or
+  withdrawn item would wrongly hold delivery back; and `DeliveryItemForm` can
+  currently be posted against any item, including a parked one.
+- Match existing HTMX idiom exactly: `_is_htmx`, `_render_criteria`, and
+  validation failures returning the fragment with **200**, not 4xx.
+- Boundaries: `surface/views.py`, `surface/urls.py`, `surface/forms.py`,
+  `templates/surface/partials/criteria.html`,
+  `templates/surface/partials/criterion_form.html`,
+  `templates/surface/client/review.html`, `surface/tests.py`.
+  `templates/base.html` stays reserved for I5.
+- Retire the project-level `criteria_locked` and the batch behaviour of
+  `submit_criteria_for_approval`/`approve_criteria` **only** once every call
+  site is migrated; leaving both live is acceptable if migration is partial.
+- Tests: per-item submit, pull-back, suspend, resume, withdraw through the UI;
+  delete refused once approved; client approves only the shown batch; a client
+  cannot approve an item pulled back after the page was rendered; mid-project
+  submission emails a working review link; delivery gating ignores parked
+  items; and the criteria panel renders correctly in every item state.
+
+##### Decisions closing the I1b Planner-adversary review (rejected iter 1)
+
+All six factual claims were confirmed against the code. The plan was rejected
+for leaving the client-consent seam as prose. These decisions are binding.
+
+- **Get the threat model right first.** Ruling 7's adversary is the
+  **freelancer, not the client**. The risk is a freelancer altering criterion
+  text after the client has been shown it. That reframing is what makes the
+  mechanism below sufficient without touching the token schema.
+- **The approved batch is derived server-side, never from the request.**
+  `ClientApproveView` approves exactly the items currently in `submitted`
+  state for that project. The review page additionally posts a fingerprint of
+  what it rendered — each item's id paired with its `submitted_at` — and the
+  view **rejects the whole POST unless that fingerprint exactly matches the
+  server's current submitted set.** So the posted data is a staleness
+  assertion, never an authorization input: a client cannot widen the batch
+  because they do not choose it, and a freelancer cannot narrow or alter it
+  unnoticed because pulling an item back clears `submitted_at` and resubmitting
+  mints a new one, breaking the match.
+- **No token-schema or database change is required, and none is authorized.**
+  `surface/tokens.py` stays out of the boundary. This was the deciding factor
+  between candidate mechanisms: binding consent through `submitted_at` keeps
+  the work out of auth-flow code entirely.
+- **Partial staleness rejects the whole batch.** Re-render the review page with
+  a plain notice that the criteria changed and ask the client to re-review.
+  Partial approval would require telling a client which subset of what they
+  read still counts, which is precisely the confusion ruling 7 forbids.
+- **Older review tokens stay valid until they expire; they are not
+  invalidated.** Because the batch is derived server-side and the review page
+  renders current state, a client arriving on an older link sees exactly what
+  they would approve, so there is no scope confusion to prevent. Invalidation
+  would also silently break a client who simply opened their email late.
+- **The per-item submit control is gated to `project.status == active`.**
+  During `draft` the existing package Submit button remains the only path.
+  `submit_acceptance_item_for_approval` has no status guard of its own, so
+  without this an individual submit could mint a client email before the
+  project had ever been reviewed at all.
+- **Three sites share the state-blindness bug, not two.** The adversary found
+  the third: `MarkDeliveredView.post`'s own pre-check filters
+  `is_passed__isnull=True` across all items, so a parked item disables the
+  freelancer's Mark delivered button even though `services.mark_delivered`
+  would now succeed. Fix all three — `all_delivery_reviewed`,
+  `DeliveryItemUpdateView`/`DeliveryItemForm`, and this — and treat the list
+  as exhaustive only after grepping for the same pattern again.
+- **I1b-1 discloses a generic badge and a count**, following the existing
+  `disputed_count` notice precedent, rather than enumerating parked criterion
+  text. The public record's job here is to stop a reader believing a clean
+  sweep happened; reproducing the criteria themselves is a larger product
+  decision that belongs with I5's richer record, not here.
+- **Correction to the ordering rationale above:** shipping I1b-1 first closes
+  the *Surface-driven* window, not every window. `AcceptanceItem.state` is not
+  admin-readonly and the suspend service is directly callable, so a parked
+  item could already be signed today. The ordering decision stands; the "no
+  window" phrasing was too strong. Admin readonly for item state is logged as
+  a Refit candidate rather than fixed here.
 
 ### I2 — Per-criterion to-do/notes (owning: Ledger + Surface)
 - Notes and client-visible acknowledgements per acceptance item. Depends on
@@ -566,6 +693,11 @@ hazard: client tokens; full dispatch)
   `checkout` has something to restore to.** The earlier M7a/M7b uses were safe
   precisely because those files were clean; the habit did not survive contact
   with a large uncommitted diff.
+- Refit candidate (new, from the I1b planning review): `AcceptanceItemAdmin`
+  has no `readonly_fields`, so item `state` is directly editable in admin,
+  bypassing every service guard the state machine provides. Same shape as the
+  M1 refit candidate about admin-editable dispute fields. Not fixed during
+  I1b — logged.
 - Refit candidates (new): three pre-existing ruff `I001` import-order errors
   in `surface/auth.py`, `surface/tests.py`, `surface/views.py` (`django.core`
   sorted after `django.core.cache`) — untouched per the cleanup doctrine,
