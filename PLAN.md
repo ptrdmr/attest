@@ -945,6 +945,137 @@ and a docs-impact check before each commit.
   test; the adversary confirmed the two assertions together pin *review
   re-rendered with the stale notice* rather than merely "did not say thanks".
 
+### I1b-4 — Honest state presentation (owning: Surface; hazard: client signature seam; full dispatch)
+
+Both defects were found by the **first hand-driven smoke test this project has
+ever had**, after 254 green tests had signed off on the same code. Neither was
+visible to the suite: one is about what a page *says*, the other about a state
+the tests never entered.
+
+#### I1b-4a — The signing page misrepresents parked criteria
+
+- `templates/surface/client/sign.html` line 19 renders
+  `{% if item.is_passed %}Passed{% else %}Not passed{% endif %}` with no
+  awareness of item state. A criterion that was **suspended** so delivery could
+  proceed is therefore shown to the client as **"Not passed"**, visually
+  identical to work that was attempted and failed — at the moment she applies a
+  legally binding signature. Worse, a parked item whose result was never
+  recorded has `is_passed = None` and also falls through to "Not passed", which
+  is not ambiguous but simply false.
+- This is the mirror of the Domain Law the public record obeys. That law forbids
+  presenting a compromised attestation as clean; this presents a negotiated
+  scope reduction as a delivery failure. **I misclassified it as cosmetic when
+  the I1b-2 adversary first logged it**, on the reasoning that suspension had
+  been admin-only — missing that I1b-2 itself is what made it routine.
+- **Decision — parked status is visually primary, and the recorded result stays
+  as secondary detail.** Do not simply hide the pass/fail: a criterion that was
+  attempted, failed, and then parked is three facts, and suppressing the middle
+  one is its own distortion. The client needs to see that it is not part of what
+  she is signing for, and may see what happened to it.
+- **Decision — label `suspended` and `withdrawn` distinctly here**, unlike the
+  public record which deliberately uses one generic phrase. A stranger sizing up
+  a freelancer needs only to know the scope moved; a signer needs to know
+  precisely what she is and is not accepting.
+- **Decision — `is_passed = None` must never render as "Not passed"** anywhere
+  on this page, in any state.
+
+#### I1b-4b — The freelancer is locked out during client review
+
+- `templates/surface/partials/criteria.html` line 56 gates **every** per-item
+  control on `project.status == "active"`, but a project sits in
+  `criteria_pending` from the moment criteria are sent until the client
+  approves. Through that entire window there is no Pull back, no Suspend, and
+  no Edit — precisely the period in which a freelancer notices a mistake in
+  what they just sent. Only the `submit` control needed that gate, and only to
+  keep `draft` out; the implementation applied it to all five.
+- **Decision — the gate becomes `criteria_pending` or `active`.** `draft` stays
+  excluded, so the package Submit button remains the only path there, and
+  delivered/signed stay excluded.
+- **This is required rather than cosmetic, because gating submit to `active`
+  alone is a deadlock.** `submit_criteria_for_approval` only runs from `draft`
+  and `approve_criteria` only from `criteria_pending`, and `ClientApproveView`
+  returns early when nothing is submitted. So a freelancer who pulled back every
+  item during `criteria_pending` would leave the client unable to approve, the
+  project unable to leave `criteria_pending`, and no per-item submit available
+  to undo it. Verified against the services, not assumed.
+- **Decision — the add-criterion form and create endpoint also include
+  `criteria_pending`.** Pulling back and deleting every item would otherwise
+  leave no criterion to resubmit and no route out of client review.
+
+- Boundaries: `templates/surface/client/sign.html`,
+  `templates/surface/partials/criteria.html`, `surface/views.py`,
+  `surface/tests.py`, `static/css/app.css`. `ledger/**` is out of bounds —
+  every state needed is already on the model.
+- Test strategy: assert what a **client** sees for a suspended item, a
+  withdrawn item, and an item with `is_passed = None`, including that "Not
+  passed" is absent in those cases. For 4b, drive pull-back and edit through the
+  UI while the project is `criteria_pending`, and add a regression test that
+  pulls back every submitted item and proves the project can still reach
+  `active` — the deadlock, pinned.
+
+#### I1b-4 execution log
+
+- Builder implemented both parts; suite 254 → 260.
+- **Implementer-adversary REJECT (round 1)**, three `[major]`, each proven by
+  execution rather than argued. It stripped the `is_passed is None` clause from
+  only the `withdrawn` copy of a duplicated block and all nine signing tests
+  stayed green, proving two copies of consent-critical rendering could drift
+  silently. It read `app.css` and showed the parked label was `0.85rem` at
+  normal weight against `<strong>` at `1rem` bold — so the label the plan
+  required to be visually *primary* was in fact visually *subordinate*. And it
+  showed the plan's unconditional `is_passed = None` decision was untested on
+  the ordinary branch. Fixed by collapsing to a single result block, adding a
+  `.badge.parked` modifier, and adding the missing case. Boundary extended to
+  `static/css/app.css` by orchestrator ruling, since finding 3 was unfixable
+  without it.
+- **Orchestrator visual verification.** Because this milestone exists precisely
+  because nobody had looked at a rendered page, the parked label was checked in
+  a real browser on a real delivered project before acceptance, not just
+  asserted in markup. It reads as the dominant element in the checklist.
+- **Compliance Gate PASS**, having derived the reachable state set itself rather
+  than accepting one: exactly eight state-and-result pairs can reach the signing
+  page, all eight are labelled, and `None` cannot render as "Not passed" on any
+  path. It found four independent single-edit mutations all caught by named
+  tests, confirming the drift risk was eliminated rather than relocated.
+- **The gate's most valuable finding was structural.** Asked whether folding the
+  Verifier-adversary seat into its pass was defensible, it said yes for the
+  template work and no for the gate change, and then demonstrated why: it
+  widened the action gate to `delivered` and all 261 tests stayed green while
+  suspend/withdraw/resume became reachable on a record under signature. **An
+  Implementer-adversary reviews a diff, so the side of a boundary you did *not*
+  move is invisible to it by construction.** Pinning the untouched side is the
+  Verifier's characteristic question. Do not fold that seat again on a milestone
+  that moves a gate.
+- Orchestrator applied the same experiment to `criterion-create`, the one
+  endpoint the gate's matrix omitted, and reproduced the gap a third time.
+  Closed by extending the matrix to 72 checks over six statuses.
+- Orchestrator upgraded the gate's `[minor]` zero-criteria trap to a blocker:
+  pull-back made it possible to delete every criterion during `criteria_pending`
+  and strand the project, which is the same deadlock 4b exists to close with one
+  extra step, and pull-back is ours. Fixed by widening the add-criterion gate in
+  template and view together.
+- Final: **263 tests**, ruff at the 3 documented pre-existing `I001`.
+
+##### Refit candidate — `AcceptanceItemDeleteView` has no project-status gate
+
+Found while verifying the gate's findings; **pre-existing, so logged rather than
+fixed under I1b-4**, but it is the strongest candidate for the next milestone
+because it has a Domain Law consequence.
+
+The view applies no project-status check at all. Its only protection is the
+`approved_at__isnull=True` guard added in I1a-3, which stops approved criteria
+being destroyed. But an item that went `submitted → suspended` never receives an
+`approved_at`, so that guard does not cover it. On a **delivered** project
+awaiting the client's signature, the freelancer can therefore delete a parked
+criterion — and with it the "Scope adjusted" disclosure I1b-1 exists to
+guarantee, turning a narrowed delivery into an apparently clean one on the
+public record.
+
+I1b-4 widened the reachability of that state by allowing suspension during
+`criteria_pending`, but did not create the path: suspending a submitted item in
+an `active` project already produced it. Verified by reading the view and the
+service guard, not assumed.
+
 ##### Follow-ups the I1b-2 gate surfaced (none blocking, ordered by seriousness)
 
 1. **A client whose approval loses a race is still shown the thanks page.** If

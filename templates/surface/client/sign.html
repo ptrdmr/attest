@@ -16,7 +16,15 @@
           <li>
             <p class="pre-line">{{ item.text }}</p>
             <p>
-              <strong>{% if item.is_passed %}Passed{% else %}Not passed{% endif %}</strong>
+              {% if item.state == "suspended" or item.state == "withdrawn" %}
+                <span class="badge parked">{% if item.state == "suspended" %}Suspended{% else %}Withdrawn{% endif %} — excluded from this delivery</span>
+                <span class="muted">
+                  Recorded result:
+                  {% if item.is_passed is None %}No result recorded{% elif item.is_passed %}Passed{% else %}Failed{% endif %}
+                </span>
+              {% else %}
+                <strong>{% if item.is_passed is None %}No result recorded{% elif item.is_passed %}Passed{% else %}Not passed{% endif %}</strong>
+              {% endif %}
               {% if item.evidence_url %}
                 · <a class="break-word" href="{{ item.evidence_url }}" rel="noopener noreferrer">View evidence</a>
               {% endif %}

@@ -1179,6 +1179,302 @@ class ClientApproveViewTests(TestCase):
         self.assertEqual(self.project.status, Project.Status.ACTIVE)
 
 
+class PendingCriteriaWorkflowTests(TestCase):
+    """Freelancer item corrections while the initial client review is pending."""
+
+    def setUp(self):
+        """Create an owned two-item project awaiting initial client approval."""
+        self.owner = make_profile()
+        self.project = make_draft_project(owner=self.owner)
+        AcceptanceItem.objects.create(
+            project=self.project,
+            text="Second criterion",
+            order=2,
+        )
+        submit_criteria_for_approval(self.project)
+        self.project.refresh_from_db()
+        self.client = Client()
+        login_as(self.client, self.owner)
+
+    def action_url(self, action, item):
+        """Return one per-item action URL for the pending project."""
+        return reverse(
+            f"surface:criterion-{action}",
+            kwargs={"project_pk": self.project.pk, "item_pk": item.pk},
+        )
+
+    def test_pull_back_and_edit_through_ui_while_criteria_pending(self):
+        """Pending review still permits pull-back followed by an honest text edit."""
+        item = self.project.acceptance_items.order_by("order").first()
+
+        pull_back_response = self.client.post(
+            self.action_url("pull-back", item),
+            HTTP_HX_REQUEST="true",
+        )
+        item.refresh_from_db()
+        self.assertEqual(pull_back_response.status_code, 200)
+        self.assertEqual(item.state, AcceptanceItem.State.DRAFT)
+        self.assertContains(pull_back_response, ">Edit</button>")
+        self.assertContains(pull_back_response, ">Send for approval</button>")
+
+        edit_response = self.client.post(
+            reverse(
+                "surface:criterion-update",
+                kwargs={"project_pk": self.project.pk, "item_pk": item.pk},
+            ),
+            {"text": "Corrected first criterion", "order": item.order},
+            HTTP_HX_REQUEST="true",
+        )
+        item.refresh_from_db()
+        self.assertEqual(edit_response.status_code, 200)
+        self.assertEqual(item.text, "Corrected first criterion")
+        self.assertContains(edit_response, "Corrected first criterion")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_pull_back_every_item_can_resubmit_and_reach_active_through_ui(self):
+        """Pulling back the whole pending batch cannot deadlock initial approval."""
+        items = list(self.project.acceptance_items.order_by("order"))
+        for item in items:
+            response = self.client.post(
+                self.action_url("pull-back", item),
+                HTTP_HX_REQUEST="true",
+            )
+            self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.SUBMITTED
+            ).exists()
+        )
+        detail_response = self.client.get(
+            reverse(
+                "surface:project-detail",
+                kwargs={"project_pk": self.project.pk},
+            )
+        )
+        for item in items:
+            self.assertIn(
+                ">Send for approval</button>",
+                criterion_html(detail_response, item),
+            )
+
+        for item in items:
+            response = self.client.post(
+                self.action_url("submit", item),
+                HTTP_HX_REQUEST="true",
+            )
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.SUBMITTED
+            ).count(),
+            len(items),
+        )
+
+        token = make_client_token(self.project, "review")
+        anonymous_client = Client()
+        fingerprint = review_fingerprint(anonymous_client, token)
+        approve_response = anonymous_client.post(
+            reverse("surface:client-approve", kwargs={"token": token}),
+            {"batch_fingerprint": fingerprint},
+        )
+
+        self.project.refresh_from_db()
+        self.assertEqual(approve_response.status_code, 200)
+        self.assertContains(approve_response, "Thank you")
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+        self.assertFalse(
+            self.project.acceptance_items.exclude(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_delete_every_item_can_add_replacement_and_reach_active_through_ui(self):
+        """Deleting pulled-back scope cannot deadlock the pending review."""
+        items = list(self.project.acceptance_items.order_by("order"))
+        for item in items:
+            pull_back_response = self.client.post(
+                self.action_url("pull-back", item),
+                HTTP_HX_REQUEST="true",
+            )
+            self.assertEqual(pull_back_response.status_code, 200)
+            delete_response = self.client.post(
+                self.action_url("delete", item),
+                HTTP_HX_REQUEST="true",
+            )
+            self.assertEqual(delete_response.status_code, 200)
+        self.assertFalse(self.project.acceptance_items.exists())
+
+        empty_detail = self.client.get(
+            reverse(
+                "surface:project-detail",
+                kwargs={"project_pk": self.project.pk},
+            )
+        )
+        self.assertContains(empty_detail, ">Add criterion</button>")
+        create_response = self.client.post(
+            reverse(
+                "surface:criterion-create",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            {"text": "Replacement criterion", "order": 1},
+            HTTP_HX_REQUEST="true",
+        )
+        self.assertEqual(create_response.status_code, 200)
+        replacement = self.project.acceptance_items.get()
+        self.assertEqual(replacement.state, AcceptanceItem.State.DRAFT)
+        self.assertContains(create_response, "Replacement criterion")
+        self.assertContains(create_response, ">Send for approval</button>")
+
+        submit_response = self.client.post(
+            self.action_url("submit", replacement),
+            HTTP_HX_REQUEST="true",
+        )
+        self.assertEqual(submit_response.status_code, 200)
+        token = make_client_token(self.project, "review")
+        anonymous_client = Client()
+        fingerprint = review_fingerprint(anonymous_client, token)
+        approve_response = anonymous_client.post(
+            reverse("surface:client-approve", kwargs={"token": token}),
+            {"batch_fingerprint": fingerprint},
+        )
+
+        self.project.refresh_from_db()
+        replacement.refresh_from_db()
+        self.assertEqual(approve_response.status_code, 200)
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+        self.assertEqual(replacement.state, AcceptanceItem.State.APPROVED)
+
+
+class CriteriaActionGateAgreementTests(TestCase):
+    """Keep rendered criteria controls aligned with reachable endpoints."""
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_controls_and_endpoints_agree_across_all_project_statuses(self):
+        """Pin both bounds of all criteria controls across project statuses."""
+        owner = make_profile()
+        client = Client()
+        login_as(client, owner)
+        action_cases = {
+            "submit": (AcceptanceItem.State.DRAFT, "Send for approval"),
+            "pull-back": (AcceptanceItem.State.SUBMITTED, "Pull back"),
+            "suspend": (AcceptanceItem.State.SUBMITTED, "Suspend"),
+            "resume": (AcceptanceItem.State.SUSPENDED, "Resume"),
+            "withdraw": (AcceptanceItem.State.APPROVED, "Withdraw"),
+        }
+        statuses = (
+            Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+            Project.Status.DELIVERED,
+            Project.Status.ATTESTED,
+            Project.Status.DISPUTED,
+        )
+        mutable_statuses = {
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+        }
+        create_statuses = {
+            Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+        }
+        checks = 0
+
+        for status in statuses:
+            for action, (item_state, control_label) in action_cases.items():
+                project = make_draft_project(owner=owner, with_criteria=False)
+                project.status = status
+                project.save(update_fields=("status",))
+                timestamp = timezone.now()
+                item = AcceptanceItem.objects.create(
+                    project=project,
+                    text=f"{status} {action} criterion",
+                    order=1,
+                    state=item_state,
+                    submitted_at=(
+                        None
+                        if item_state == AcceptanceItem.State.DRAFT
+                        else timestamp
+                    ),
+                    approved_at=(
+                        timestamp
+                        if item_state == AcceptanceItem.State.APPROVED
+                        else None
+                    ),
+                    is_passed=True,
+                )
+                detail_response = client.get(
+                    reverse(
+                        "surface:project-detail",
+                        kwargs={"project_pk": project.pk},
+                    )
+                )
+                control_is_rendered = (
+                    f">{control_label}</button>"
+                    in criterion_html(detail_response, item)
+                )
+                endpoint_response = client.post(
+                    reverse(
+                        f"surface:criterion-{action}",
+                        kwargs={"project_pk": project.pk, "item_pk": item.pk},
+                    ),
+                    HTTP_HX_REQUEST="true",
+                )
+                endpoint_is_reachable = endpoint_response.status_code != 404
+                expected_reachable = status in mutable_statuses
+
+                self.assertEqual(
+                    control_is_rendered,
+                    expected_reachable,
+                    f"{control_label} rendering disagrees for {status}",
+                )
+                self.assertEqual(
+                    endpoint_is_reachable,
+                    expected_reachable,
+                    f"{action} endpoint disagrees for {status}",
+                )
+                checks += 2
+
+        for status in statuses:
+            project = make_draft_project(owner=owner, with_criteria=False)
+            project.status = status
+            project.save(update_fields=("status",))
+            detail_response = client.get(
+                reverse(
+                    "surface:project-detail",
+                    kwargs={"project_pk": project.pk},
+                )
+            )
+            control_is_rendered = (
+                ">Add criterion</button>" in criteria_panel_html(detail_response)
+            )
+            endpoint_response = client.post(
+                reverse(
+                    "surface:criterion-create",
+                    kwargs={"project_pk": project.pk},
+                ),
+                {"text": f"{status} replacement criterion", "order": 1},
+                HTTP_HX_REQUEST="true",
+            )
+            endpoint_is_reachable = endpoint_response.status_code != 404
+            expected_reachable = status in create_statuses
+
+            self.assertEqual(
+                control_is_rendered,
+                expected_reachable,
+                f"Add criterion rendering disagrees for {status}",
+            )
+            self.assertEqual(
+                endpoint_is_reachable,
+                expected_reachable,
+                f"criterion-create endpoint disagrees for {status}",
+            )
+            checks += 2
+
+        self.assertEqual(checks, 72)
+
+
 class PerItemCriteriaWorkflowTests(TestCase):
     """Freelancer item controls and server-bound client consent."""
 
@@ -1688,6 +1984,14 @@ class ProjectDetailPanelTests(TestCase):
         panel = criteria_panel_html(response)
         self.assertIn("Add criterion", panel)
         self.assertNotIn("Save item", panel)
+        for unavailable_control in {
+            "Send for approval",
+            "Pull back",
+            "Suspend",
+            "Withdraw",
+            "Resume",
+        }:
+            self.assertNotIn(f">{unavailable_control}</button>", panel)
         self.assertNotContains(response, "Delivery checklist")
 
     def test_active_detail_merges_delivery_form_into_criteria_panel(self):
@@ -1717,7 +2021,17 @@ class ProjectDetailPanelTests(TestCase):
         panel = criteria_panel_html(response)
         self.assertIn("Passed", panel)
         self.assertIn("https://example.com/proof", panel)
-        self.assertNotContains(response, "Save item")
+        for unavailable_control in {
+            "Edit",
+            "Delete",
+            "Send for approval",
+            "Pull back",
+            "Suspend",
+            "Save item",
+            "Withdraw",
+            "Resume",
+        }:
+            self.assertNotIn(f">{unavailable_control}</button>", panel)
         self.assertContains(response, "Awaiting signature")
 
     def test_active_panel_renders_controls_for_every_item_state(self):
@@ -1941,6 +2255,98 @@ class ClientSignViewTests(TestCase):
         advance_to_delivered(self.project)
         self.sign_token = make_client_token(self.project, "sign")
         self.client = Client()
+
+    def get_sign_page_with_parked_item(self, state, is_passed):
+        """Render a legal delivered project containing one parked criterion."""
+        project = make_draft_project()
+        parked_item = AcceptanceItem.objects.create(
+            project=project,
+            text="Adjusted scope criterion",
+            order=2,
+        )
+        advance_to_active(project)
+        parked_item.refresh_from_db()
+        parked_item.is_passed = is_passed
+        parked_item.save(update_fields=("is_passed",))
+        if state == AcceptanceItem.State.SUSPENDED:
+            suspend_acceptance_item(parked_item)
+        else:
+            withdraw_acceptance_item(parked_item)
+        project.acceptance_items.filter(
+            state=AcceptanceItem.State.APPROVED
+        ).update(is_passed=True)
+        mark_delivered(project)
+        token = make_client_token(project, "sign")
+        return self.client.get(
+            reverse("surface:client-sign", kwargs={"token": token})
+        )
+
+    def test_suspended_failed_item_is_disclosed_without_not_passed_label(self):
+        """A suspended failure is outside delivery, with its result secondary."""
+        response = self.get_sign_page_with_parked_item(
+            AcceptanceItem.State.SUSPENDED,
+            False,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'class="badge parked"')
+        self.assertContains(response, "Suspended — excluded from this delivery")
+        self.assertContains(response, "Recorded result:")
+        self.assertContains(response, "Failed")
+        self.assertNotContains(response, "Not passed")
+
+    def test_withdrawn_passed_item_is_disclosed_without_not_passed_label(self):
+        """Withdrawn scope is named distinctly and retains its recorded result."""
+        response = self.get_sign_page_with_parked_item(
+            AcceptanceItem.State.WITHDRAWN,
+            True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'class="badge parked"')
+        self.assertContains(response, "Withdrawn — excluded from this delivery")
+        self.assertContains(response, "Recorded result:")
+        self.assertContains(response, "Passed")
+        self.assertNotContains(response, "Not passed")
+
+    def test_unrecorded_result_is_never_presented_as_not_passed(self):
+        """An undecided parked criterion says no result instead of inventing failure."""
+        response = self.get_sign_page_with_parked_item(
+            AcceptanceItem.State.SUSPENDED,
+            None,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Suspended — excluded from this delivery")
+        self.assertContains(response, "Recorded result:")
+        self.assertContains(response, "No result recorded")
+        self.assertNotContains(response, "Not passed")
+
+    def test_ordinary_unrecorded_result_is_not_presented_as_not_passed(self):
+        """An undecided approved item is not mislabeled as a delivery failure."""
+        self.project.acceptance_items.update(is_passed=None)
+
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "<strong>No result recorded</strong>", html=True)
+        self.assertNotContains(response, "Not passed")
+
+    def test_passed_item_keeps_passed_label_and_evidence_link(self):
+        """Ordinary completed scope remains passed with its evidence available."""
+        evidence_url = "https://example.com/client-proof"
+        self.project.acceptance_items.update(evidence_url=evidence_url)
+
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "<strong>Passed</strong>", html=True)
+        self.assertContains(response, evidence_url)
+        self.assertContains(response, "View evidence")
 
     def test_client_sign_happy_path_attests_and_shows_payload_hash(self):
         """Valid signature posts through ledger and renders the record hash."""

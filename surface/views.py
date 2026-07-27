@@ -528,6 +528,7 @@ class AcceptanceItemCreateView(OwnedProjectMixin, View):
         """Validate and create an ordered acceptance item."""
         if self.project.status not in {
             Project.Status.DRAFT,
+            Project.Status.CRITERIA_PENDING,
             Project.Status.ACTIVE,
         }:
             raise Http404
@@ -635,14 +636,17 @@ class AcceptanceItemDeleteView(OwnedProjectMixin, View):
 
 
 class AcceptanceItemActionView(OwnedProjectMixin, View):
-    """Apply one legal per-item state transition for an active project."""
+    """Apply one legal per-item transition while criteria can still change."""
 
     service = None
     success_message = ""
 
     def post(self, request, project_pk, item_pk):
         """Validate the action and delegate the item transition to Ledger."""
-        if self.project.status != Project.Status.ACTIVE:
+        if self.project.status not in {
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+        }:
             raise Http404
         form = ActionForm(request.POST)
         if not form.is_valid() or self.service is None:

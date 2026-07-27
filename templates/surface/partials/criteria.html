@@ -53,7 +53,7 @@
             </form>
           {% endif %}
 
-          {% if project.status == "active" %}
+          {% if project.status == "criteria_pending" or project.status == "active" %}
             {% if row.item.state == "draft" %}
               <form method="post" action="{% url 'surface:criterion-submit' project.pk row.item.pk %}" hx-post="{% url 'surface:criterion-submit' project.pk row.item.pk %}" hx-target="#criteria-panel" hx-swap="outerHTML">
                 {% csrf_token %}
@@ -91,7 +91,7 @@
     {% endfor %}
   </div>
 
-  {% if project.status == "draft" or project.status == "active" %}
+  {% if project.status == "draft" or project.status == "criteria_pending" or project.status == "active" %}
     <form
       class="criterion-form"
       method="post"

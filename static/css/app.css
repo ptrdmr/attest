@@ -147,6 +147,13 @@ h2 {
   background: #ffedf0;
 }
 
+.badge.parked {
+  color: #704d00;
+  background: #fff4cc;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
 .delivery-result {
   display: flex;
   align-items: center;
