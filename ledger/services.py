@@ -78,27 +78,52 @@ def approve_criteria(project):
     )
 
 
-def _transition_acceptance_item(item, expected_states, target_state):
-    """Move an acceptance item across one explicitly permitted edge."""
-    if item.state not in expected_states:
+def _transition_acceptance_item(
+    item,
+    expected_states,
+    target_state,
+    *,
+    additional_guards=None,
+    **field_updates,
+):
+    """Move an acceptance item across one guarded workflow edge."""
+    expected_state = item.state
+    if expected_state not in expected_states:
         raise InvalidTransition(
-            f"Cannot transition acceptance item from {item.state} "
+            f"Cannot transition acceptance item from {expected_state} "
             f"to {target_state}."
         )
-    item.state = target_state
+    updates = {"state": target_state, **field_updates}
+    guarded_items = AcceptanceItem.objects.filter(
+        pk=item.pk,
+        state=expected_state,
+    )
+    if additional_guards:
+        guarded_items = guarded_items.filter(**additional_guards)
+    updated_count = guarded_items.update(**updates)
+    if updated_count == 0:
+        try:
+            item.refresh_from_db()
+        except AcceptanceItem.DoesNotExist:
+            raise InvalidTransition(
+                "Acceptance item no longer exists."
+            ) from None
+        raise InvalidTransition(
+            "Acceptance item state changed before transition could be saved."
+        )
+    for field_name, value in updates.items():
+        setattr(item, field_name, value)
     return item
 
 
 def submit_acceptance_item_for_approval(item):
     """Submit one draft acceptance item for client approval."""
-    _transition_acceptance_item(
+    return _transition_acceptance_item(
         item,
         {AcceptanceItem.State.DRAFT},
         AcceptanceItem.State.SUBMITTED,
+        submitted_at=timezone.now(),
     )
-    item.submitted_at = timezone.now()
-    item.save(update_fields=("state", "submitted_at"))
-    return item
 
 
 @transaction.atomic
@@ -109,26 +134,22 @@ def submit_acceptance_items_for_approval(items):
 
 def pull_back_acceptance_item(item):
     """Return one submitted acceptance item to editable draft state."""
-    _transition_acceptance_item(
+    return _transition_acceptance_item(
         item,
         {AcceptanceItem.State.SUBMITTED},
         AcceptanceItem.State.DRAFT,
+        submitted_at=None,
     )
-    item.submitted_at = None
-    item.save(update_fields=("state", "submitted_at"))
-    return item
 
 
 def approve_acceptance_item(item):
     """Approve one submitted acceptance item."""
-    _transition_acceptance_item(
+    return _transition_acceptance_item(
         item,
         {AcceptanceItem.State.SUBMITTED},
         AcceptanceItem.State.APPROVED,
+        approved_at=timezone.now(),
     )
-    item.approved_at = timezone.now()
-    item.save(update_fields=("state", "approved_at"))
-    return item
 
 
 @transaction.atomic
@@ -139,7 +160,7 @@ def approve_acceptance_items(items):
 
 def suspend_acceptance_item(item):
     """Suspend one submitted or approved acceptance item."""
-    _transition_acceptance_item(
+    return _transition_acceptance_item(
         item,
         {
             AcceptanceItem.State.SUBMITTED,
@@ -147,8 +168,6 @@ def suspend_acceptance_item(item):
         },
         AcceptanceItem.State.SUSPENDED,
     )
-    item.save(update_fields=("state",))
-    return item
 
 
 def resume_acceptance_item(item):
@@ -158,24 +177,21 @@ def resume_acceptance_item(item):
         if item.approved_at is not None
         else AcceptanceItem.State.SUBMITTED
     )
-    _transition_acceptance_item(
+    return _transition_acceptance_item(
         item,
         {AcceptanceItem.State.SUSPENDED},
         target_state,
+        additional_guards={"approved_at": item.approved_at},
     )
-    item.save(update_fields=("state",))
-    return item
 
 
 def withdraw_acceptance_item(item):
     """Withdraw one approved acceptance item permanently."""
-    _transition_acceptance_item(
+    return _transition_acceptance_item(
         item,
         {AcceptanceItem.State.APPROVED},
         AcceptanceItem.State.WITHDRAWN,
     )
-    item.save(update_fields=("state",))
-    return item
 
 
 def acceptance_item_locked(item):

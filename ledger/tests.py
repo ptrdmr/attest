@@ -74,6 +74,10 @@ VACUOUS_SIGNING = (
 )
 DELIVERY_FAILED_ITEM = "Every delivery item must pass before delivery."
 SIGNING_FAILED_ITEM = "Every acceptance item must pass before signing."
+STALE_ACCEPTANCE_ITEM_TRANSITION = (
+    "Acceptance item state changed before transition could be saved."
+)
+DELETED_ACCEPTANCE_ITEM_TRANSITION = "Acceptance item no longer exists."
 
 
 _profile_counter = 0
@@ -637,6 +641,104 @@ class AcceptanceItemStateMachineTests(TestCase):
         self.assertEqual(self.item.state, AcceptanceItem.State.APPROVED)
         self.assertEqual(self.item.submitted_at, submitted_at)
         self.assertIsNotNone(self.item.approved_at)
+
+    def test_stale_pullback_cannot_overwrite_client_approval(self):
+        """A delayed pull-back cannot erase a competing client approval."""
+        self.set_state(
+            AcceptanceItem.State.SUBMITTED,
+            submitted=True,
+        )
+        stale_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        competing_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        approve_acceptance_item(competing_item)
+
+        with self.assertRaises(InvalidTransition) as raised:
+            pull_back_acceptance_item(stale_item)
+
+        self.assertEqual(str(raised.exception), STALE_ACCEPTANCE_ITEM_TRANSITION)
+        self.assertEqual(stale_item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(stale_item.approved_at, competing_item.approved_at)
+        persisted_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        self.assertEqual(persisted_item.state, AcceptanceItem.State.APPROVED)
+        self.assertIsNotNone(persisted_item.approved_at)
+        self.assertFalse(
+            AcceptanceItem.objects.filter(
+                pk=self.item.pk,
+                state=AcceptanceItem.State.DRAFT,
+                approved_at__isnull=False,
+            ).exists()
+        )
+
+    def test_stale_resume_cannot_downgrade_new_client_approval(self):
+        """Resume guards the approval timestamp used to choose its target."""
+        submit_acceptance_item_for_approval(self.item)
+        suspend_acceptance_item(self.item)
+        stale_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        competing_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        resume_acceptance_item(competing_item)
+        approve_acceptance_item(competing_item)
+        suspend_acceptance_item(competing_item)
+
+        with self.assertRaises(InvalidTransition) as raised:
+            resume_acceptance_item(stale_item)
+
+        self.assertEqual(str(raised.exception), STALE_ACCEPTANCE_ITEM_TRANSITION)
+        self.assertEqual(stale_item.state, AcceptanceItem.State.SUSPENDED)
+        self.assertEqual(stale_item.approved_at, competing_item.approved_at)
+        self.assertFalse(
+            AcceptanceItem.objects.filter(
+                pk=self.item.pk,
+                state=AcceptanceItem.State.SUBMITTED,
+                approved_at__isnull=False,
+            ).exists()
+        )
+        self.assertFalse(
+            AcceptanceItem.objects.filter(
+                pk=self.item.pk,
+                state=AcceptanceItem.State.DRAFT,
+                approved_at__isnull=False,
+            ).exists()
+        )
+
+    def test_stale_suspend_rejects_other_legal_source_state(self):
+        """Suspend fails closed when submitted moved to approved."""
+        submit_acceptance_item_for_approval(self.item)
+        stale_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        competing_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        approve_acceptance_item(competing_item)
+
+        with self.assertRaises(InvalidTransition) as raised:
+            suspend_acceptance_item(stale_item)
+
+        self.assertEqual(str(raised.exception), STALE_ACCEPTANCE_ITEM_TRANSITION)
+        self.assertEqual(stale_item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(stale_item.approved_at, competing_item.approved_at)
+        persisted_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        self.assertEqual(persisted_item.state, AcceptanceItem.State.APPROVED)
+        self.assertFalse(
+            AcceptanceItem.objects.filter(
+                pk=self.item.pk,
+                state__in=(
+                    AcceptanceItem.State.DRAFT,
+                    AcceptanceItem.State.SUBMITTED,
+                ),
+                approved_at__isnull=False,
+            ).exists()
+        )
+
+    def test_transition_reports_concurrently_deleted_item(self):
+        """A deleted row has a distinct fail-closed transition error."""
+        submit_acceptance_item_for_approval(self.item)
+        stale_item = AcceptanceItem.objects.get(pk=self.item.pk)
+        AcceptanceItem.objects.filter(pk=self.item.pk).delete()
+
+        with self.assertRaises(InvalidTransition) as raised:
+            pull_back_acceptance_item(stale_item)
+
+        self.assertEqual(str(raised.exception), DELETED_ACCEPTANCE_ITEM_TRANSITION)
+        self.assertFalse(
+            AcceptanceItem.objects.filter(pk=self.item.pk).exists()
+        )
 
     def test_submitted_suspend_and_resume_edge(self):
         """submitted→suspended→submitted retains historical timestamps."""

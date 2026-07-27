@@ -408,6 +408,81 @@ hazard: client tokens; full dispatch)
   submission emails a working review link; delivery gating ignores parked
   items; and the criteria panel renders correctly in every item state.
 
+#### I1a-2 — Guarded item transitions (owning: Ledger; no consults; lands BEFORE I1b-2 commits)
+
+- **Why it exists and why it interrupts I1b.** The I1b-2 Implementer-adversary
+  proved, by direct interleaving rather than by argument, that a freelancer's
+  delayed pull-back click can land after a client's approval and silently erase
+  it, leaving the row in `draft` with `approved_at` still set. The Surface code
+  had claimed `select_for_update()` closed this window. It does not: the lock
+  only serializes the two writes, and `pull_back_acceptance_item` then performs
+  a blind `save(update_fields=...)` with no re-check of current state. The test
+  database is also SQLite, which does not support `SELECT ... FOR UPDATE` at
+  all — Django silently drops the clause — so no test in this suite could ever
+  have exercised the locking that was supposed to be the protection.
+- **The bug is I1a's, already committed, but I1b-2 is what makes it
+  reachable**: before the per-item UI there was no pull-back button. Human
+  ruling: fix it first, so no version of this repository ever contains a
+  reachable path that erases a recorded client approval.
+- Fix: make every `_transition_acceptance_item` write a **compare-and-swap** —
+  a guarded `UPDATE ... WHERE state = <expected>` whose affected-row count is
+  checked, raising `InvalidTransition` when it is zero, instead of a blind save
+  over a row that may have moved. This is a correctness fix at the only layer
+  that can hold it; every caller inherits it. **No schema or migration change
+  is needed or authorized** — a guarded update is a query, not a structure.
+- Boundaries: `ledger/services.py`, `ledger/tests.py`. Nothing in `surface/**`;
+  the uncommitted I1b-2 work stays untouched in the tree and is committed
+  separately afterwards, which the disjoint file sets make safe.
+- Test strategy: a **deterministic interleaving** test, not a threaded one —
+  hold a stale in-memory copy of an item, commit a competing transition
+  through a second copy, then drive the stale one and assert it raises rather
+  than writing. Threaded concurrency tests would be nondeterministic and, on
+  SQLite, would not prove what they appear to. Also assert the invariant the
+  adversary caught being violated: no row may end in `draft` with `approved_at`
+  set. The golden-digest payload test must stay green, which is the signal
+  that no serialization behaviour drifted.
+
+##### I1a-2 execution log
+
+- Shipped: `_transition_acceptance_item` now performs a guarded
+  `UPDATE ... WHERE pk = ? AND state = ?` and raises `InvalidTransition` on
+  zero affected rows. Six transition services inherit it. Three new
+  deterministic interleaving tests; suite 244 → 247. No migration, no model
+  change, golden digest unmoved at `302fc585…`.
+- Implementer-adversary (Sonnet) REJECT then satisfied. It confirmed the sound
+  parts by **executed interleaving** rather than by reading — `suspend` fails
+  closed, field sets match the old `update_fields` exactly, the in-memory
+  instance stays honest, `timezone.now()` is computed once, and
+  `AcceptanceItem` has no `save()`/`clean()` for `.update()` to bypass.
+- **The blocker it found is the lesson of this milestone.** The first fix
+  guarded `state` and stopped there, but `resume_acceptance_item` chooses its
+  target by reading `approved_at` off the in-memory copy. The adversary proved
+  by interleaving that a stale copy could resume an item to `submitted` with
+  `approved_at` still set — silently downgrading a recorded client approval,
+  the exact bug class the milestone existed to close, surviving in the one
+  caller whose behaviour branches on a field.
+- **Orchestrator ruling on the fix shape:** extend the guard to accept
+  additional conditions and have `resume` name `approved_at` among them,
+  rather than re-reading the row inside the transaction. It reuses the
+  already-tested zero-row failure path instead of adding a second one, and it
+  makes the dependency visible at the call site — any future transition that
+  branches on a field must declare that field, which turns this bug class into
+  something a reviewer can see rather than something they must reason out.
+- Also fixed: a concurrently deleted row reported as a state race. Same
+  exception type (a new one would ripple into Surface, out of boundary) with
+  its own message constant.
+- Compliance Gate (Opus 5, fresh context) PASS, eight items. It **proved**
+  rather than argued that the two Ledger files commit safely alone, by building
+  a throwaway worktree at `cc4cad6`, copying in only those files, and running
+  the suite green at 235. It also mutation-verified all three new tests itself
+  instead of trusting the builder's report.
+- **Routed to I1b-2, found by the gate:** `delete_acceptance_item` still reads
+  `approved_at` into Python and then calls an unguarded `item.delete()`, so an
+  approval committing between the two destroys the row. Much narrower than the
+  fixed bug — the window is two queries in one request, not a human's think
+  time — and it sits inside I1b-2's declared delete-hole work, so it is that
+  seat's to close with a guarded filtered delete.
+
 ##### Decisions closing the I1b Planner-adversary review (rejected iter 1)
 
 All six factual claims were confirmed against the code. The plan was rejected
