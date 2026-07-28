@@ -8,6 +8,7 @@ from django.utils.text import slugify
 
 from .models import (
     AcceptanceItem,
+    AcceptanceStep,
     Attestation,
     CapabilityTag,
     ChangeOrder,
@@ -199,17 +200,31 @@ def acceptance_item_locked(item):
     return item.state != AcceptanceItem.State.DRAFT
 
 
+@transaction.atomic
 def delete_acceptance_item(item):
     """Delete never-approved scope only while its project remains mutable."""
-    deleted_count, _ = AcceptanceItem.objects.filter(
-        pk=item.pk,
-        approved_at__isnull=True,
-        project__status__in=(
+    guard = {
+        "approved_at__isnull": True,
+        "project__status__in": (
             Project.Status.DRAFT,
             Project.Status.CRITERIA_PENDING,
             Project.Status.ACTIVE,
         ),
+    }
+    AcceptanceStep.objects.filter(
+        item_id=item.pk,
+        item__approved_at__isnull=True,
+        item__project__status__in=guard["project__status__in"],
     ).delete()
+    guarded_items = AcceptanceItem.objects.filter(
+        pk=item.pk,
+        **guard,
+    )
+    # The normal collector evaluates this guarded queryset before deleting now
+    # that AcceptanceStep cascades from it, opening a check/delete race. Every
+    # child relation must be deleted manually above before issuing this guarded
+    # DELETE; the related-object tripwire test enforces that complete set.
+    deleted_count = guarded_items._raw_delete(guarded_items.db)
     if deleted_count == 0:
         current_item = AcceptanceItem.objects.filter(pk=item.pk).values(
             "approved_at",
@@ -223,6 +238,92 @@ def delete_acceptance_item(item):
         raise InvalidTransition(
             "Acceptance items cannot be deleted after project delivery."
         )
+
+
+def create_acceptance_step(item, text, order):
+    """Create an ordered step while its parent criterion remains draft."""
+    if acceptance_item_locked(item):
+        raise InvalidTransition(
+            "Acceptance steps can only be created while their item is draft."
+        )
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Acceptance step text must not be empty.")
+    return AcceptanceStep.objects.create(
+        item=item,
+        text=text,
+        order=order,
+    )
+
+
+def update_acceptance_step(step, text, order):
+    """Update step structure in one statement guarded by parent draft state."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Acceptance step text must not be empty.")
+    updated_count = AcceptanceStep.objects.filter(
+        pk=step.pk,
+        item__state=AcceptanceItem.State.DRAFT,
+    ).update(text=text, order=order)
+    if updated_count == 0:
+        current_step = AcceptanceStep.objects.filter(pk=step.pk).values(
+            "item__state",
+        ).first()
+        if current_step is None:
+            raise InvalidTransition("Acceptance step no longer exists.")
+        raise InvalidTransition(
+            "Acceptance steps can only be changed while their item is draft."
+        )
+    step.text = text
+    step.order = order
+    return step
+
+
+def delete_acceptance_step(step):
+    """Delete a step in one statement guarded by parent draft state."""
+    deleted_count, _ = AcceptanceStep.objects.filter(
+        pk=step.pk,
+        item__state=AcceptanceItem.State.DRAFT,
+    ).delete()
+    if deleted_count == 0:
+        current_step = AcceptanceStep.objects.filter(pk=step.pk).values(
+            "item__state",
+        ).first()
+        if current_step is None:
+            raise InvalidTransition("Acceptance step no longer exists.")
+        raise InvalidTransition(
+            "Acceptance steps can only be deleted while their item is draft."
+        )
+
+
+def set_acceptance_step_done(step, is_done):
+    """Set progress in one statement guarded by approved active scope."""
+    if not isinstance(is_done, bool):
+        raise ValueError("is_done must be a boolean.")
+    updated_count = AcceptanceStep.objects.filter(
+        pk=step.pk,
+        item__state=AcceptanceItem.State.APPROVED,
+        item__project__status=Project.Status.ACTIVE,
+    ).update(is_done=is_done)
+    if updated_count == 0:
+        current_step = AcceptanceStep.objects.filter(pk=step.pk).values(
+            "item__state",
+            "item__project__status",
+        ).first()
+        if current_step is None:
+            raise InvalidTransition("Acceptance step no longer exists.")
+        if current_step["item__state"] != AcceptanceItem.State.APPROVED:
+            raise InvalidTransition(
+                "Acceptance step progress requires an approved item."
+            )
+        raise InvalidTransition(
+            "Acceptance step progress can only change while the project is active."
+        )
+    step.is_done = is_done
+    return step
+
+
+def acceptance_step_locked(step):
+    """Return whether an acceptance step's structure is not editable."""
+    return acceptance_item_locked(step.item)
 
 
 def mark_delivered(project):
@@ -345,6 +446,7 @@ def canonical_payload(project):
     """Build the deterministic signed snapshot for a project."""
     acceptance_items = []
     item_rows = project.acceptance_items.order_by("order", "pk").values(
+        "id",
         "text",
         "is_passed",
         "evidence_url",
@@ -352,7 +454,19 @@ def canonical_payload(project):
         "submitted_at",
         "approved_at",
     )
+    steps_by_item_id = defaultdict(list)
+    step_rows = AcceptanceStep.objects.filter(
+        item__project=project,
+    ).order_by("item_id", "order", "pk").values(
+        "item_id",
+        "text",
+        "is_done",
+    )
+    for step_row in step_rows:
+        item_id = step_row.pop("item_id")
+        steps_by_item_id[item_id].append(step_row)
     for item_row in item_rows:
+        item_id = item_row.pop("id")
         item_row["submitted_at"] = (
             item_row["submitted_at"].isoformat()
             if item_row["submitted_at"] is not None
@@ -363,6 +477,7 @@ def canonical_payload(project):
             if item_row["approved_at"] is not None
             else None
         )
+        item_row["steps"] = steps_by_item_id[item_id]
         acceptance_items.append(item_row)
     change_orders = list(
         project.change_orders.filter(status=ChangeOrder.Status.APPROVED)

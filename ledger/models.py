@@ -109,6 +109,35 @@ class AcceptanceItem(models.Model):
         return self.text
 
 
+class AcceptanceStep(models.Model):
+    """Store one ordered unit of work beneath an acceptance criterion."""
+
+    item = models.ForeignKey(
+        AcceptanceItem,
+        on_delete=models.CASCADE,
+        related_name="steps",
+    )
+    text = models.TextField()
+    order = models.PositiveIntegerField()
+    is_done = models.BooleanField(default=False)
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+
+    class Meta:
+        """Order steps stably and forbid duplicate positions per criterion."""
+
+        ordering = ("order", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("item", "order"),
+                name="unique_acceptance_step_order_per_item",
+            )
+        ]
+
+    def __str__(self):
+        """Return the acceptance step text."""
+        return self.text
+
+
 class ChangeOrder(models.Model):
     """Record a proposed adjustment to project price or timeline."""
 

@@ -1355,6 +1355,88 @@ the signing page and signing it.
   `AiDraftConfirmView`, which is `DRAFT`-only. Single-item deletion was the only
   hole.
 
+#### I2a execution log
+
+- Model, migration `0004_acceptancestep`, the five planned services, nested
+  payload, both pinned tests re-pinned deliberately. Golden digest moved
+  `302fc585…dc19` → `e4694469…1b8c`, over a fixture extended to actually contain
+  steps. Suite 269 → 286.
+- **The builder found that adding a child model silently broke I1c**, which had
+  been committed only hours earlier. Django's deletion collector cannot
+  fast-delete a model that has *any* cascading relation — it is a model-level
+  decision, not a row-level one — so `AcceptanceItem.objects.filter(guards).delete()`
+  stopped compiling to one guarded `DELETE` and became SELECT-the-ids, then
+  DELETE-by-id. The final delete carried no guard, reopening precisely the
+  check-then-act race I1c existed to close. Nothing in the suite would have said
+  a word, because the I1c test counted statements rather than inspecting them.
+- **Orchestrator ruling: accept `_raw_delete`.** Steps are removed first by their
+  own guarded statement, then the item is deleted through
+  `queryset._raw_delete()`, which compiles the queryset's WHERE straight into the
+  DELETE, all inside `transaction.atomic`. It is a private API, which is a real
+  cost, but the alternatives were worse: reverting to collector behaviour
+  reintroduces the race, and locking would have required changing
+  `mark_delivered` outside this milestone's boundary.
+- **The I1c test was rewritten rather than weakened, and came out stronger.** It
+  no longer counts queries — a count is meaningless once a legitimate child
+  delete exists — and instead asserts the *final* DELETE statement still carries
+  `approved_at`, `ledger_project` and `status`. That pins the property that
+  actually matters, and would have caught this regression where the original
+  would not.
+- **`_raw_delete` skips the collector, so cascade is now hand-written code.**
+  A tripwire test pins `AcceptanceItem._meta.related_objects` to exactly
+  `AcceptanceStep`, with a docstring telling whoever trips it to add their new
+  child to the manual deletion or lose the cascade silently. Proven by
+  temporarily adding a second child model and watching it fire.
+- Plan clarification: the "two queries" rule meant two for the item-and-step
+  fetch. Three total, including the pre-existing change-order query, is correct
+  and is what the test pins.
+- **Implementer-adversary ACCEPT.** Recomputed the golden digest in a standalone
+  script importing no project code, and matched. Captured the emitted SQL to show
+  `_raw_delete` carries the full WHERE, then proved the clause load-bearing
+  against a row that fails the guard. Proved rollback two ways, including the
+  guard-triggered zero-row path.
+- **Verifier-adversary REJECT**, and the separate seat earned itself for the
+  second milestone running. It pinned both bounds of the `is_done` gate across
+  the whole item-state × project-status matrix and found two real holes:
+  `delete_acceptance_step` had no stale-parent recheck — proven by a
+  check-then-act implementation surviving all fourteen step-service tests — and
+  **the rewritten I1c test pinned SQL substrings rather than predicates.** A
+  DELETE carrying `approved_at`, `ledger_project` and `status` as decoy literals
+  while filtering only on `id` passed it. The orchestrator had approved that test
+  as "stronger than the one it replaced"; it was stronger against a naive revert
+  and weaker against a decoy. Now fixed to assert the DELETE's **bound
+  parameters**, captured via `connection.execute_wrapper` because
+  `CaptureQueriesContext` does not expose them on SQLite.
+- **Compliance Gate PASS**, with the best verification method this project has
+  seen. It validated its digest recomputation by first reproducing the *old*
+  literal from the pre-I2 item shape, then the new one — a self-checking method
+  rather than a bare assertion. It then answered the question that actually
+  mattered empirically: a **genuine pre-I2 attestation in the dev database**,
+  written by that morning's hand-driven walkthrough, still verifies `True` under
+  the new code, because `verify_payload_hash` rehashes the stored dict and never
+  calls `canonical_payload`. No historical record is disturbed.
+- The gate also confirmed the race was real at its source — `can_fast_delete()`
+  genuinely flips to `False` once a cascading child exists — and improved the
+  risk picture: the FK is `DEFERRABLE INITIALLY DEFERRED` with `PRAGMA
+  foreign_keys` on, so a future child omitted from the manual cascade raises
+  `IntegrityError` at commit rather than orphaning rows quietly. The failure mode
+  is loud.
+- Tripwire extended to assert no `pre_delete`/`post_delete` receivers exist for
+  `AcceptanceItem`, since `_raw_delete` skips signal dispatch as well as cascade.
+  Migration `0004` gained a reversibility test to match `0002` and `0003`.
+- Final: **288 tests**, ruff at the 3 documented pre-existing `I001`.
+
+##### Roadmap item — the clean escape from `_raw_delete`
+
+Logged by the I2a gate. Setting `on_delete=models.DO_NOTHING` on `AcceptanceStep`
+and declaring a database-level `ON DELETE CASCADE` instead would restore
+`can_fast_delete` to `True`, letting a plain guarded `.delete()` compile back to
+a single statement with a real cascade — removing both the private API and the
+hand-written child cleanup. It needs custom migration SQL and a SQLite table
+rebuild, so it was out of scope here. This is the shape to reach for if
+`_raw_delete` ever becomes a maintenance problem, rather than inventing something
+new under pressure.
+
 ##### Refit candidate — `AcceptanceItemUpdateView` reads the lock, then saves
 
 Found by the I2 Planner-adversary. `AcceptanceItemUpdateView.post` calls

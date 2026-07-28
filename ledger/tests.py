@@ -5,14 +5,16 @@ from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
 
 from django.contrib.auth.models import User
-from django.db import IntegrityError, connection, transaction
+from django.db import IntegrityError, connection, models, transaction
 from django.db.migrations.executor import MigrationExecutor
+from django.db.models.signals import post_delete, pre_delete
 from django.test import TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from ledger.models import (
     AcceptanceItem,
+    AcceptanceStep,
     Attestation,
     CapabilityTag,
     ChangeOrder,
@@ -24,6 +26,7 @@ from ledger.services import (
     InvalidSignatureMeta,
     InvalidTransition,
     acceptance_item_locked,
+    acceptance_step_locked,
     amend_attestation,
     approve_acceptance_item,
     approve_acceptance_items,
@@ -31,9 +34,11 @@ from ledger.services import (
     approve_criteria,
     canonical_payload,
     compute_payload_hash,
+    create_acceptance_step,
     criteria_locked,
     decline_change_order,
     delete_acceptance_item,
+    delete_acceptance_step,
     disputed_count,
     flag_dispute,
     has_open_change_orders,
@@ -45,12 +50,14 @@ from ledger.services import (
     reopen_active,
     resolve_dispute,
     resume_acceptance_item,
+    set_acceptance_step_done,
     set_profile_visibility,
     sign_attestation,
     submit_acceptance_item_for_approval,
     submit_acceptance_items_for_approval,
     submit_criteria_for_approval,
     suspend_acceptance_item,
+    update_acceptance_step,
     verify_payload_hash,
     withdraw_acceptance_item,
 )
@@ -440,6 +447,69 @@ class AcceptanceItemStateMigrationTests(TransactionTestCase):
         self.assertNotIn("state", reversed_fields)
         self.assertNotIn("submitted_at", reversed_fields)
         self.assertNotIn("approved_at", reversed_fields)
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, latest_migration)])
+
+
+class AcceptanceStepMigrationTests(TransactionTestCase):
+    """Migration 0004 creates and cleanly removes the step table."""
+
+    def test_0004_acceptance_step_applies_and_reverses(self):
+        """The AcceptanceStep model can be applied and rolled back cleanly."""
+        executor = MigrationExecutor(connection)
+        app_label = "ledger"
+        before_migration = (
+            "0003_acceptanceitem_approved_at_acceptanceitem_state_and_more"
+        )
+        step_migration = "0004_acceptancestep"
+        latest_migration = next(
+            name
+            for app, name in executor.loader.graph.leaf_nodes()
+            if app == app_label
+        )
+
+        executor.migrate([(app_label, before_migration)])
+        before_state = executor.loader.project_state(
+            (app_label, before_migration)
+        )
+        before_models = {
+            model._meta.model_name for model in before_state.apps.get_models()
+        }
+        self.assertNotIn("acceptancestep", before_models)
+        self.assertNotIn(
+            "ledger_acceptancestep",
+            connection.introspection.table_names(),
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, step_migration)])
+        applied_state = executor.loader.project_state(
+            (app_label, step_migration)
+        )
+        AppliedStep = applied_state.apps.get_model(app_label, "AcceptanceStep")
+        self.assertEqual(
+            {field.name for field in AppliedStep._meta.get_fields()},
+            {"id", "item", "text", "order", "is_done", "created_at"},
+        )
+        self.assertIn(
+            "ledger_acceptancestep",
+            connection.introspection.table_names(),
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, before_migration)])
+        reversed_state = executor.loader.project_state(
+            (app_label, before_migration)
+        )
+        reversed_models = {
+            model._meta.model_name for model in reversed_state.apps.get_models()
+        }
+        self.assertNotIn("acceptancestep", reversed_models)
+        self.assertNotIn(
+            "ledger_acceptancestep",
+            connection.introspection.table_names(),
+        )
 
         executor = MigrationExecutor(connection)
         executor.migrate([(app_label, latest_migration)])
@@ -949,14 +1019,30 @@ class AcceptanceItemStateMachineTests(TestCase):
             AcceptanceItem.objects.filter(pk=approved_item.pk).exists()
         )
 
-    def test_successful_delete_uses_one_guarded_database_query(self):
-        """Approval and project-status guards execute in the DELETE query."""
+    def test_successful_delete_keeps_guards_in_final_database_delete(self):
+        """Child cascade queries do not move guards out of the item DELETE."""
         item_pk = self.item.pk
+        delete_statements = []
 
-        with CaptureQueriesContext(connection) as captured_queries:
+        def capture_delete(execute, sql, params, many, context):
+            if sql.lstrip().lower().startswith("delete"):
+                delete_statements.append((sql, params))
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(capture_delete):
             delete_acceptance_item(self.item)
 
-        self.assertEqual(len(captured_queries), 1)
+        self.assertEqual(len(delete_statements), 2)
+        _, guarded_params = delete_statements[-1]
+        self.assertCountEqual(
+            guarded_params,
+            (
+                item_pk,
+                Project.Status.DRAFT,
+                Project.Status.CRITERIA_PENDING,
+                Project.Status.ACTIVE,
+            ),
+        )
         self.assertFalse(
             AcceptanceItem.objects.filter(pk=item_pk).exists()
         )
@@ -1085,6 +1171,353 @@ class AcceptanceItemStateMachineTests(TestCase):
             )
         project.refresh_from_db()
         self.assertEqual(project.status, Project.Status.DRAFT)
+
+
+class AcceptanceStepServiceTests(TestCase):
+    """Pin step structure and progress guards at both bounds."""
+
+    def make_item(self, state=AcceptanceItem.State.DRAFT, project_status=None):
+        """Create and return one item in an explicit state and project status."""
+        if project_status is None:
+            project_status = Project.Status.DRAFT
+        project = make_project_with_items(status=project_status)
+        item = project.acceptance_items.order_by("order").first()
+        item.state = state
+        item.save(update_fields=("state",))
+        return project, item
+
+    def test_draft_structure_services_create_update_and_delete(self):
+        """All three structural mutations succeed for a draft parent."""
+        _, item = self.make_item()
+
+        step = create_acceptance_step(item, "First version", 1)
+        self.assertFalse(acceptance_step_locked(step))
+        update_acceptance_step(step, "Revised version", 2)
+        step.refresh_from_db()
+        self.assertEqual((step.text, step.order), ("Revised version", 2))
+
+        step_pk = step.pk
+        delete_acceptance_step(step)
+        self.assertFalse(AcceptanceStep.objects.filter(pk=step_pk).exists())
+
+    def test_structure_services_refuse_every_non_draft_item_state(self):
+        """Create, update, and delete all refuse every locked parent state."""
+        refusal_messages = {
+            "create": (
+                "Acceptance steps can only be created while their item is draft."
+            ),
+            "update": (
+                "Acceptance steps can only be changed while their item is draft."
+            ),
+            "delete": (
+                "Acceptance steps can only be deleted while their item is draft."
+            ),
+        }
+        for state in AcceptanceItem.State.values:
+            if state == AcceptanceItem.State.DRAFT:
+                continue
+            for mutation_name, refusal_message in refusal_messages.items():
+                with self.subTest(state=state, mutation=mutation_name):
+                    _, item = self.make_item(state=state)
+                    step = AcceptanceStep.objects.create(
+                        item=item,
+                        text="Locked step",
+                        order=1,
+                    )
+
+                    with self.assertRaisesMessage(
+                        InvalidTransition,
+                        refusal_message,
+                    ):
+                        if mutation_name == "create":
+                            create_acceptance_step(item, "New step", 2)
+                        elif mutation_name == "update":
+                            update_acceptance_step(step, "Changed step", 2)
+                        else:
+                            delete_acceptance_step(step)
+
+                    step.refresh_from_db()
+                    self.assertEqual((step.text, step.order), ("Locked step", 1))
+                    self.assertTrue(acceptance_step_locked(step))
+
+    def test_structure_services_reject_blank_text(self):
+        """Creation and update reject text that is blank after stripping."""
+        _, item = self.make_item()
+        step = create_acceptance_step(item, "Existing", 1)
+
+        with self.assertRaises(ValueError):
+            create_acceptance_step(item, " \t ", 2)
+        with self.assertRaises(ValueError):
+            update_acceptance_step(step, "\n", 2)
+
+        step.refresh_from_db()
+        self.assertEqual((step.text, step.order), ("Existing", 1))
+
+    def test_duplicate_order_raises_integrity_error(self):
+        """The database forbids duplicate step positions under one item."""
+        _, item = self.make_item()
+        create_acceptance_step(item, "First", 1)
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                create_acceptance_step(item, "Duplicate", 1)
+
+    def test_structural_successes_each_use_one_guarded_statement(self):
+        """Update and delete each keep the parent-state guard in one query."""
+        _, item = self.make_item()
+        update_step = create_acceptance_step(item, "Update me", 1)
+
+        with CaptureQueriesContext(connection) as update_queries:
+            update_acceptance_step(update_step, "Updated", 2)
+        self.assertEqual(len(update_queries), 1)
+        self.assertIn("ledger_acceptanceitem", update_queries[0]["sql"].lower())
+
+        delete_step = create_acceptance_step(item, "Delete me", 1)
+        with CaptureQueriesContext(connection) as delete_queries:
+            delete_acceptance_step(delete_step)
+        self.assertEqual(len(delete_queries), 1)
+        self.assertIn("ledger_acceptanceitem", delete_queries[0]["sql"].lower())
+
+    def test_parent_bulk_delete_cascades_to_steps(self):
+        """Draft-item bulk replacement cannot leave orphaned step rows."""
+        _, item = self.make_item()
+        step = create_acceptance_step(item, "Removed with parent", 1)
+
+        AcceptanceItem.objects.filter(pk=item.pk).delete()
+
+        self.assertFalse(AcceptanceStep.objects.filter(pk=step.pk).exists())
+
+    def test_manual_item_delete_handles_every_related_model(self):
+        """Raw item deletion must track child relations and delete receivers."""
+        raw_delete_warning = (
+            "AcceptanceItem's child relations, deletion behavior, or delete "
+            "signal listeners changed. delete_acceptance_item uses _raw_delete, "
+            "so update its manual child deletion and account for pre_delete or "
+            "post_delete receivers; _raw_delete will not dispatch them."
+        )
+        cascading_relations = {
+            (
+                relation.related_model,
+                relation.field.remote_field.on_delete,
+            )
+            for relation in AcceptanceItem._meta.related_objects
+        }
+
+        self.assertEqual(
+            cascading_relations,
+            {(AcceptanceStep, models.CASCADE)},
+            msg=raw_delete_warning,
+        )
+        registered_delete_signals = {
+            signal_name
+            for signal_name, signal in (
+                ("pre_delete", pre_delete),
+                ("post_delete", post_delete),
+            )
+            if signal.has_listeners(AcceptanceItem)
+        }
+        self.assertEqual(
+            registered_delete_signals,
+            set(),
+            msg=raw_delete_warning,
+        )
+
+    def test_is_done_allowed_only_for_approved_item_on_active_project(self):
+        """The full item-state/project-status matrix pins both guard bounds."""
+        for project_status in Project.Status.values:
+            for item_state in AcceptanceItem.State.values:
+                with self.subTest(
+                    project_status=project_status,
+                    item_state=item_state,
+                ):
+                    _, item = self.make_item(
+                        state=item_state,
+                        project_status=project_status,
+                    )
+                    step = AcceptanceStep.objects.create(
+                        item=item,
+                        text="Track progress",
+                        order=1,
+                    )
+                    is_permitted = (
+                        project_status == Project.Status.ACTIVE
+                        and item_state == AcceptanceItem.State.APPROVED
+                    )
+
+                    if is_permitted:
+                        set_acceptance_step_done(step, True)
+                    else:
+                        with self.assertRaises(InvalidTransition):
+                            set_acceptance_step_done(step, True)
+
+                    step.refresh_from_db()
+                    self.assertEqual(step.is_done, is_permitted)
+
+    def test_set_done_requires_a_boolean(self):
+        """Progress rejects truthy non-boolean values before writing."""
+        _, item = self.make_item(
+            state=AcceptanceItem.State.APPROVED,
+            project_status=Project.Status.ACTIVE,
+        )
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="Typed progress",
+            order=1,
+        )
+
+        with self.assertRaises(ValueError):
+            set_acceptance_step_done(step, 1)
+
+        step.refresh_from_db()
+        self.assertFalse(step.is_done)
+
+    def test_set_done_success_is_one_multi_hop_guarded_statement(self):
+        """Item and project guards compile into the successful UPDATE."""
+        _, item = self.make_item(
+            state=AcceptanceItem.State.APPROVED,
+            project_status=Project.Status.ACTIVE,
+        )
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="One statement",
+            order=1,
+        )
+
+        with CaptureQueriesContext(connection) as captured_queries:
+            set_acceptance_step_done(step, True)
+
+        self.assertEqual(len(captured_queries), 1)
+        sql = captured_queries[0]["sql"].lower()
+        self.assertIn("update", sql)
+        self.assertIn("ledger_acceptanceitem", sql)
+        self.assertIn("ledger_project", sql)
+        step.refresh_from_db()
+        self.assertTrue(step.is_done)
+
+    def test_set_done_refusal_distinguishes_item_and_project_guards(self):
+        """Progress refusal identifies which current relation blocks it."""
+        _, submitted_item = self.make_item(
+            state=AcceptanceItem.State.SUBMITTED,
+            project_status=Project.Status.ACTIVE,
+        )
+        submitted_step = AcceptanceStep.objects.create(
+            item=submitted_item,
+            text="Await approval",
+            order=1,
+        )
+        with self.assertRaisesMessage(
+            InvalidTransition,
+            "Acceptance step progress requires an approved item.",
+        ):
+            set_acceptance_step_done(submitted_step, True)
+
+        _, approved_item = self.make_item(
+            state=AcceptanceItem.State.APPROVED,
+            project_status=Project.Status.DELIVERED,
+        )
+        approved_step = AcceptanceStep.objects.create(
+            item=approved_item,
+            text="Project frozen",
+            order=1,
+        )
+        with self.assertRaisesMessage(
+            InvalidTransition,
+            "Acceptance step progress can only change while the project is active.",
+        ):
+            set_acceptance_step_done(approved_step, True)
+
+    def test_structural_updates_recheck_current_parent_state(self):
+        """A stale draft relation cannot overwrite newly locked step content."""
+        _, item = self.make_item()
+        step = create_acceptance_step(item, "Original", 1)
+        stale_step = AcceptanceStep.objects.select_related("item").get(pk=step.pk)
+        self.assertEqual(stale_step.item.state, AcceptanceItem.State.DRAFT)
+        AcceptanceItem.objects.filter(pk=item.pk).update(
+            state=AcceptanceItem.State.SUBMITTED,
+        )
+
+        with self.assertRaisesMessage(
+            InvalidTransition,
+            "Acceptance steps can only be changed while their item is draft.",
+        ):
+            update_acceptance_step(stale_step, "Stale overwrite", 2)
+
+        step.refresh_from_db()
+        self.assertEqual((step.text, step.order), ("Original", 1))
+
+    def test_structural_delete_rechecks_current_parent_state(self):
+        """A stale draft relation cannot delete a newly locked step."""
+        _, item = self.make_item()
+        step = create_acceptance_step(item, "Keep me", 1)
+        stale_step = AcceptanceStep.objects.select_related("item").get(pk=step.pk)
+        self.assertEqual(stale_step.item.state, AcceptanceItem.State.DRAFT)
+        AcceptanceItem.objects.filter(pk=item.pk).update(
+            state=AcceptanceItem.State.SUBMITTED,
+        )
+
+        with self.assertRaisesMessage(
+            InvalidTransition,
+            "Acceptance steps can only be deleted while their item is draft.",
+        ):
+            delete_acceptance_step(stale_step)
+
+        self.assertTrue(AcceptanceStep.objects.filter(pk=step.pk).exists())
+
+    def test_set_done_rechecks_current_project_status(self):
+        """A stale active relation cannot write progress after delivery."""
+        project, item = self.make_item(
+            state=AcceptanceItem.State.APPROVED,
+            project_status=Project.Status.ACTIVE,
+        )
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="Freeze at delivery",
+            order=1,
+        )
+        stale_step = AcceptanceStep.objects.select_related(
+            "item__project",
+        ).get(pk=step.pk)
+        self.assertEqual(
+            stale_step.item.project.status,
+            Project.Status.ACTIVE,
+        )
+        Project.objects.filter(pk=project.pk).update(
+            status=Project.Status.DELIVERED,
+        )
+
+        with self.assertRaises(InvalidTransition):
+            set_acceptance_step_done(stale_step, True)
+
+        step.refresh_from_db()
+        self.assertFalse(step.is_done)
+
+    def test_each_guarded_mutation_identifies_a_deleted_step(self):
+        """Update, delete, and progress each distinguish a vanished row."""
+        for mutation_name in ("update", "delete", "set_done"):
+            with self.subTest(mutation=mutation_name):
+                _, item = self.make_item(
+                    state=AcceptanceItem.State.APPROVED
+                    if mutation_name == "set_done"
+                    else AcceptanceItem.State.DRAFT,
+                    project_status=Project.Status.ACTIVE,
+                )
+                step = AcceptanceStep.objects.create(
+                    item=item,
+                    text="Soon deleted",
+                    order=1,
+                )
+                AcceptanceStep.objects.filter(pk=step.pk).delete()
+
+                with self.assertRaisesMessage(
+                    InvalidTransition,
+                    "Acceptance step no longer exists.",
+                ):
+                    if mutation_name == "update":
+                        update_acceptance_step(step, "Changed", 2)
+                    elif mutation_name == "delete":
+                        delete_acceptance_step(step)
+                    else:
+                        set_acceptance_step_done(step, True)
 
 
 class AcceptanceItemGateTests(TestCase):
@@ -1689,7 +2122,7 @@ class PayloadHashTests(TestCase):
             skills_csv="Python, Django",
             status=Project.Status.DELIVERED,
         )
-        AcceptanceItem.objects.create(
+        item = AcceptanceItem.objects.create(
             project=project,
             text="A",
             order=1,
@@ -1714,10 +2147,22 @@ class PayloadHashTests(TestCase):
             ),
             is_passed=True,
         )
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Second signed step",
+            order=2,
+            is_done=False,
+        )
+        AcceptanceStep.objects.create(
+            item=item,
+            text="First signed step",
+            order=1,
+            is_done=True,
+        )
 
         self.assertEqual(
             compute_payload_hash(canonical_payload(project)),
-            "302fc585ff14c2b1fda0c67375100b4ec8d802368bbf92306815cd56ef53dc19",
+            "e46944690ba1b2810afdc3cd31689e139fcd8b4a9e039586c8ee159ea13e1b8c",
         )
 
     def test_canonical_payload_serializes_item_state_and_timestamps(self):
@@ -1762,6 +2207,7 @@ class PayloadHashTests(TestCase):
                 "state": "approved",
                 "submitted_at": "2026-02-03T04:05:06+00:00",
                 "approved_at": "2026-02-04T05:06:07+00:00",
+                "steps": [],
             },
         )
         self.assertEqual(payload_items[1]["state"], "suspended")
@@ -1770,6 +2216,73 @@ class PayloadHashTests(TestCase):
             "2026-02-03T04:05:06+00:00",
         )
         self.assertIsNone(payload_items[1]["approved_at"])
+
+    def test_canonical_payload_nests_ordered_steps_in_two_queries(self):
+        """Steps nest by parent in order without an item-by-item query."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        items = list(project.acceptance_items.order_by("order"))
+        AcceptanceStep.objects.create(
+            item=items[0],
+            text="Later",
+            order=2,
+            is_done=False,
+        )
+        AcceptanceStep.objects.create(
+            item=items[0],
+            text="Earlier",
+            order=1,
+            is_done=True,
+        )
+        AcceptanceStep.objects.create(
+            item=items[1],
+            text="Other item",
+            order=1,
+            is_done=False,
+        )
+
+        with CaptureQueriesContext(connection) as captured_queries:
+            payload_items = canonical_payload(project)["acceptance_items"]
+
+        self.assertEqual(len(captured_queries), 3)
+        acceptance_queries = [
+            query["sql"]
+            for query in captured_queries
+            if "ledger_acceptance" in query["sql"].lower()
+        ]
+        self.assertEqual(len(acceptance_queries), 2)
+        self.assertEqual(
+            payload_items[0]["steps"],
+            [
+                {"text": "Earlier", "is_done": True},
+                {"text": "Later", "is_done": False},
+            ],
+        )
+        self.assertEqual(
+            payload_items[1]["steps"],
+            [{"text": "Other item", "is_done": False}],
+        )
+
+    def test_hash_changes_when_step_content_or_progress_changes(self):
+        """Both signed step fields contribute to the canonical digest."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        item = project.acceptance_items.order_by("order").first()
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="Signed wording",
+            order=1,
+            is_done=False,
+        )
+        original_hash = compute_payload_hash(canonical_payload(project))
+
+        step.text = "Different signed wording"
+        step.save(update_fields=("text",))
+        text_hash = compute_payload_hash(canonical_payload(project))
+        step.is_done = True
+        step.save(update_fields=("is_done",))
+        progress_hash = compute_payload_hash(canonical_payload(project))
+
+        self.assertNotEqual(original_hash, text_hash)
+        self.assertNotEqual(text_hash, progress_hash)
 
     def test_key_insertion_order_does_not_change_hash(self):
         """Two dicts with identical content but different key order hash equal."""
@@ -1820,6 +2333,40 @@ class PayloadHashTests(TestCase):
         )
         recomputed = compute_payload_hash(canonical_payload(project))
         self.assertEqual(attestation.payload_hash, recomputed)
+
+    def test_signed_step_snapshot_does_not_follow_live_row_changes(self):
+        """Changing a live step cannot rewrite an existing signed payload."""
+        project = make_project_with_items(status=Project.Status.DELIVERED)
+        mark_all_items_passed(project)
+        item = project.acceptance_items.order_by("order").first()
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="Signed step",
+            order=1,
+            is_done=False,
+        )
+        attestation = sign_attestation(
+            project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+        self.assertEqual(
+            attestation.payload["acceptance_items"][0]["steps"],
+            [{"text": "Signed step", "is_done": False}],
+        )
+        signed_payload = json.loads(json.dumps(attestation.payload))
+        signed_hash = attestation.payload_hash
+
+        AcceptanceStep.objects.filter(pk=step.pk).update(
+            text="Later live value",
+            is_done=True,
+        )
+        attestation.refresh_from_db()
+
+        self.assertEqual(attestation.payload, signed_payload)
+        self.assertEqual(attestation.payload_hash, signed_hash)
+        self.assertTrue(verify_payload_hash(attestation))
 
 
 class SignAttestationTests(TestCase):
@@ -2431,6 +2978,10 @@ class CapabilityTagTests(TestCase):
         self.assertTrue(verify_payload_hash(attestation))
         self.assertNotIn(
             "state",
+            attestation.payload["acceptance_items"][0],
+        )
+        self.assertNotIn(
+            "steps",
             attestation.payload["acceptance_items"][0],
         )
         recompute_capability_tags(self.profile)
