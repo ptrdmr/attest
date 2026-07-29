@@ -2,7 +2,7 @@
 
 from django import forms
 
-from ledger.models import AcceptanceItem, Project
+from ledger.models import AcceptanceItem, AcceptanceStep, Project
 
 
 class MagicLinkRequestForm(forms.Form):
@@ -41,6 +41,27 @@ class AcceptanceItemForm(forms.ModelForm):
         model = AcceptanceItem
         fields = ("text", "order")
         widgets = {"text": forms.Textarea(attrs={"rows": 2})}
+
+
+class AcceptanceStepForm(forms.ModelForm):
+    """Validate one ordered step beneath an acceptance criterion."""
+
+    class Meta:
+        """Configure editable acceptance step fields."""
+
+        model = AcceptanceStep
+        fields = ("text", "order")
+        widgets = {"text": forms.Textarea(attrs={"rows": 2})}
+
+
+class AcceptanceStepDoneForm(forms.Form):
+    """Validate the explicit intended completion state for a step."""
+
+    is_done = forms.TypedChoiceField(
+        choices=((True, "Done"), (False, "Not done")),
+        coerce=lambda value: value == "True",
+        widget=forms.HiddenInput,
+    )
 
 
 class DeliveryItemForm(forms.ModelForm):

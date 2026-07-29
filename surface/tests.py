@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 from hashlib import sha256
+import json
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -10,11 +11,19 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.cache.backends.db import DatabaseCache
 from django.core import mail, signing
+from django.db import connection
 from django.test import Client, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 
-from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
+from ledger.models import (
+    AcceptanceItem,
+    AcceptanceStep,
+    ChangeOrder,
+    Profile,
+    Project,
+)
 from ledger.services import (
     InvalidTransition,
     approve_criteria,
@@ -1064,6 +1073,173 @@ class ClientApproveViewTests(TestCase):
         self.token = make_client_token(self.project, "review")
         self.client = Client()
 
+    def test_submitted_batch_fingerprint_hashes_complete_step_content(self):
+        """The digest shape includes ordered step identity, text, order, and state."""
+        from surface.views import _submitted_batch_fingerprint
+
+        item = self.project.acceptance_items.get()
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="Consent-bound step",
+            order=7,
+            is_done=True,
+        )
+        first_digest = _submitted_batch_fingerprint([item])
+        serialized_entries = json.dumps(
+            [
+                [
+                    item.pk,
+                    item.submitted_at.isoformat(),
+                    [[step.pk, step.text, step.order, step.is_done]],
+                ]
+            ],
+            separators=(",", ":"),
+        )
+
+        self.assertEqual(
+            first_digest,
+            sha256(serialized_entries.encode("utf-8")).hexdigest(),
+        )
+        self.assertRegex(first_digest, r"\A[0-9a-f]{64}\Z")
+
+        AcceptanceStep.objects.filter(pk=step.pk).update(
+            text="Changed consent-bound step"
+        )
+        text_digest = _submitted_batch_fingerprint([item])
+        AcceptanceStep.objects.filter(pk=step.pk).update(
+            text=step.text,
+            is_done=False,
+        )
+        done_digest = _submitted_batch_fingerprint([item])
+        AcceptanceStep.objects.filter(pk=step.pk).update(
+            is_done=step.is_done,
+            order=8,
+        )
+        order_digest = _submitted_batch_fingerprint([item])
+
+        self.assertNotEqual(first_digest, text_digest)
+        self.assertNotEqual(first_digest, done_digest)
+        self.assertNotEqual(first_digest, order_digest)
+
+    def test_submitted_batch_fingerprint_sorts_reversed_item_input(self):
+        """Fingerprint order is deterministic even when input arrives newest-first."""
+        from surface.views import _submitted_batch_fingerprint
+
+        first_item = self.project.acceptance_items.get()
+        second_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Second submitted criterion",
+            order=2,
+            state=AcceptanceItem.State.SUBMITTED,
+            submitted_at=timezone.now(),
+        )
+        reversed_items = self.project.acceptance_items.filter(
+            state=AcceptanceItem.State.SUBMITTED
+        ).order_by("-pk")
+        serialized_entries = json.dumps(
+            [
+                [first_item.pk, first_item.submitted_at.isoformat(), []],
+                [second_item.pk, second_item.submitted_at.isoformat(), []],
+            ],
+            separators=(",", ":"),
+        )
+
+        self.assertEqual(
+            _submitted_batch_fingerprint(reversed_items),
+            sha256(serialized_entries.encode("utf-8")).hexdigest(),
+        )
+
+    def test_submitted_batch_fingerprint_pins_null_timestamp_sentinel(self):
+        """A missing timestamp has one explicit consent-bound representation."""
+        from surface.views import _submitted_batch_fingerprint
+
+        item = self.project.acceptance_items.get()
+        item.submitted_at = None
+        item.save(update_fields=("submitted_at",))
+        serialized_entries = json.dumps(
+            [[item.pk, "__missing_submitted_at__", []]],
+            separators=(",", ":"),
+        )
+
+        self.assertEqual(
+            _submitted_batch_fingerprint([item]),
+            sha256(serialized_entries.encode("utf-8")).hexdigest(),
+        )
+
+    def test_approve_fingerprint_prefetches_steps_with_locked_items(self):
+        """The real approval path fetches all locked items and steps without N+1."""
+        from surface.views import _submitted_batch_fingerprint
+
+        second_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Second submitted criterion",
+            order=2,
+            state=AcceptanceItem.State.SUBMITTED,
+            submitted_at=timezone.now(),
+        )
+        for item in (self.project.acceptance_items.get(order=1), second_item):
+            AcceptanceStep.objects.create(
+                item=item,
+                text=f"Step for item {item.pk}",
+                order=1,
+            )
+
+        submitted_items = list(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.SUBMITTED
+            )
+        )
+        fingerprint = _submitted_batch_fingerprint(submitted_items)
+        with (
+            patch("surface.views.services.approve_acceptance_items"),
+            patch("surface.views.services.approve_criteria"),
+            CaptureQueriesContext(connection) as captured_queries,
+        ):
+            response = self.client.post(
+                reverse(
+                    "surface:client-approve",
+                    kwargs={"token": self.token},
+                ),
+                {"batch_fingerprint": fingerprint},
+            )
+
+        step_selects = [
+            query["sql"]
+            for query in captured_queries
+            if query["sql"].lstrip().upper().startswith("SELECT")
+            and "ledger_acceptancestep" in query["sql"].lower()
+        ]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(captured_queries), 7)
+        self.assertEqual(len(step_selects), 1)
+
+    def test_client_review_shows_step_scope_without_progress_state(self):
+        """Review discloses step text while withholding irrelevant done status."""
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Client-visible review step",
+            order=1,
+            is_done=True,
+        )
+
+        response = self.client.get(
+            reverse("surface:client-review", kwargs={"token": self.token})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Client-visible review step")
+        self.assertNotContains(response, 'class="badge passed"')
+        self.assertNotContains(response, 'class="badge failed"')
+
+    def test_client_review_omits_step_block_for_empty_scope(self):
+        """A criterion without steps gets no empty nested-list placeholder."""
+        response = self.client.get(
+            reverse("surface:client-review", kwargs={"token": self.token})
+        )
+
+        self.assertNotContains(response, 'class="step-list"')
+
     def test_client_approve_activates_project(self):
         """Valid approve POST activates the project through ledger.services."""
         fingerprint = review_fingerprint(self.client, self.token)
@@ -1166,7 +1342,7 @@ class ClientApproveViewTests(TestCase):
         ].value()
         self.assertEqual(review_response.status_code, 200)
         self.assertContains(review_response, item.text)
-        self.assertIn("__missing_submitted_at__", fingerprint)
+        self.assertRegex(fingerprint, r"\A[0-9a-f]{64}\Z")
 
         approve_response = self.client.post(
             reverse("surface:client-approve", kwargs={"token": self.token}),
@@ -1519,6 +1695,340 @@ class CriteriaActionGateAgreementTests(TestCase):
                     AcceptanceItem.objects.filter(pk=item.pk).exists(),
                     status not in mutable_statuses,
                 )
+
+
+class AcceptanceStepSurfaceTests(TestCase):
+    """Freelancer step controls and endpoints mirror Ledger's exact guards."""
+
+    def setUp(self):
+        """Authenticate one freelancer for owned-project step requests."""
+        self.owner = make_profile()
+        self.client = Client()
+        login_as(self.client, self.owner)
+
+    def step_url(self, action, project, item, step=None):
+        """Build one nested step URL using the established route names."""
+        kwargs = {"project_pk": project.pk, "item_pk": item.pk}
+        if step is not None:
+            kwargs["step_pk"] = step.pk
+        return reverse(f"surface:criterion-step-{action}", kwargs=kwargs)
+
+    def make_item_for_state(self, project, state):
+        """Create one internally coherent item fixture in the requested state."""
+        timestamp = timezone.now()
+        return AcceptanceItem.objects.create(
+            project=project,
+            text=f"{project.status} {state} criterion",
+            order=1,
+            state=state,
+            submitted_at=(
+                None if state == AcceptanceItem.State.DRAFT else timestamp
+            ),
+            approved_at=(
+                timestamp if state == AcceptanceItem.State.APPROVED else None
+            ),
+            is_passed=True,
+        )
+
+    def test_structure_controls_and_endpoints_agree_across_every_state_matrix(self):
+        """Create, edit, and delete exist exactly while the parent is draft."""
+        checks = 0
+        for status in Project.Status.values:
+            for item_state in AcceptanceItem.State.values:
+                with self.subTest(status=status, item_state=item_state):
+                    project = make_draft_project(
+                        owner=self.owner,
+                        with_criteria=False,
+                    )
+                    project.status = status
+                    project.save(update_fields=("status",))
+                    item = self.make_item_for_state(project, item_state)
+                    step = AcceptanceStep.objects.create(
+                        item=item,
+                        text="Existing step",
+                        order=1,
+                    )
+                    detail_response = self.client.get(
+                        reverse(
+                            "surface:project-detail",
+                            kwargs={"project_pk": project.pk},
+                        )
+                    )
+                    item_markup = criterion_html(detail_response, item)
+                    expected_reachable = item_state == AcceptanceItem.State.DRAFT
+
+                    for label in ("Add step", "Edit step", "Delete step"):
+                        self.assertEqual(
+                            f">{label}</button>" in item_markup,
+                            expected_reachable,
+                            f"{label} rendering disagrees for {status}/{item_state}",
+                        )
+                        checks += 1
+
+                    update_get_response = self.client.get(
+                        self.step_url("update", project, item, step),
+                        HTTP_HX_REQUEST="true",
+                    )
+                    with patch(
+                        "surface.views.services.create_acceptance_step"
+                    ):
+                        create_response = self.client.post(
+                            self.step_url("create", project, item),
+                            {"text": "Created step", "order": 2},
+                            HTTP_HX_REQUEST="true",
+                        )
+                    with patch(
+                        "surface.views.services.update_acceptance_step"
+                    ):
+                        update_response = self.client.post(
+                            self.step_url("update", project, item, step),
+                            {"text": "Updated step", "order": 1},
+                            HTTP_HX_REQUEST="true",
+                        )
+                    with patch(
+                        "surface.views.services.delete_acceptance_step"
+                    ):
+                        delete_response = self.client.post(
+                            self.step_url("delete", project, item, step),
+                            HTTP_HX_REQUEST="true",
+                        )
+                    for action, response in (
+                        ("create", create_response),
+                        ("update-get", update_get_response),
+                        ("update", update_response),
+                        ("delete", delete_response),
+                    ):
+                        self.assertEqual(
+                            response.status_code != 404,
+                            expected_reachable,
+                            f"{action} endpoint disagrees for {status}/{item_state}",
+                        )
+                        checks += 1
+        self.assertEqual(checks, 210)
+
+    def test_draft_step_edit_get_renders_bound_inline_form(self):
+        """The Edit-step HTMX endpoint returns a usable form for its selected step."""
+        project = make_draft_project(owner=self.owner)
+        item = project.acceptance_items.get()
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="Editable inline step",
+            order=7,
+        )
+
+        response = self.client.get(
+            self.step_url("update", project, item, step),
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Editable inline step")
+        self.assertContains(response, 'value="7"')
+        self.assertContains(response, ">Save step</button>")
+
+    def test_done_control_and_endpoint_agree_across_every_state_matrix(self):
+        """Progress is writable only for approved scope on an active project."""
+        checks = 0
+        for status in Project.Status.values:
+            for item_state in AcceptanceItem.State.values:
+                with self.subTest(status=status, item_state=item_state):
+                    project = make_draft_project(
+                        owner=self.owner,
+                        with_criteria=False,
+                    )
+                    project.status = status
+                    project.save(update_fields=("status",))
+                    item = self.make_item_for_state(project, item_state)
+                    step = AcceptanceStep.objects.create(
+                        item=item,
+                        text="Progress step",
+                        order=1,
+                    )
+                    detail_response = self.client.get(
+                        reverse(
+                            "surface:project-detail",
+                            kwargs={"project_pk": project.pk},
+                        )
+                    )
+                    control_is_rendered = (
+                        ">Mark done</button>"
+                        in criterion_html(detail_response, item)
+                    )
+                    expected_reachable = (
+                        status == Project.Status.ACTIVE
+                        and item_state == AcceptanceItem.State.APPROVED
+                    )
+                    with patch(
+                        "surface.views.services.set_acceptance_step_done"
+                    ):
+                        endpoint_response = self.client.post(
+                            self.step_url("done", project, item, step),
+                            {"is_done": "True"},
+                            HTTP_HX_REQUEST="true",
+                        )
+
+                    self.assertEqual(
+                        control_is_rendered,
+                        expected_reachable,
+                        f"done rendering disagrees for {status}/{item_state}",
+                    )
+                    self.assertEqual(
+                        endpoint_response.status_code != 404,
+                        expected_reachable,
+                        f"done endpoint disagrees for {status}/{item_state}",
+                    )
+                    checks += 2
+        self.assertEqual(checks, 60)
+
+    def test_done_posts_explicit_idempotent_boolean_intent(self):
+        """Repeated intent cannot invert progress, and either boolean is accepted."""
+        project = make_draft_project(owner=self.owner)
+        advance_to_active(project)
+        item = project.acceptance_items.get()
+        step = AcceptanceStep.objects.create(
+            item=item,
+            text="Explicit progress",
+            order=1,
+        )
+        url = self.step_url("done", project, item, step)
+
+        for _submission in range(2):
+            response = self.client.post(
+                url,
+                {"is_done": "True"},
+                HTTP_HX_REQUEST="true",
+            )
+            step.refresh_from_db()
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(step.is_done)
+            self.assertContains(response, ">Mark not done</button>")
+
+        response = self.client.post(
+            url,
+            {"is_done": "False"},
+            HTTP_HX_REQUEST="true",
+        )
+        step.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(step.is_done)
+
+    def test_owner_can_create_update_and_delete_draft_steps(self):
+        """All three structure endpoints delegate real mutations while draft."""
+        project = make_draft_project(owner=self.owner)
+        item = project.acceptance_items.get()
+
+        create_response = self.client.post(
+            self.step_url("create", project, item),
+            {"text": "Created through Surface", "order": 1},
+            HTTP_HX_REQUEST="true",
+        )
+        step = item.steps.get()
+        update_response = self.client.post(
+            self.step_url("update", project, item, step),
+            {"text": "Updated through Surface", "order": 1},
+            HTTP_HX_REQUEST="true",
+        )
+        step.refresh_from_db()
+        delete_response = self.client.post(
+            self.step_url("delete", project, item, step),
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(create_response.status_code, 200)
+        self.assertEqual(update_response.status_code, 200)
+        self.assertEqual(step.text, "Updated through Surface")
+        self.assertEqual(delete_response.status_code, 200)
+        self.assertFalse(AcceptanceStep.objects.filter(pk=step.pk).exists())
+
+    def test_duplicate_step_order_returns_inline_form_error(self):
+        """A duplicate position is a friendly form error, never a server error."""
+        project = make_draft_project(owner=self.owner)
+        item = project.acceptance_items.get()
+        AcceptanceStep.objects.create(item=item, text="First step", order=1)
+
+        response = self.client.post(
+            self.step_url("create", project, item),
+            {"text": "Duplicate step", "order": 1},
+            HTTP_HX_REQUEST="true",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "That order is already in use.")
+        self.assertEqual(item.steps.count(), 1)
+
+    def test_duplicate_step_order_on_update_returns_inline_form_error(self):
+        """Reordering onto a sibling position keeps the stored step unchanged."""
+        project = make_draft_project(owner=self.owner)
+        item = project.acceptance_items.get()
+        first_step = AcceptanceStep.objects.create(
+            item=item,
+            text="First step",
+            order=1,
+        )
+        second_step = AcceptanceStep.objects.create(
+            item=item,
+            text="Second step",
+            order=2,
+        )
+
+        response = self.client.post(
+            self.step_url("update", project, item, second_step),
+            {"text": "Conflicting update", "order": 1},
+            HTTP_HX_REQUEST="true",
+        )
+
+        second_step.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "That order is already in use.")
+        self.assertEqual(second_step.text, "Second step")
+        self.assertEqual(second_step.order, 2)
+        self.assertTrue(AcceptanceStep.objects.filter(pk=first_step.pk).exists())
+
+    def test_foreign_project_step_is_404_for_every_step_endpoint(self):
+        """Nested lookup never resolves another freelancer's step by primary key."""
+        owned_project = make_draft_project(owner=self.owner)
+        other_project = make_draft_project(owner=make_profile())
+        foreign_item = other_project.acceptance_items.get()
+        foreign_step = AcceptanceStep.objects.create(
+            item=foreign_item,
+            text="Foreign step",
+            order=1,
+        )
+        kwargs = {
+            "project_pk": owned_project.pk,
+            "item_pk": foreign_item.pk,
+            "step_pk": foreign_step.pk,
+        }
+
+        update_url = reverse("surface:criterion-step-update", kwargs=kwargs)
+        responses = [
+            self.client.post(
+                self.step_url("create", owned_project, foreign_item),
+                {"text": "Foreign create intrusion", "order": 2},
+                HTTP_HX_REQUEST="true",
+            ),
+            self.client.get(update_url, HTTP_HX_REQUEST="true"),
+            self.client.post(
+                update_url,
+                {"text": "Intrusion", "order": 1},
+                HTTP_HX_REQUEST="true",
+            ),
+            self.client.post(
+                reverse("surface:criterion-step-delete", kwargs=kwargs),
+                HTTP_HX_REQUEST="true",
+            ),
+            self.client.post(
+                reverse("surface:criterion-step-done", kwargs=kwargs),
+                {"is_done": "True"},
+                HTTP_HX_REQUEST="true",
+            ),
+        ]
+
+        self.assertTrue(all(response.status_code == 404 for response in responses))
+        foreign_step.refresh_from_db()
+        self.assertEqual(foreign_step.text, "Foreign step")
+        self.assertFalse(foreign_step.is_done)
+        self.assertEqual(foreign_item.steps.count(), 1)
 
 
 class PerItemCriteriaWorkflowTests(TestCase):
@@ -2355,6 +2865,39 @@ class ClientSignViewTests(TestCase):
         self.assertContains(response, "Passed")
         self.assertNotContains(response, "Not passed")
 
+    def test_parked_item_steps_render_inside_excluded_scope_framing(self):
+        """Suspended scope retains its steps within the parked visual group."""
+        project = make_draft_project()
+        parked_item = AcceptanceItem.objects.create(
+            project=project,
+            text="Parked criterion with steps",
+            order=2,
+        )
+        AcceptanceStep.objects.create(
+            item=parked_item,
+            text="Parked nested step",
+            order=1,
+        )
+        advance_to_active(project)
+        parked_item.refresh_from_db()
+        suspend_acceptance_item(parked_item)
+        project.acceptance_items.filter(
+            state=AcceptanceItem.State.APPROVED
+        ).update(is_passed=True)
+        mark_delivered(project)
+        token = make_client_token(project, "sign")
+
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": token})
+        )
+        content = response.content.decode()
+        parked_start = content.index('class="parked-scope"')
+        parked_end = content.index("</div>", parked_start)
+
+        self.assertContains(response, "Parked nested step")
+        self.assertGreater(content.index("Parked nested step"), parked_start)
+        self.assertLess(content.index("Parked nested step"), parked_end)
+
     def test_unrecorded_result_is_never_presented_as_not_passed(self):
         """An undecided parked criterion says no result instead of inventing failure."""
         response = self.get_sign_page_with_parked_item(
@@ -2393,6 +2936,114 @@ class ClientSignViewTests(TestCase):
         self.assertContains(response, "<strong>Passed</strong>", html=True)
         self.assertContains(response, evidence_url)
         self.assertContains(response, "View evidence")
+
+    def test_passed_item_with_outstanding_step_discloses_both_facts_prominently(self):
+        """The outstanding-work alert precedes Passed and names the undone step."""
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Outstanding signing step",
+            order=1,
+            is_done=False,
+        )
+
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token})
+        )
+        content = response.content.decode()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            'class="outstanding-steps-notice" role="alert"',
+        )
+        self.assertContains(response, "this criterion is marked Passed")
+        self.assertContains(response, "Outstanding signing step")
+        self.assertContains(response, "Not done")
+        self.assertContains(response, "<strong>Passed</strong>", html=True)
+        self.assertLess(
+            content.index('class="outstanding-steps-notice"'),
+            content.index("<strong>Passed</strong>"),
+        )
+
+    def test_outstanding_step_notice_has_primary_visual_treatment(self):
+        """The consent warning is styled as a strong alert, not muted metadata."""
+        stylesheet = (
+            settings.BASE_DIR / "static" / "css" / "app.css"
+        ).read_text(encoding="utf-8")
+        notice_rule = stylesheet.split(
+            ".outstanding-steps-notice {",
+            1,
+        )[1].split("}", 1)[0]
+
+        self.assertIn("border: 2px solid", notice_rule)
+        self.assertIn("background: #fff1d6", notice_rule)
+        self.assertIn("font-weight: 650", notice_rule)
+
+    def test_mobile_criterion_grid_has_no_dead_flex_direction(self):
+        """Responsive criterion CSS does not retain a flex-only declaration."""
+        stylesheet = (
+            settings.BASE_DIR / "static" / "css" / "app.css"
+        ).read_text(encoding="utf-8")
+        mobile_rules = stylesheet.split("@media (max-width: 680px) {", 1)[1]
+        criterion_rule = mobile_rules.split(".criterion {", 1)[1].split(
+            "}",
+            1,
+        )[0]
+
+        self.assertNotIn("flex-direction", criterion_rule)
+
+    def test_passed_item_with_all_steps_done_omits_outstanding_notice(self):
+        """Completed granular work does not trigger the outstanding-work warning."""
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Completed signing step",
+            order=1,
+            is_done=True,
+        )
+
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token})
+        )
+
+        self.assertContains(response, "Completed signing step")
+        self.assertContains(response, "Done")
+        self.assertNotContains(response, 'class="outstanding-steps-notice"')
+
+    def test_signing_page_shows_done_and_not_done_step_states(self):
+        """Every signing-page step carries its explicit completion state."""
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Completed signing step",
+            order=1,
+            is_done=True,
+        )
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Incomplete signing step",
+            order=2,
+            is_done=False,
+        )
+
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token})
+        )
+
+        self.assertContains(response, "Completed signing step")
+        self.assertContains(response, "Incomplete signing step")
+        self.assertContains(response, "Done")
+        self.assertContains(response, "Not done")
+
+    def test_signing_page_omits_step_block_when_criterion_has_no_steps(self):
+        """Empty step scope adds no noisy placeholder to the consent record."""
+        response = self.client.get(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token})
+        )
+
+        self.assertNotContains(response, 'class="criterion-steps"')
+        self.assertNotContains(response, 'class="outstanding-steps-notice"')
 
     def test_client_sign_happy_path_attests_and_shows_payload_hash(self):
         """Valid signature posts through ledger and renders the record hash."""
@@ -3438,6 +4089,27 @@ class AiDraftViewTests(TestCase):
             self.project.acceptance_items.order_by("order").values_list("text", flat=True)
         )
         self.assertEqual(texts, ["Applied criterion A", "Applied criterion B"])
+
+    def test_confirm_replacing_draft_criteria_cascades_their_steps(self):
+        """Human-confirmed bulk replacement removes steps under deleted drafts."""
+        old_item = self.project.acceptance_items.get()
+        old_step = AcceptanceStep.objects.create(
+            item=old_item,
+            text="Step beneath replaced AI scope",
+            order=1,
+        )
+
+        response = self.client.post(
+            reverse(
+                "surface:ai-draft-confirm",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            ai_confirm_form_data(),
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(AcceptanceItem.objects.filter(pk=old_item.pk).exists())
+        self.assertFalse(AcceptanceStep.objects.filter(pk=old_step.pk).exists())
 
     def test_confirm_without_valid_form_leaves_project_unchanged(self):
         """Invalid confirm POST re-renders preview and leaves stored project state intact."""

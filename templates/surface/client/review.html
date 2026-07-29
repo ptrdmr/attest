@@ -16,7 +16,16 @@
     {% endif %}
     <ol>
       {% for item in pending_acceptance_items %}
-        <li class="pre-line">{{ item.text }}</li>
+        <li>
+          <span class="pre-line">{{ item.text }}</span>
+          {% if item.steps.all %}
+            <ol class="step-list">
+              {% for step in item.steps.all %}
+                <li class="pre-line">{{ step.text }}</li>
+              {% endfor %}
+            </ol>
+          {% endif %}
+        </li>
       {% empty %}
         <li>No criteria are currently awaiting approval.</li>
       {% endfor %}
@@ -42,7 +51,16 @@
       <h2>Already-approved scope</h2>
       <ol>
         {% for item in approved_acceptance_items %}
-          <li class="pre-line">{{ item.text }}</li>
+          <li>
+            <span class="pre-line">{{ item.text }}</span>
+            {% if item.steps.all %}
+              <ol class="step-list">
+                {% for step in item.steps.all %}
+                  <li class="pre-line">{{ step.text }}</li>
+                {% endfor %}
+              </ol>
+            {% endif %}
+          </li>
         {% endfor %}
       </ol>
     </section>

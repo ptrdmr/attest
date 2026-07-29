@@ -21,7 +21,13 @@ from django.views import View
 from django.views.generic import FormView, TemplateView
 
 from ledger import services
-from ledger.models import AcceptanceItem, ChangeOrder, Profile, Project
+from ledger.models import (
+    AcceptanceItem,
+    AcceptanceStep,
+    ChangeOrder,
+    Profile,
+    Project,
+)
 
 from . import ai, billing
 from .auth import (
@@ -33,6 +39,8 @@ from .auth import (
 )
 from .forms import (
     AcceptanceItemForm,
+    AcceptanceStepDoneForm,
+    AcceptanceStepForm,
     ActionForm,
     AiDraftConfirmForm,
     AiDumpForm,
@@ -140,13 +148,34 @@ def _send_change_order_link(request, change_order):
     )
 
 
-def _project_context(project, **extra):
+def _project_context(
+    project,
+    *,
+    step_form=None,
+    step_item_pk=None,
+    editing_step_pk=None,
+    **extra,
+):
     """Build the common project-detail template context."""
-    acceptance_items = list(project.acceptance_items.all())
+    acceptance_items = list(project.acceptance_items.prefetch_related("steps"))
     criteria_rows = [
         {
             "item": item,
             "locked": services.acceptance_item_locked(item),
+            "steps": list(item.steps.all()),
+            "step_form": (
+                step_form
+                if item.pk == step_item_pk and editing_step_pk is None
+                else AcceptanceStepForm()
+            ),
+            "editing_step_pk": (
+                editing_step_pk if item.pk == step_item_pk else None
+            ),
+            "editing_step_form": (
+                step_form
+                if item.pk == step_item_pk and editing_step_pk is not None
+                else None
+            ),
         }
         for item in acceptance_items
     ]
@@ -173,9 +202,23 @@ def _project_context(project, **extra):
     return context
 
 
-def _render_criteria(request, project, *, form=None, status=200):
+def _render_criteria(
+    request,
+    project,
+    *,
+    form=None,
+    step_form=None,
+    step_item_pk=None,
+    editing_step_pk=None,
+    status=200,
+):
     """Render the criteria HTMX fragment with optional form errors."""
-    context = _project_context(project)
+    context = _project_context(
+        project,
+        step_form=step_form,
+        step_item_pk=step_item_pk,
+        editing_step_pk=editing_step_pk,
+    )
     if form is not None:
         context["acceptance_form"] = form
     return render(request, "surface/partials/criteria.html", context, status=status)
@@ -187,25 +230,32 @@ def _client_token_error(request):
 
 
 def _submitted_batch_fingerprint(items):
-    """Serialize item identity and submission time as a stable set fingerprint."""
-    submitted_pairs = sorted(
-        (
+    """Hash submitted item identity, timestamp, and complete step scope."""
+    submitted_entries = sorted(
+        [
             item.pk,
             (
                 item.submitted_at.isoformat()
                 if item.submitted_at is not None
                 else "__missing_submitted_at__"
             ),
-        )
+            [
+                [step.pk, step.text, step.order, step.is_done]
+                for step in item.steps.all()
+            ],
+        ]
         for item in items
     )
-    return json.dumps(submitted_pairs, separators=(",", ":"))
+    serialized_entries = json.dumps(submitted_entries, separators=(",", ":"))
+    return sha256(serialized_entries.encode("utf-8")).hexdigest()
 
 
 def _client_review_context(project, token, *, stale_batch=False):
     """Build client review context from the project's current item states."""
     pending_items = list(
-        project.acceptance_items.filter(state=AcceptanceItem.State.SUBMITTED)
+        project.acceptance_items.filter(
+            state=AcceptanceItem.State.SUBMITTED
+        ).prefetch_related("steps")
     )
     return {
         "project": project,
@@ -213,7 +263,7 @@ def _client_review_context(project, token, *, stale_batch=False):
         "pending_acceptance_items": pending_items,
         "approved_acceptance_items": project.acceptance_items.filter(
             state=AcceptanceItem.State.APPROVED
-        ),
+        ).prefetch_related("steps"),
         "approval_form": ClientApprovalForm(
             initial={
                 "batch_fingerprint": _submitted_batch_fingerprint(pending_items),
@@ -617,6 +667,178 @@ class AcceptanceItemUpdateView(OwnedProjectMixin, View):
         return redirect("surface:project-detail", project_pk=self.project.pk)
 
 
+def _owned_acceptance_step(project, item_pk, step_pk):
+    """Resolve a step through its criterion and authenticated owned project."""
+    return get_object_or_404(
+        AcceptanceStep,
+        pk=step_pk,
+        item__pk=item_pk,
+        item__project=project,
+    )
+
+
+class AcceptanceStepCreateView(OwnedProjectMixin, View):
+    """Add a step while its owned parent criterion remains draft."""
+
+    def post(self, request, project_pk, item_pk):
+        """Validate and delegate creation through the guarded Ledger service."""
+        item = get_object_or_404(
+            AcceptanceItem,
+            pk=item_pk,
+            project=self.project,
+        )
+        if item.state != AcceptanceItem.State.DRAFT:
+            raise Http404
+        form = AcceptanceStepForm(request.POST)
+        if form.is_valid():
+            try:
+                with transaction.atomic():
+                    services.create_acceptance_step(
+                        item,
+                        form.cleaned_data["text"],
+                        form.cleaned_data["order"],
+                    )
+            except IntegrityError:
+                form.add_error("order", "That order is already in use.")
+            except services.InvalidTransition:
+                raise Http404 from None
+            else:
+                return self._success_response(request)
+        return self._error_response(request, item, form)
+
+    def _error_response(self, request, item, form):
+        """Render inline validation errors for the selected criterion."""
+        if _is_htmx(request):
+            return _render_criteria(
+                request,
+                self.project,
+                step_form=form,
+                step_item_pk=item.pk,
+            )
+        return render(
+            request,
+            "surface/projects/detail.html",
+            _project_context(
+                self.project,
+                step_form=form,
+                step_item_pk=item.pk,
+            ),
+        )
+
+    def _success_response(self, request):
+        """Return the refreshed criteria panel or project detail."""
+        if _is_htmx(request):
+            return _render_criteria(request, self.project)
+        return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
+class AcceptanceStepUpdateView(OwnedProjectMixin, View):
+    """Edit a step while its owned parent criterion remains draft."""
+
+    def get(self, request, project_pk, item_pk, step_pk):
+        """Show the selected step's inline edit form."""
+        step = _owned_acceptance_step(self.project, item_pk, step_pk)
+        if step.item.state != AcceptanceItem.State.DRAFT:
+            raise Http404
+        return _render_criteria(
+            request,
+            self.project,
+            step_form=AcceptanceStepForm(instance=step),
+            step_item_pk=item_pk,
+            editing_step_pk=step.pk,
+        )
+
+    def post(self, request, project_pk, item_pk, step_pk):
+        """Validate and delegate the guarded structural update."""
+        step = _owned_acceptance_step(self.project, item_pk, step_pk)
+        if step.item.state != AcceptanceItem.State.DRAFT:
+            raise Http404
+        form = AcceptanceStepForm(request.POST, instance=step)
+        if form.is_valid():
+            try:
+                with transaction.atomic():
+                    services.update_acceptance_step(
+                        step,
+                        form.cleaned_data["text"],
+                        form.cleaned_data["order"],
+                    )
+            except IntegrityError:
+                form.add_error("order", "That order is already in use.")
+            except services.InvalidTransition:
+                raise Http404 from None
+            else:
+                if _is_htmx(request):
+                    return _render_criteria(request, self.project)
+                return redirect(
+                    "surface:project-detail",
+                    project_pk=self.project.pk,
+                )
+        if _is_htmx(request):
+            return _render_criteria(
+                request,
+                self.project,
+                step_form=form,
+                step_item_pk=item_pk,
+                editing_step_pk=step.pk,
+            )
+        return render(
+            request,
+            "surface/projects/detail.html",
+            _project_context(
+                self.project,
+                step_form=form,
+                step_item_pk=item_pk,
+                editing_step_pk=step.pk,
+            ),
+        )
+
+
+class AcceptanceStepDeleteView(OwnedProjectMixin, View):
+    """Delete a step while its owned parent criterion remains draft."""
+
+    def post(self, request, project_pk, item_pk, step_pk):
+        """Validate and delegate guarded step deletion."""
+        form = ActionForm(request.POST)
+        step = _owned_acceptance_step(self.project, item_pk, step_pk)
+        if (
+            not form.is_valid()
+            or step.item.state != AcceptanceItem.State.DRAFT
+        ):
+            raise Http404
+        try:
+            services.delete_acceptance_step(step)
+        except services.InvalidTransition:
+            raise Http404 from None
+        if _is_htmx(request):
+            return _render_criteria(request, self.project)
+        return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
+class AcceptanceStepDoneView(OwnedProjectMixin, View):
+    """Set explicit progress only for approved scope on active work."""
+
+    def post(self, request, project_pk, item_pk, step_pk):
+        """Validate intended state and delegate the guarded progress update."""
+        form = AcceptanceStepDoneForm(request.POST)
+        step = _owned_acceptance_step(self.project, item_pk, step_pk)
+        if (
+            not form.is_valid()
+            or self.project.status != Project.Status.ACTIVE
+            or step.item.state != AcceptanceItem.State.APPROVED
+        ):
+            raise Http404
+        try:
+            services.set_acceptance_step_done(
+                step,
+                form.cleaned_data["is_done"],
+            )
+        except services.InvalidTransition:
+            raise Http404 from None
+        if _is_htmx(request):
+            return _render_criteria(request, self.project)
+        return redirect("surface:project-detail", project_pk=self.project.pk)
+
+
 class AcceptanceItemDeleteView(OwnedProjectMixin, View):
     """Delete one acceptance item while criteria remain editable."""
 
@@ -959,7 +1181,7 @@ class ClientApproveView(ClientTokenMixin, View):
             submitted_items = list(
                 self.project.acceptance_items.select_for_update().filter(
                     state=AcceptanceItem.State.SUBMITTED
-                )
+                ).prefetch_related("steps")
             )
             current_fingerprint = _submitted_batch_fingerprint(submitted_items)
             if not submitted_items:
@@ -1057,12 +1279,25 @@ class ClientSignView(ClientTokenMixin, View):
 
     def _render(self, request, form):
         """Render delivery evidence without exposing the signing token."""
+        acceptance_items = list(
+            self.project.acceptance_items.prefetch_related("steps")
+        )
+        acceptance_rows = [
+            {
+                "item": item,
+                "steps": list(item.steps.all()),
+                "has_undone_steps": any(
+                    not step.is_done for step in item.steps.all()
+                ),
+            }
+            for item in acceptance_items
+        ]
         return render(
             request,
             self.template_name,
             {
                 "project": self.project,
-                "acceptance_items": self.project.acceptance_items.all(),
+                "acceptance_rows": acceptance_rows,
                 "form": form,
             },
         )

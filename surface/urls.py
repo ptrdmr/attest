@@ -55,6 +55,26 @@ urlpatterns = [
         name="criterion-delete",
     ),
     path(
+        "projects/<int:project_pk>/criteria/<int:item_pk>/steps/add/",
+        views.AcceptanceStepCreateView.as_view(),
+        name="criterion-step-create",
+    ),
+    path(
+        "projects/<int:project_pk>/criteria/<int:item_pk>/steps/<int:step_pk>/edit/",
+        views.AcceptanceStepUpdateView.as_view(),
+        name="criterion-step-update",
+    ),
+    path(
+        "projects/<int:project_pk>/criteria/<int:item_pk>/steps/<int:step_pk>/delete/",
+        views.AcceptanceStepDeleteView.as_view(),
+        name="criterion-step-delete",
+    ),
+    path(
+        "projects/<int:project_pk>/criteria/<int:item_pk>/steps/<int:step_pk>/done/",
+        views.AcceptanceStepDoneView.as_view(),
+        name="criterion-step-done",
+    ),
+    path(
         "projects/<int:project_pk>/criteria/<int:item_pk>/submit/",
         views.AcceptanceItemSubmitView.as_view(),
         name="criterion-submit",

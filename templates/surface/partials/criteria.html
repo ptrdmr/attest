@@ -9,6 +9,89 @@
           <span class="badge">{{ row.item.get_state_display }}</span>
         </div>
 
+        {% if row.steps or row.item.state == "draft" %}
+          <div class="criterion-steps">
+            {% if row.steps %}
+              <p class="muted">Steps</p>
+              <ol class="step-list">
+                {% for step in row.steps %}
+                  <li>
+                    {% if row.editing_step_pk == step.pk %}
+                      <form
+                        method="post"
+                        action="{% url 'surface:criterion-step-update' project.pk row.item.pk step.pk %}"
+                        hx-post="{% url 'surface:criterion-step-update' project.pk row.item.pk step.pk %}"
+                        hx-target="#criteria-panel"
+                        hx-swap="outerHTML"
+                      >
+                        {% csrf_token %}
+                        {{ row.editing_step_form.as_div }}
+                        <button type="submit">Save step</button>
+                      </form>
+                    {% else %}
+                      <span class="pre-line">{{ step.text }}</span>
+                      {% if row.item.state == "draft" %}
+                        <span class="actions step-actions">
+                          <button
+                            class="button-link"
+                            type="button"
+                            hx-get="{% url 'surface:criterion-step-update' project.pk row.item.pk step.pk %}"
+                            hx-target="#criteria-panel"
+                            hx-swap="outerHTML"
+                          >Edit step</button>
+                          <form
+                            method="post"
+                            action="{% url 'surface:criterion-step-delete' project.pk row.item.pk step.pk %}"
+                            hx-post="{% url 'surface:criterion-step-delete' project.pk row.item.pk step.pk %}"
+                            hx-target="#criteria-panel"
+                            hx-swap="outerHTML"
+                          >
+                            {% csrf_token %}
+                            <button class="button-link danger secondary" type="submit">Delete step</button>
+                          </form>
+                        </span>
+                      {% elif project.status == "active" and row.item.state == "approved" %}
+                        <form
+                          class="step-done-form"
+                          method="post"
+                          action="{% url 'surface:criterion-step-done' project.pk row.item.pk step.pk %}"
+                          hx-post="{% url 'surface:criterion-step-done' project.pk row.item.pk step.pk %}"
+                          hx-target="#criteria-panel"
+                          hx-swap="outerHTML"
+                        >
+                          {% csrf_token %}
+                          {% if step.is_done %}
+                            <input type="hidden" name="is_done" value="False">
+                            <button class="button-link" type="submit">Mark not done</button>
+                          {% else %}
+                            <input type="hidden" name="is_done" value="True">
+                            <button class="button-link" type="submit">Mark done</button>
+                          {% endif %}
+                        </form>
+                      {% endif %}
+                    {% endif %}
+                  </li>
+                {% endfor %}
+              </ol>
+            {% endif %}
+
+            {% if row.item.state == "draft" %}
+              <form
+                class="step-form"
+                method="post"
+                action="{% url 'surface:criterion-step-create' project.pk row.item.pk %}"
+                hx-post="{% url 'surface:criterion-step-create' project.pk row.item.pk %}"
+                hx-target="#criteria-panel"
+                hx-swap="outerHTML"
+              >
+                {% csrf_token %}
+                {{ row.step_form.as_div }}
+                <button class="secondary" type="submit">Add step</button>
+              </form>
+            {% endif %}
+          </div>
+        {% endif %}
+
         {% if project.status == "active" and row.item.state == "approved" %}
           <form method="post" action="{% url 'surface:delivery-item-update' project.pk row.item.pk %}">
             {% csrf_token %}

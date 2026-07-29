@@ -710,6 +710,61 @@ others without escalating:
   `criterion-step-<action>`, `OwnedProjectMixin` for ownership, HTMX partial
   responses via the existing `_is_htmx` and `_render_criteria` helpers.
 
+#### I2b addendum — placement decisions
+
+Added by the orchestrator before dispatch. The accepted plan deferred UI
+mechanics to "existing convention", and the Planner-adversary agreed that was
+reasonable for reordering specifically. These are the remaining placement calls,
+decided here rather than left for the builder to invent, because under-deciding
+is what got two earlier plans in this project rejected. Nothing here changes a
+reviewed decision; the fingerprint and the lock model stand exactly as accepted.
+
+- **Steps render inside the existing criteria panel**, nested in each
+  `article.criterion` between the text line and the delivery form. Every step
+  control uses `hx-target="#criteria-panel"` with `hx-swap="outerHTML"`, which is
+  what all nine existing controls already do. No new HTMX pattern.
+- **Affordances by parent state.** A `draft` item shows its steps with per-step
+  edit and delete plus an add-step form. Any non-draft item shows its steps as
+  read-only text. An `approved` item on an `active` project additionally shows a
+  done control per step. A draft item never shows a done control, because
+  `set_acceptance_step_done` would refuse it.
+- **The done control posts an explicit boolean, never a bare toggle.** M7b's
+  visibility control was rejected in review for inverting current state, which is
+  non-idempotent and lets a double submit or a stale page silently flip the value
+  back. Steps repeat that mistake at their peril: the form carries the intended
+  value, and the view sets it rather than negating what it read.
+- **Client review page shows step text only, with no done state.** The client is
+  being asked to approve *scope* there, and progress is irrelevant to that
+  decision. This is not the sign page and must not grow into it.
+- **Client signing page shows every step with its done state**, because that page
+  is the legal consent point and the plan requires a criterion passed with an
+  outstanding step to disclose both facts. Where a passed criterion has any undone
+  step, the notice must be **visually primary, not subordinate to the "Passed"
+  badge** — the I1b-4 implementer-adversary rejected exactly that subordination
+  for the parked badge, and the same trap is open here.
+- **Steps under a parked item still render on the signing page**, inside the
+  existing "excluded from this delivery" framing rather than beside it.
+- **A criterion with no steps renders no step block at all** on both
+  client-facing pages; a bare "no steps" line under every criterion is noise. The
+  freelancer's draft criteria always show the add-step affordance.
+- **Named surface.** Forms `AcceptanceStepForm` (text, order — mirroring
+  `AcceptanceItemForm`, including its duplicate-order `IntegrityError` to inline
+  form error handling) and a done form carrying the explicit boolean. URLs under
+  `projects/<project_pk>/criteria/<item_pk>/steps/`, named
+  `criterion-step-create`, `criterion-step-update`, `criterion-step-delete`,
+  `criterion-step-done`.
+- **Step lookup is scoped through the owned project**, not by primary key alone:
+  `get_object_or_404(AcceptanceStep, pk=step_pk, item__pk=item_pk,
+  item__project=self.project)`. A step belonging to someone else's project must
+  be a 404, not an authorization check that happens later.
+- **View gates mirror the service guards exactly, and both bounds get a matrix
+  test.** Create, update and delete require parent `draft`; done requires parent
+  `approved` and project `active`. Follow
+  `test_controls_and_endpoints_agree_across_all_project_statuses`: assert the
+  rendered controls and the endpoints agree across every project status and item
+  state, so a control that appears without a working endpoint — or an endpoint
+  reachable with no control — fails.
+
 #### Role sequence and test strategy
 
 Planner → Implementer → Verifier for each milestone, with **the
@@ -1436,6 +1491,108 @@ hand-written child cleanup. It needs custom migration SQL and a SQLite table
 rebuild, so it was out of scope here. This is the shape to reach for if
 `_raw_delete` ever becomes a maintenance problem, rather than inventing something
 new under pressure.
+
+#### I2b execution log
+
+- Four step routes (`create`, `update`, `delete`, `done`), `AcceptanceStepForm`
+  and an explicit-boolean done form, step display on the freelancer panel and
+  both client-facing pages, and the fingerprint folded to include step content.
+  Suite 288 → 310.
+- The orchestrator's **I2b addendum was written before dispatch** specifically to
+  avoid a third round of "the plan left it to the implementer". It held: no
+  escalation was raised and no placement decision had to be invented mid-build.
+- **My claim about the fingerprint's format-independence was wrong.** The plan
+  asserted existing tests read the fingerprint out of the rendered form rather
+  than reconstructing it. The builder checked instead of trusting and found
+  `test_null_submitted_at_is_stable_on_review_and_approval` searched the raw value
+  for the `__missing_submitted_at__` sentinel. Moving to a digest therefore cost
+  real coverage.
+- **Implementer-adversary REJECT** on exactly that: it mutated the sentinel to a
+  different literal and then removed the sentinel design entirely, and the
+  replacement test passed both times. A digest is 64 characters whatever the
+  null-handling does. Fixed with a self-checking unit test that reconstructs the
+  expected JSON using the literal sentinel and hashes it. It also measured an N+1
+  on the approve path — the GET review path prefetched steps while
+  `ClientApproveView`'s `select_for_update()` queryset did not — and found the
+  create endpoint's cross-project scoping untested.
+- **Verifier-adversary REJECT**, the third milestone running that keeping this
+  seat separate has paid for itself. It confirmed both state matrices are
+  genuinely load-bearing by moving every POST gate in both directions one state at
+  a time, then found five holes:
+  - **The fingerprint unit test pinned shape but not content.** The fixture used
+    `is_done=False, order=1`, so hardcoding those literals in place of the live
+    values passed. Omitting the fields failed, which is what made it look
+    covered.
+  - **`sorted()` was unpinned** — swapping it for `list()` stayed green, because
+    every fixture was single-item or already in primary-key order.
+  - **The signing page's outstanding-work notice had presence-only coverage.**
+    `{% if True %}` passed: an unconditional notice would have shipped.
+  - **The review page's "no progress" rule was pinned by vocabulary**, so a leak
+    worded `Completed` / `Incomplete` passed.
+  - **The Edit-step GET endpoint was entirely unpinned** and could return `Http404`
+    unconditionally with every step test still green — meaning the control that
+    `hx-get`s the inline form could have been dead. That is the I1b-4 defect shape
+    exactly, caught this time before shipping rather than by a human clicking.
+- All five fixed, plus two minors: the "Mark not done" label is now pinned in both
+  directions, and a mobile `flex-direction` rule left dead by the `.criterion`
+  flex→grid change was removed as builder-created mess.
+- **Hand-driven walkthrough completed** across four seeded projects covering
+  draft, criteria-pending, active and delivered. Step add/edit/delete exercised
+  in place, done ticking exercised in **both** directions, duplicate step position
+  produced a readable inline error rather than a server error, and a criterion
+  created with no steps rendered consistently with its neighbours at both desktop
+  and 390px widths. The signing-page trap — a criterion marked Passed with two of
+  four steps outstanding — showed a bordered notice above and visually dominant
+  over "Passed", while the all-done criterion beside it showed none.
+- The first walkthrough report skipped the review-page and layout checks and was
+  written in cheerleading prose; it was sent back for the missing observations,
+  which then included computed colour, font weight, opacity and data attributes.
+  **The orchestrator additionally verified the no-leak claim directly** by
+  rendering the review page and inspecting its HTML: zero progress vocabulary, and
+  every step an identical `<li class="pre-line">` despite two of them genuinely
+  being done in the database.
+
+- **Compliance Gate PASS**, verifying the consent seam the strongest way yet: it
+  recomputed the fingerprint from the database in a separate process, without
+  calling `_submitted_batch_fingerprint`, and got a value byte-identical to the
+  hidden field on the live review page. It then mutated the preimage seven ways
+  and confirmed every component is load-bearing. It independently confirmed the
+  review page leaks nothing despite two of the four seeded steps genuinely being
+  done, and fetched the signing-page trap from the running server rather than
+  judging the template.
+- The gate noted the property that makes inducement impossible and that nobody had
+  stated outright: `_client_review_context` passes **the same materialised list
+  object** to the fingerprint and to the template, so the steps that are hashed
+  and the steps that are displayed are the same Python objects within one request,
+  with no window between them.
+- Dead context key `acceptance_items` in `ClientSignView._render` removed —
+  builder-created residue from the switch to `acceptance_rows`, so builder mess
+  under the cleanup doctrine rather than a pre-existing Refit target.
+
+##### Roadmap item — bound step text length and step count
+
+Raised by the I2a gate as "worth a thought at I2b", answered by the I2b gate as
+acceptable to ship but worth logging. Both are correct and this is the reasoning.
+
+The sharp edge is already gone: what worried I2a was unbounded content
+round-tripping through a client-held form field, and the digest change fixed that
+— the fingerprint field is 64 characters regardless of how much step text exists.
+What remains is an authenticated freelancer inflating their own record, one row
+per POST, with no unauthenticated path and no amplification, already capped per
+request by Django's 2.5 MB `DATA_UPLOAD_MAX_MEMORY_SIZE` default.
+
+Decisively: `AcceptanceItem.text` has been an unbounded `TextField` with unbounded
+count since M1, already client-visible and already in the signed payload. Steps
+are a second instance of an accepted exposure, not a new class of one, and capping
+steps while leaving criteria uncapped would be incoherent.
+
+The one argument with force is that a signed payload cannot be corrected
+afterwards, so a bound is cheaper before production data exists than after. The
+fix, when taken, is a form-layer `max_length` on `AcceptanceStepForm.text` — the
+model `TextField` imposes none — plus a per-item count check through the existing
+inline-error path. No migration, no service change. **Choosing the numbers is a
+product judgement and belongs to a human ruling, which is why this is logged
+rather than guessed.**
 
 ##### Refit candidate — `AcceptanceItemUpdateView` reads the lock, then saves
 

@@ -176,3 +176,37 @@ The sequence from here is I2 (notes) → I3 (portal) → I4 (branding), with I5
 (directory and search) parallelizable and owning `surface/urls.py` plus the
 `base.html` nav at dispatch. Milestone definitions and file boundaries are in
 `PLAN.md`.
+
+## Initiative 2 complete — per-criterion steps (goal 5)
+
+Shipped as I2a (Ledger) and I2b (Surface). Each acceptance criterion can now
+carry granular steps, and **the human ruled that the client sees them and that
+they enter the signed record** — the middle option, client-visible but unsigned,
+was put to the human and rejected, because it would have recreated in a new place
+the same defect I1b-1, I1b-3 and I1b-4 each existed to close.
+
+The rule that makes it safe is a split: step *wording* is editable only while its
+criterion is a draft, so nothing a client approved can be reworded; the *done*
+flag is writable only while the criterion is approved and the project active.
+Those windows are disjoint from signing, so everything a client reads at the
+signature is frozen when they read it. Steps are folded into the client-approval
+fingerprint, which now returns a digest rather than raw JSON.
+
+The old stub had this initiative blocked on I3 for client identity. **That was
+wrong** — the dependency only existed for attributing notes to a client author,
+and steps are freelancer-authored and client-*visible*. I3 was never a
+prerequisite.
+
+Notable: adding the child table silently broke I1c's delete guard, because Django
+stops fast-deleting a model the moment it has any cascading relation, which moved
+the guard out of the final statement. Caught mid-build, fixed with a guarded
+`_raw_delete` and a tripwire, and logged in `PLAN.md` along with the clean
+long-term escape from that private API. The separate Verifier-adversary seat
+rejected both milestones and was right both times — including finding a signing-page
+notice that would have shipped rendering unconditionally, and an edit control whose
+endpoint could have been dead. Suite is at 310.
+
+Sequence from here is unchanged: I3 (portal) → I4 (branding), with I5
+parallelizable. One human ruling is outstanding and logged in `PLAN.md`: whether
+to bound step text length and step count before there is production data, and if
+so at what numbers.
