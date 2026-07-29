@@ -1316,6 +1316,50 @@ class ClientApproveViewTests(TestCase):
         self.assertContains(response, "These criteria have already been handled.")
         self.assertNotContains(response, "criteria changed after this page was shown")
 
+    def test_client_approve_blank_fingerprint_is_stale_not_empty(self):
+        """A blank consent fingerprint is stale while submitted scope still exists."""
+        response = self.client.post(
+            reverse("surface:client-approve", kwargs={"token": self.token}),
+            {"batch_fingerprint": ""},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "criteria changed after this page was shown")
+        self.assertNotContains(response, "No criteria are currently awaiting approval.")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_active_project_batch_does_not_reapprove_initial_criteria(self):
+        """Later submitted scope is approved without replaying initial activation."""
+        approve_criteria(self.project)
+        later_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Later submitted criterion",
+            order=2,
+            state=AcceptanceItem.State.SUBMITTED,
+            submitted_at=timezone.now(),
+        )
+        fingerprint = review_fingerprint(self.client, self.token)
+
+        with patch("ledger.services.approve_criteria") as approve_project:
+            response = self.client.post(
+                reverse("surface:client-approve", kwargs={"token": self.token}),
+                {"batch_fingerprint": fingerprint},
+            )
+
+        approve_project.assert_not_called()
+        later_item.refresh_from_db()
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Thank you")
+        self.assertEqual(later_item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+
     def test_approval_losing_a_race_is_not_reported_as_thanks(self):
         """A rolled-back approval re-renders review instead of confirming."""
         fingerprint = review_fingerprint(self.client, self.token)
@@ -3120,6 +3164,23 @@ class ClientSignViewTests(TestCase):
         self.assertContains(response, "Thank you")
         self.assertContains(response, attestation.payload_hash)
 
+    def test_client_sign_records_project_client_email_exactly(self):
+        """Token signing records the project's exact client email spelling."""
+        self.project.client_email = "Client.MixedCase@Example.COM"
+        self.project.save(update_fields=("client_email",))
+
+        response = self.client.post(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+            {
+                "signature_name": "Acme Authorized Signer",
+                "confirm": "on",
+            },
+        )
+
+        attestation = self.project.attestations.get(is_current=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attestation.client_email, "Client.MixedCase@Example.COM")
+
     def test_client_sign_missing_confirm_is_rejected(self):
         """Signing without the confirmation checkbox does not create an attestation."""
         response = self.client.post(
@@ -3143,6 +3204,27 @@ class ClientSignViewTests(TestCase):
         )
         self.assertEqual(response.status_code, 410)
 
+    def test_client_sign_post_non_delivered_never_calls_signing_service(self):
+        """A valid POST cannot reach Ledger before delivery."""
+        active_project = make_draft_project()
+        advance_to_active(active_project)
+        token = make_client_token(active_project, "sign")
+
+        with patch("ledger.services.sign_attestation") as sign_record:
+            response = self.client.post(
+                reverse("surface:client-sign", kwargs={"token": token}),
+                {
+                    "signature_name": "Acme Authorized Signer",
+                    "confirm": "on",
+                },
+            )
+
+        sign_record.assert_not_called()
+        self.assertEqual(response.status_code, 410)
+        active_project.refresh_from_db()
+        self.assertEqual(active_project.status, Project.Status.ACTIVE)
+        self.assertFalse(active_project.attestations.exists())
+
     def test_client_sign_already_attested_shows_signed_page(self):
         """An already attested project shows the signed confirmation page."""
         attestation = sign_project_via_service(self.project)
@@ -3153,6 +3235,48 @@ class ClientSignViewTests(TestCase):
         self.assertContains(response, "Thank you")
         self.assertContains(response, attestation.payload_hash)
         self.assertNotContains(response, "Type your full name")
+
+    def test_client_sign_post_already_attested_reuses_signed_record(self):
+        """A repeated valid POST shows the existing record without signing again."""
+        attestation = sign_project_via_service(self.project)
+
+        with patch("ledger.services.sign_attestation") as sign_record:
+            response = self.client.post(
+                reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+                {
+                    "signature_name": "Different Signer",
+                    "confirm": "on",
+                },
+            )
+
+        sign_record.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, attestation.payload_hash)
+        self.assertEqual(self.project.attestations.count(), 1)
+
+    def test_client_sign_invalid_transition_returns_token_error(self):
+        """A delivery race returns the generic unavailable response without a record."""
+        with patch(
+            "ledger.services.sign_attestation",
+            side_effect=InvalidTransition("status changed"),
+        ):
+            response = self.client.post(
+                reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+                {
+                    "signature_name": "Acme Authorized Signer",
+                    "confirm": "on",
+                },
+            )
+
+        self.assertEqual(response.status_code, 410)
+        self.assertContains(
+            response,
+            "This review link is no longer available",
+            status_code=410,
+        )
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertFalse(self.project.attestations.exists())
 
     def test_client_sign_empty_signature_is_rejected(self):
         """Blank signature names re-render the form with validation errors."""

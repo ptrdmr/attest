@@ -1128,8 +1128,120 @@ the change, not after.
   require that the session's verified email equals `project.client_email`. Note
   this makes the portal path *stronger* than the token path; equalizing them is
   out of scope and is logged, not fixed here.
-- Boundaries: `surface/views.py`, `surface/urls.py`, `surface/tests.py`,
-  `templates/surface/portal/**`.
+- Boundaries: **superseded by the addendum below.**
+
+#### I3c addendum — the boundary the isolation architecture forces (2026-07-29)
+
+The boundary above was written before I3a and I3b established where portal code
+lives, and it now contradicts that architecture. `surface/views.py` imports
+`ensure_profile` and `get_or_create_freelancer` at module scope (lines 34-35), so
+adding `PortalApproveView` and `PortalSignView` there would place portal routes in
+a module that reaches account creation — undoing, for the two most consequential
+routes in the initiative, the guarantee I3a built and I3b extended, and which the
+Verifier-adversary has already defeated twice with fresh bypasses. The original
+boundary is therefore **amended, not interpreted**:
+
+- **Portal action views go in `surface/portal_views.py`**, beside the display view,
+  which currently imports only Ledger models, `client_auth` and `delivery`.
+- **The shared consent helpers go in a new neutral `surface/consent.py`** that
+  imports Ledger services and nothing else. They cannot live in `views.py`:
+  `portal_views.py` would then have to import that module and inherit the same path
+  to the identity functions. This is the same reasoning that put `_delivery_rows`
+  into `surface/delivery.py` during I3b, and the second time the isolation
+  guarantee has dictated a module rather than a preference.
+- **All three identity guards grow to cover the two new routes** — the row-count
+  matrix, the mock-based unreachability matrix, and the AST import-absence check
+  over `client_auth.py`, `portal_views.py` and `consent.py`. Both previous
+  milestones were rejected for a guard that had a hole, and both holes were in
+  newly added surface.
+- Amended boundaries: `surface/portal_views.py`, **`surface/consent.py` (new)**,
+  `surface/views.py` (thin-caller extraction only), `surface/urls.py`,
+  `surface/tests.py`, `templates/surface/portal/**`, `static/css/app.css`.
+
+**The two carried-forward items are resolved in this milestone, not deferred
+again.** I3a carried the observation that the client strip reads as subordinate to
+the freelancer nav on portal pages, and ruled it acceptable only because I3a
+contained no signing; I3b carried the ruling that the undone-steps caution stays
+with its criterion on a read-only page, and said to revisit it when the client is
+about to sign on that page. Signing now arrives, so both are due: **client identity
+becomes primary on portal pages, and the undone-steps caution takes the signing
+page's more prominent treatment** rather than the read-only page's.
+
+#### I3c characterization pass — what it proved (2026-07-29)
+
+Suite 352 → **358**. The Verifier ran first, per the charter's role sequence for a
+refactor, and **corrected the plan's own claim about the harness.** Line 1117 above
+asserts that every existing consent test drives its view through `reverse()` and
+the test client. That is not fully true: four tests call
+`surface.views._submitted_batch_fingerprint` directly, and three patch
+`surface.views.services.*`. The invariant is still achievable, but only under
+implementation choices that are now mandatory rather than incidental:
+
+- **`consent.py` must do `from ledger import services` and call
+  `services.approve_acceptance_items(...)` and friends by module attribute at call
+  time.** `patch("surface.views.services.approve_acceptance_items")` mutates the
+  attribute on the shared `ledger.services` module object, so attribute-style calls
+  from a different module remain intercepted, while `from ledger.services import
+  approve_acceptance_items` binds at import time and defeats the patch.
+- **`_submitted_batch_fingerprint` moves to `consent.py` but must stay reachable as
+  `surface.views._submitted_batch_fingerprint`.** This is not a compatibility
+  shim: `_client_review_context` in `views.py` genuinely still needs it to render
+  the hidden fingerprint field, so the import is load-bearing.
+
+Both constraints are **empirically proven, not reasoned**. A simulated extraction
+making the opposite choices — bare function imports plus an unconditional
+`approve_criteria` — was run against the suite and produced **7 failures** across
+`ClientApproveViewTests`, `ClientSignViewTests` and
+`PerItemCriteriaWorkflowTests`. The harness fails loudly on a wrong extraction
+rather than passing silently, which is the property the whole Verifier-first
+sequence exists to establish.
+
+Six characterization tests were added, each mutation-proven: blank fingerprint
+staying distinct from a handled empty batch, an active project not replaying
+`approve_criteria`, the exact `client_email` recorded by the token path, POST
+signing rejecting a non-delivered project before reaching Ledger, POST signing of
+an already-attested project reusing the existing record, and a signing
+`InvalidTransition` returning the generic 410.
+
+**Verifier-adversary: ACCEPT**, sixth pass from this seat, two minors and no
+blockers or majors — the first time it has not found something that had to change.
+It re-derived all six mutation proofs independently rather than trusting the
+builder's table, and for four of the six it also tried a *weaker* mutation of the
+right shape, on the principle that a test which only catches a sledgehammer is a
+softball. Both minors were ruled on:
+
+- **M1, a vacuous assertion, fixed.** The blank-fingerprint test asserted
+  `assertNotContains("These criteria have already been handled.")`, which cannot
+  fail in that fixture: `templates/surface/client/review.html` line 45 renders that
+  string only under `{% elif not stale_batch %}`, so the stale path never emits it.
+  The fix was **not** to delete the line — that would leave the "not empty" half of
+  the test's name unearned — but to assert absence of the empty-state marker from
+  line 30, which renders whenever pending scope is empty *regardless* of the stale
+  flag and is therefore a real witness that submitted scope survived the rejection.
+  Proven by mutation: approving the batch on the invalid-form path makes the new
+  assertion fail while the old one stays green, which is direct evidence the swap
+  converted a vacuous line into a load-bearing one.
+- **M2, a soft count under a mock, accepted unchanged.**
+  `attestations.count() == 1` stays true even if `sign_attestation` is invoked under
+  the patch, but `assert_not_called` already catches that case. Same ruling as I3a
+  made on the row-count guard: defence in depth does not require every layer to
+  catch every attack.
+
+**Process note.** The first Verifier-adversary run was interrupted mid-experiment
+and left `surface/views.py` rewired to a scratch module. The orchestrator recovered
+per the charter — assessed the tree rather than trusting a report, harvested the
+interrupted experiment's result (which is the 7-failure evidence above), reverted
+production code and deleted the scratch file. Two lessons worth keeping: **an
+interrupted adversary leaves live mutations on disk**, so the tree must be
+inspected before anything else happens; and **an interrupt can roll back the
+orchestrator's own file edits while preserving a subagent's**, which silently
+reverted this plan amendment once and required re-applying. The re-dispatched pass
+was scoped to a softball hunt with scoped test runs instead of repeated full-suite
+runs, since the extraction question was already settled.
+
+**The harness is committed before the refactor begins**, so that I3c's binding
+invariant is checkable against a committed baseline rather than being disentangled
+from the implementer's work in a single uncommitted diff.
 
 #### Role sequence and test strategy
 
@@ -2258,3 +2370,22 @@ service guard, not assumed.
   could add explicit order_by; attestations signed pre-M6b carry no
   "skills" payload key (dev data only — repair path if ever needed is a
   client-re-signed amendment, never a payload edit).
+- Refit candidate (logged by the I3c gate, 2026-07-29): two pre-existing tests
+  (`surface/tests.py` lines 461 and 5085) override the email backend to the console
+  one to exercise the DEBUG-gated dev-link branches, and echo two full magic-link
+  tokens to test stdout. Transient process output rather than a persisted log, and
+  both branches are `settings.DEBUG`-gated, so it is not a constitution violation —
+  but the assertions could stop rendering the token body. Noted, not touched.
+- 2026-07-29: I3c characterization pass (Verifier first, per the charter's role
+  sequence for a refactor of consent-critical code). Suite 352 → 358. The Verifier
+  corrected the plan's own claim that every consent test drives its view through
+  `reverse()`: four call `_submitted_batch_fingerprint` via `surface.views` and
+  three patch `surface.views.services.*`, which turns two implementation choices
+  from incidental into mandatory for the extraction. Both are empirically proven by
+  a simulated wrong extraction that produced 7 failures. Verifier-adversary ACCEPT
+  with two minors; one vacuous assertion fixed by making it load-bearing rather
+  than deleting it, one soft count accepted under the I3a defence-in-depth ruling.
+  I3c's boundary amended before dispatch: the plan sent the new portal views into
+  `surface/views.py`, which imports the identity functions at module scope and
+  would have undone I3a's guarantee for the two most consequential routes in the
+  initiative.
