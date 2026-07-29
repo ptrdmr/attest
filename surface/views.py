@@ -106,6 +106,12 @@ def _send_email(request, subject, body, recipient):
     return True
 
 
+def _with_portal_discovery(request, action_url):
+    """Keep an action URL first and append the client portal request page."""
+    portal_url = request.build_absolute_uri(reverse("surface:portal-request"))
+    return f"{action_url}\n\nView all your projects in Attest: {portal_url}"
+
+
 def _send_signing_link(request, project):
     """Email a purpose-bound signing URL without rendering its token."""
     sign_token = make_client_token(project, "sign")
@@ -115,7 +121,7 @@ def _send_signing_link(request, project):
     return _send_email(
         request,
         subject="Sign the project delivery record",
-        body=sign_url,
+        body=_with_portal_discovery(request, sign_url),
         recipient=project.client_email,
     )
 
@@ -129,7 +135,7 @@ def _send_review_link(request, project):
     return _send_email(
         request,
         subject="Review project criteria",
-        body=review_url,
+        body=_with_portal_discovery(request, review_url),
         recipient=project.client_email,
     )
 
@@ -143,7 +149,7 @@ def _send_change_order_link(request, change_order):
     return _send_email(
         request,
         subject=f"Review a change order for {change_order.project.title}",
-        body=review_url,
+        body=_with_portal_discovery(request, review_url),
         recipient=change_order.project.client_email,
     )
 

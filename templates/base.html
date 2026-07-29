@@ -12,7 +12,8 @@
   <header class="site-header">
     <a class="brand" href="{% url 'surface:home' %}">Attest</a>
     {% if request.user.is_authenticated %}
-      <nav aria-label="Application">
+      <nav aria-label="Freelancer application" data-identity="freelancer">
+        <span class="identity-label">Freelancer: {{ request.user.email }}</span>
         <a href="{% url 'surface:project-list' %}">Projects</a>
         <a href="{% url 'surface:record' %}">Record</a>
         <a href="{% url 'surface:billing' %}">Billing</a>
@@ -23,6 +24,16 @@
       </form>
     {% endif %}
   </header>
+  {% if attest_client_email %}
+    <aside class="client-strip" data-identity="client" aria-label="Client session">
+      <span><strong>Client:</strong> {{ attest_client_email }}</span>
+      <a href="{% url 'surface:portal' %}">Client portal</a>
+      <form method="post" action="{% url 'surface:portal-logout' %}">
+        {% csrf_token %}
+        <button class="button-link" type="submit">Sign out as client</button>
+      </form>
+    </aside>
+  {% endif %}
   <main class="{% block main_class %}container{% endblock %}">
     {% if messages %}
       <div class="messages" aria-live="polite">

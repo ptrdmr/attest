@@ -807,8 +807,473 @@ at the freelancer editor, the client review page and the signing page in a real
 browser before the Compliance Gate runs.
 
 ### I3 — Client portal (owning: Surface; hazard: auth; full dispatch)
-- Client identity keyed to `client_email`, own magic-link flow, persistent
-  re-visitable project view. **Blocked on M7a.**
+
+Planned 2026-07-28. M7a landed, so the block is cleared. Owning department is
+Surface throughout; Ledger is a **read-only consult** — no domain change is
+required, because listing a client's projects is a query and the actions already
+have services.
+
+**Human rulings taken before planning:**
+1. **The portal hosts the actions, not just the view.** Clients approve scope and
+   sign from inside it. The read-only option was recommended and rejected; the
+   human wants one place for everything.
+2. **One list across all freelancers.** A client email that appears on projects
+   belonging to different freelancers sees them together. This leaks nothing to
+   the freelancers — only the client sees the combined list — but it does mean a
+   shared inbox such as `info@company.com` reaches every project at that company.
+   Accepted knowingly.
+
+#### The department rule must be amended before I3a lands
+
+`dept_surface.mdc` currently states: *"Client access is tokenized: magic links /
+signed tokens with expiry — clients never get accounts in MVP; token checks
+happen in a shared mixin/decorator, not per-view copies."*
+
+The design below keeps the substance of that rule — **a client still gets no
+account: no `User` row, no `Profile`, no password, no handle** — but it does
+replace per-request token possession with a session, which the current wording
+forbids by implication. Leaving the text as-is would actively mislead the next
+agent. **Proposed amendment, requiring human approval before I3a lands:**
+
+> Client access is credentialled by email, never by account: a magic link
+> establishes a session carrying a verified client email, and clients still have
+> no `User`, `Profile`, password or handle. Project-scoped action links remain
+> tokenized. Both the session check and the token check live in shared mixins,
+> never in per-view copies.
+
+#### The hazard that shapes everything
+
+`MagicLinkRequestView` calls `get_or_create_freelancer` on **every allowed
+request, before the link is ever clicked**, and that creates a `User` **and** a
+`Profile` with a public handle for any email typed into the form. It also matches
+on email first, so an email already belonging to a freelancer resolves to that
+freelancer's account.
+
+Therefore: **the client portal must have its own request view, its own token
+namespace, and its own session keys, and must be structurally incapable of
+reaching `get_or_create_freelancer` or `ensure_profile`.** Not "must avoid
+calling" — incapable, and pinned by a test that fails if either function becomes
+reachable from a portal request. A client who signs into the portal must end the
+request with the same `User` and `Profile` count as before it.
+
+**All portal auth lives in a new module, `surface/client_auth.py`.** The first
+draft put these helpers in `surface/auth.py`, and the Planner-adversary pointed
+out that this is the very module defining `get_or_create_freelancer` and
+`ensure_profile` — so "structurally incapable" would have rested on nothing but an
+implementer's discipline not to reach for the function on the next line. The new
+module **must not import `get_or_create_freelancer`, `ensure_profile`, or
+`ledger.models.Profile` at all**, and an import-absence assertion pins that
+alongside the mock-based unreachability test. That turns the claim into something
+the suite can enforce rather than something the prose asserts.
+
+**The identity-free primitives are shared, not duplicated, via a third neutral
+module `surface/signed_links.py`.** Round 2 pointed out that narrowing the
+boundary traded a discipline problem for a duplication one: single-use cache
+consumption and the DEBUG-mode quoted-printable token repair
+(`normalize_magic_login_token`) are generic mechanics that both flows need, and
+neither has anything to do with identity. So both are extracted into a module that
+imports no identity code at all, and `surface/auth.py` and
+`surface/client_auth.py` both import from it. **`surface/auth.py` returns to
+I3a's boundary for that behaviour-preserving extraction only.** This is safe
+because the guarantee is now carried by the import-absence test on
+`client_auth.py`, not by excluding a file from a list.
+
+**The portal gets its own DEBUG one-click link, `attest_dev_portal_url`**, mirroring
+`attest_dev_login_url`. Without it the mandated hand walkthrough is harder for the
+portal than for the freelancer flow, because the console email backend mangles
+tokens with quoted-printable encoding — a real effect visible in this project's own
+test output, not a theoretical one.
+
+#### Decisions — identity and session
+
+- **A portal token encodes a normalized email, not a project**, and lives in a
+  separate namespace from the three project-scoped purposes.
+  `make_portal_token(email)` / `read_portal_token(token)` with salt
+  `surface.client.portal`. **Do not add `"portal"` to `CLIENT_TOKEN_PURPOSES`** —
+  those govern project-scoped tokens and share a payload shape. Keeping the sets
+  disjoint means a portal token can never be read as a review or sign token, and
+  that isolation gets a test in the shape of the existing
+  `ClientTokenPurposeIsolationTests`.
+- **Portal login links are single-use and short-lived: one hour**, matching the
+  freelancer magic link rather than the 14-day project tokens, because this link
+  establishes a session rather than granting one action. Consumption uses the same
+  cache-marker mechanism under its own key namespace
+  `surface.portal-login.used:{sha256(token)}`.
+- **The GET-then-POST confirm step is mandatory**, for the same reason the
+  freelancer flow has it: an email scanner prefetching the link would otherwise
+  consume it. This is not optional polish; it is the existing hardening and
+  skipping it would be a regression against a known attack.
+- **The session keys are exactly `attest_client_email` and
+  `attest_client_verified_at`**, matching the existing `attest_billing_*` and
+  `attest_dev_login_url` naming. Naming them here is deliberate: "clears only the
+  client keys" is not an auditable instruction unless the keys are enumerated, and
+  the session also carries Django's three `_auth_*` keys plus billing-stub flags
+  that must survive untouched.
+- **The server-side `attest_client_verified_at` check is the expiry authority, and
+  it is not redundant with the cookie.** `SESSION_COOKIE_AGE` is unset, so Django's
+  14-day default applies — the same figure by coincidence — but Django's
+  `expire_date` is a **sliding** window recomputed on save, so a client browsing
+  daily would never expire. The stored timestamp gives an absolute cutoff from
+  first verification. **Session life is 14 days from verification**; the one-hour
+  figure belongs to the link, not the session. This reasoning is written down
+  because a future reviewer could otherwise "harmonize away" the custom check as
+  duplicate logic.
+- **Sign-in calls `request.session.cycle_key()`** to close session fixation.
+  Confirmed against Django's source: `cycle_key()` preserves session data and does
+  not disturb `_auth_user_id`, and `login()` itself calls `cycle_key()` rather than
+  `flush()` when no user is already authenticated — so a freelancer logging in
+  beside an active client session preserves it.
+- **Client sign-out clears only the two client keys**, never flushing.
+- **Freelancer logout ends the client session too, and that is accepted rather
+  than worked around.** Django's `logout()` calls `request.session.flush()`
+  unconditionally, and one browser has one session, so there is no way to keep a
+  client session alive across a freelancer logout without weakening the freelancer
+  logout — which would be the wrong trade. The first draft asserted "freelancer
+  logout keeps flushing everything, unchanged" as though that were consequence-free
+  and listed a test only for the *opposite* direction. **Both directions are now
+  required tests**, and the client can simply request a fresh link.
+- **Rate limiting mirrors the freelancer limiter** — five requests per email per
+  hour — under its own key namespace, and, as there, a blocked request must take
+  the same visible path as an allowed one.
+- **Every comparison of a session email against `client_email` is
+  case-insensitive (`client_email__iexact`)**, at all three call sites: the
+  eligibility check when a link is requested, the project-listing query, and I3c's
+  signing-identity gate. Round 2 caught this as an unstated assumption, and it is a
+  real one: `client_email` has **no normalization anywhere** — not on the model, not
+  in `ProjectForm` — because until now it was only ever a mail-to address, and the
+  portal is the first place this codebase treats it as an identity key. A freelancer
+  who types `Client@Example.COM` would otherwise be matched by some call sites and
+  not others, depending on which the implementer wrote first. The codebase already
+  has the idiom for this in `email__iexact`. Normalizing the stored column is the
+  cleaner long-term fix and is logged as a follow-up rather than done here, since it
+  is a Ledger change and this initiative is Surface-owned.
+- **A signing-time email mismatch returns 404**, matching the established
+  convention that access failures do not disclose existence. In practice it should
+  be unreachable — the session mixin would already have refused the page, and
+  `client_email` cannot change once a project has left `draft` — so this is defence
+  in depth. It is specified anyway because "the session's email must equal
+  `client_email`" is not testable without saying what happens when it does not.
+- **Requesting a link for an email with no projects sends no email and shows the
+  same page.** Enumeration parity with the freelancer flow; a client must not be
+  able to discover whether an address is a client of anyone.
+
+#### Decisions — discovery and navigation
+
+- **The three existing action emails each gain one line pointing at the portal
+  request page — the plain URL of the form, not a token.** Without this the portal
+  ships undiscoverable: nothing would ever tell a client it exists, and the
+  self-service request page would be a URL nobody has. Pointing at the request
+  form rather than embedding a portal token also means no email carries a
+  long-lived credential, so the existing "tokens never rendered where they need not
+  be" posture is preserved. **No new freelancer-triggered invite action is built**;
+  clients already receive these emails, so a second mechanism would be surface
+  without purpose.
+- **The action link stays on the first line of the body, and any email test that
+  parses it must read that first line rather than the whole body.** In the event
+  only one test did so; the plan said three, and the builder corrected it. Round 2
+  of the plan review proved by reproduction that
+  `test_per_item_submit_emails_working_review_link` does
+  `urlparse(mail.outbox[0].body.strip()).path` over the entire body, so appending
+  any second line corrupts the parsed path and turns a green test red. **This is a
+  legitimate test edit and not a violation of the no-existing-test-may-change
+  invariant**, which binds I3c's consent refactor specifically: here the email
+  format is deliberately changing and the test was written against a
+  single-line assumption. The distinction matters, because an implementer who
+  applies the invariant too broadly will conclude the discovery decision is
+  impossible to implement.
+- **`base.html` gains a client strip, rendered when `attest_client_email` is
+  present in the session**, showing the verified email, a link to the portal, and a
+  client sign-out. It is **separate from and visually distinguishable from the
+  freelancer nav**, which stays gated on `request.user.is_authenticated` and will
+  be false for a client by the identity guarantee above. In the two-hats case
+  **both render simultaneously**, and the strip must make it obvious which identity
+  is which — an ambiguous header here is how someone signs the wrong thing. The
+  template reads the session through `request`;
+  `django.template.context_processors.request` is enabled at `config/settings.py`
+  line 62, so this is confirmed rather than assumed.
+  Colour and layout are left to the implementer, but the floor is testable: **an
+  automated test must assert the two strips render as structurally distinct
+  elements with both identity strings present**, backstopped by the mandated
+  two-hats walkthrough.
+- **The existing emailed action links keep working exactly as they do today.**
+  The portal adds a second doorway; it does not deprecate the first. Stated
+  explicitly because the token path being retired is a reasonable thing for a
+  future agent to assume, and it would break every client mid-project.
+
+#### Decisions — what the portal shows
+
+- **Draft projects never appear.** A draft is the freelancer's private workspace
+  and the client has not been told it exists. The portal lists
+  `criteria_pending` and later, only.
+- **Each project shows which freelancer it belongs to** by display name, which a
+  mixed cross-freelancer list is unreadable without. **This ships in I3a, not
+  I3b** — the adversary noted that "a bare list" in I3a would contradict this same
+  paragraph's reasoning on day one.
+- **Cross-tenant isolation depends on `client_email` being editable only while a
+  project is `draft`**, which `ProjectUpdateView.project_is_accessible` currently
+  enforces. The whole session-identity model rests on that holding, so it is stated
+  as an explicit dependency and gets a test that fails if the draft-only gate is
+  ever widened — otherwise a future edit could silently move a live project between
+  clients' portals.
+- **The portal shows progress during `active`, including step done flags.** This
+  is the void the reconnaissance found — a client currently sees nothing at all
+  between approving scope and being asked to sign — and closing it is the point of
+  the initiative.
+- **The client review page stays scope-only.** I2b deliberately withheld progress
+  there because that page asks the client to approve *scope*, and progress is
+  irrelevant to that question. The portal asks a different question and may answer
+  it. **These two rules are not in conflict and must not be "harmonized"** by a
+  future agent who notices the difference.
+- **A disputed project is shown as disputed.** Domain Law forbids presenting a
+  disputed attestation as clean, and that applies to this new surface on day one,
+  not as a follow-up.
+- **A finished project shows the signed record**: the frozen payload's checklist,
+  the hash, and the signature time. Today `signed.html` shows only hash and
+  timestamp, so the portal is where a client can finally re-read what they signed.
+
+#### Milestones
+
+**These three are strictly sequential and must never be dispatched
+concurrently.** I3b needs I3a's `ClientSessionMixin` and I3c needs both, and all
+three claim `surface/views.py`, `surface/urls.py`, `surface/tests.py` and
+`templates/surface/portal/**`. Two concurrent briefs over those files is the
+file-collision defect the charter warns about, and this project has split work
+across simultaneous briefs before.
+
+**No milestone in I3 requires a migration.** Session keys and the existing
+database cache table carry everything. Stated explicitly because the constitution
+forbids unauthorized schema changes, and "no migration needed" should be a
+decision on the record rather than something inferred from the absence of a
+sentence.
+
+- **I3a — Client session foundation.** Token functions, request/confirm/sign-out
+  views, rate limiting, session establishment, `ClientSessionMixin`, and a project
+  list **including freelancer attribution**. Boundaries: `surface/tokens.py`,
+  **`surface/client_auth.py` (new)**, `surface/views.py`, `surface/forms.py`,
+  `surface/urls.py`, `surface/tests.py`, `templates/surface/portal/**`,
+  `templates/base.html`, `static/css/app.css`, **`surface/signed_links.py` (new)**,
+  and **`surface/auth.py` for the shared-primitive extraction only**. An earlier
+  draft excluded `auth.py` outright, and the builder correctly flagged that the two
+  statements contradicted each other; the extraction decision above supersedes the
+  exclusion, and the identity guarantee now rests on the import-absence test rather
+  than on keeping a file off a list. `config/tests.py` is dropped from the boundary;
+  the first draft carried it over from M7a's list, and no settings change is needed.
+- **I3b — Portal project view (read-only).** Project detail with scope, progress,
+  change-order history, delivery state and the signed record. Boundaries:
+  `surface/views.py`, `surface/urls.py`, `surface/tests.py`,
+  `templates/surface/portal/**`, `static/css/app.css`.
+  - **I3b shares the delivery checklist as a template partial, not just as a
+    Python helper.** The first revision extracted `_delivery_rows(project)` from
+    `ClientSignView._render` and called the duplication closed. Round 2 showed that
+    was the wrong half: the Python there builds only a trivial
+    `{item, steps, has_undone_steps}` shape, while **the state-conditional badge
+    markup that actually drifted in I1b-4 — the block that told a client a
+    suspended criterion was "Not passed" — lives in
+    `templates/surface/client/sign.html` lines 19-51.** Extracting the plumbing
+    while leaving the portal free to hand-write that conditional again would
+    reproduce the original defect on a new surface.
+    So: extract both, the `_delivery_rows(project)` helper **and** a shared row
+    partial included by `sign.html` and the portal template alike, plus a **parity
+    test asserting both surfaces render the same item states identically**.
+    `templates/surface/client/sign.html` therefore **is** edited, to include the
+    partial — but its existing tests must stay green **unmodified**, which is what
+    makes the extraction provably behaviour-preserving. Boundary gains
+    `templates/surface/client/sign.html` and `templates/surface/partials/**`.
+- **I3c — Portal-hosted actions.** The hazardous one. See below.
+
+#### I3c is a refactor of the consent seam, and the charter governs it
+
+Putting approval and signing in the portal means two doorways into
+`approve_acceptance_items` + `approve_criteria` and into `sign_attestation`.
+**Duplicating that logic is forbidden.** The consent seam carries a batch
+fingerprint, an all-or-nothing savepoint, and stale-batch handling that took four
+milestones and several adversary rejections to get right; a second copy would
+drift from the first, and the drift would be silent.
+
+**The shared unit is a helper function, never a shared URL-routed view.** This is
+the single most important sentence in the milestone, and the first draft left it
+ambiguous. `templates/surface/client/review.html` bakes the token into its form
+actions via `{% url 'surface:client-approve' token=token %}`, and a
+session-resolved route has no token kwarg — so one View class serving both would
+force either a fork of that template or a signature change to
+`ClientApproveView.post`, and either one breaks the invariant below. Instead:
+
+- `_approve_submitted_batch(project, submitted_fingerprint)` holds the fingerprint
+  comparison, the savepoint and the approval calls, and returns an outcome the
+  caller maps to its own response.
+- `_sign_delivery_record(...)` holds the signing call.
+- `ClientApproveView` and `ClientSignView` keep their existing signatures,
+  templates and URLs untouched, and become thin callers.
+- New `PortalApproveView` and `PortalSignView` are separate thin callers with their
+  own templates.
+
+That is a refactor of consent-critical code, and the charter's role sequence for a
+refactor is **Verifier first, then Implementer** — characterization tests before
+the change, not after.
+
+- **The binding invariant: no existing test may change.** The 310-test suite is
+  the characterization harness. Every existing consent test drives its view
+  through `reverse()` and the test client rather than calling view methods
+  directly, so a behaviour-preserving internal extraction is invisible to them —
+  which is what makes the invariant achievable rather than aspirational. If the
+  refactor nonetheless requires editing an existing consent test, that is not a
+  test problem: it means behaviour moved, and it **stops and escalates to the
+  orchestrator** rather than being accommodated.
+- **Portal signing is bound to the verified email.** Today possession of a sign
+  token is sufficient and the attestation records `project.client_email`
+  regardless of who actually clicked. Signing from a session must additionally
+  require that the session's verified email equals `project.client_email`. Note
+  this makes the portal path *stronger* than the token path; equalizing them is
+  out of scope and is logged, not fixed here.
+- Boundaries: `surface/views.py`, `surface/urls.py`, `surface/tests.py`,
+  `templates/surface/portal/**`.
+
+#### Role sequence and test strategy
+
+Full dispatch for all three, hazard-zone builder seat throughout, and **the
+Verifier-adversary seat stays separate** — it has rejected three consecutive
+milestones and found a real defect in each.
+
+Tests must cover:
+- **The identity guarantee**, as the highest priority: a complete portal
+  request/confirm cycle leaves `User` and `Profile` counts unchanged, and
+  `get_or_create_freelancer` and `ensure_profile` are unreachable from every
+  portal route. Pin it so that wiring a portal view to freelancer auth fails.
+- Token namespace isolation in both directions: a portal token rejected by all
+  three project purposes, and each project token rejected as a portal token.
+- Single-use consumption, reuse after consumption, expiry, and that a GET does not
+  consume.
+- Enumeration parity: identical response and zero mail for an unknown email, an
+  email with only draft projects, and a rate-limited request.
+- Session expiry enforced by the server-side timestamp, not only the cookie —
+  prove by ageing the stored timestamp while leaving the cookie valid.
+- Cross-tenant isolation: a signed-in client sees exactly the projects whose
+  `client_email` matches, no drafts, and a 404 rather than a 403 for a project
+  that is not theirs, matching the existing convention that failures do not leak
+  existence.
+- Both hats at once, **in both directions**: a browser holding a freelancer session
+  and a client session behaves correctly for both; client sign-out leaves the
+  freelancer session intact; and freelancer logout ends the client session, which is
+  the accepted behaviour and must be pinned so nobody "fixes" it into a partial
+  flush later.
+- The `client_email` draft-only dependency, so that widening
+  `ProjectUpdateView.project_is_accessible` fails loudly.
+- The portal auth module's import-absence guarantee, alongside the mock-based
+  unreachability test.
+- For I3c specifically: the existing suite passing **unmodified**, plus the
+  session path exercising the same fingerprint and savepoint behaviour as the
+  token path, plus a signing attempt where the session email does not match
+  `project.client_email`.
+
+**A hand-driven walkthrough is part of the definition of done for each
+milestone**, as it was for I2b, and for I3 it must include the two-hats case in
+one browser — that is the scenario least likely to be caught by tests and most
+likely to be encountered by a real freelancer who is also somebody's client.
+
+#### Accepted risks and logged follow-ups
+
+- **A freelancer can put any email in `client_email`, so anyone can inject a
+  project into a stranger's portal listing.** This is not new — that address has
+  always received the action emails — but the portal changes the exposure from one
+  ignorable email into a persistent entry mixed among the client's real freelancer
+  relationships, and there is no client-side dismiss, hide or report. Accepted for
+  I3 and logged: a dismiss mechanism is the natural follow-up, and email
+  verification of `client_email` is the heavier alternative.
+- **A project whose status changes while a client is looking at it** needs no new
+  machinery: I3b is read-only so there is nothing to go stale, and I3c inherits the
+  existing fingerprint and `InvalidTransition` handling through the shared helper.
+  Written down because the absence of a mechanism should be a reasoned decision
+  rather than an oversight.
+- **Portal signing is bound to a verified email while token signing is not**, which
+  leaves the two paths at different strengths. Equalizing them means either binding
+  sign tokens to an email or retiring them, and both are their own milestone.
+- **`client_email` is stored unnormalized.** `client_email__iexact` handles it at
+  every portal call site, but normalizing on save is the cleaner fix and is a Ledger
+  change, so it is logged for a future milestone rather than smuggled into a
+  Surface-owned initiative.
+
+#### I3a execution log (2026-07-28)
+
+Suite 310 → **338**. Hazard-zone builder seat throughout.
+
+**Built:** `surface/client_auth.py` (portal tokens, session helpers, and the portal
+views), `surface/signed_links.py` (mechanics shared with freelancer auth),
+`surface/context_processors.py`, a portal token namespace in `surface/tokens.py`,
+`templates/surface/portal/`, and a client strip in `templates/base.html`.
+
+**Views live in `client_auth.py`, not `views.py`, and that is deliberate.** It
+diverges from this codebase's pattern of auth modules holding only helpers, and the
+Implementer-adversary flagged it and then recommended accepting it, which I did. The
+reason is decisive: `surface/views.py` already imports `get_or_create_freelancer`
+and `ensure_profile` at module scope, so portal views living there would make the
+import-absence test meaningless. Keeping them in a provably identity-free module is
+what makes the central guarantee checkable at all.
+
+**Implementer-adversary: ACCEPT** with one major and three minors, all ruled on.
+The major was that the row-count invariant covered only the request and confirm
+routes while the other two guards were weaker than they looked, so the net had a
+hole; extended to every route. Two minors became fixes: the header rendered the
+client strip from the raw session key, so an expired identity displayed as active
+(my fault — the plan told the builder to read the session directly), fixed with a
+context processor; and `verified_client_email` mutated the session as a side effect
+of a read, split into a pure check plus an explicit invalidation. Boundary was
+extended for that fix to `surface/context_processors.py` and one line of
+`config/settings.py`.
+
+**Verifier-adversary: REJECT, then ACCEPT.** Its fourth consecutive rejection in
+this project and its fourth real finding. It defeated **all three identity guards at
+once** with `__import__("surface.auth", ...)` plus a call on an email that already
+had a `User` — the route matrix omitted login POST, the AST check only saw static
+imports, and row counts cannot move for an existing identity. It also showed the
+fourteen-day cutoff could silently become a **sliding window** with nothing going
+red, which is the precise mutation the stored-timestamp design exists to prevent;
+that all three action emails could lose their portal discovery line unnoticed,
+because discovery was tested on the helper rather than through the views that send
+mail; and that the token salt could be set to `surface.client.review` while the
+isolation test stayed green, because that test proved payload shapes differ rather
+than namespaces. All six findings closed and each re-proved by re-applying the
+mutation that exposed it. On the row-count guard staying green for an
+already-existing identity, the adversary ruled it acceptable: defence in depth does
+not require every layer to catch every attack, and reachability is pinned by the
+mock and the AST ban.
+
+**Walkthrough.** The portal lists all four non-draft projects for
+`client@acme.com` across both freelancers with attribution, and does not leak the
+same client's draft project. Two process notes worth keeping:
+
+- **A zombie dev server from an earlier session held port 8009 and served
+  pre-portal code**, producing a 404 on every portal route and an alarming
+  "the feature does not exist" report. The new server had silently failed to bind.
+  Check the port's owning process, not just that a server is running.
+- **The browser walkthrough reported a critical two-hats defect that does not
+  exist.** It already held a different freelancer's session from an earlier
+  walkthrough, so its freelancer login hit Django's identity-change path. A direct
+  probe showed the truth: a client session survives a **first** freelancer login via
+  `cycle_key()`, and is flushed when a **different** freelancer signs in over an
+  existing session. The flush is correct, and it was an unspecified third direction
+  beyond the plan's two, so it is now pinned by
+  `test_switching_freelancers_flushes_existing_client_session`.
+
+**Carried into I3c:** on portal pages the freelancer nav sits in the primary header
+while the client strip sits below it, so the client identity reads as subordinate on
+a page where the client is the subject. Both are explicitly labelled, so the plan's
+"unmistakable" bar is met for I3a, which contains no signing. I3c introduces signing
+into the portal and is where subordinate framing starts to matter — make the client
+identity primary on portal pages then.
+
+#### Plan review history
+
+Two Planner-adversary rounds, both REJECT, both finding real defects — which is the
+charter's limit, so the plan came to the human rather than looping a third time.
+Round 1 found the I3c extraction shape undecided in a way that would have broken
+the plan's own invariant mid-refactor, and link discovery undecided entirely, which
+would have shipped the portal undiscoverable. Round 2 found the email-body change
+would break a green test it never mentioned, that narrowing the auth boundary had
+traded a discipline problem for a duplication one, that the checklist extraction
+fixed the half that never drifted, and that `client_email` comparison semantics
+were unstated. Every finding was accepted; there is no outstanding disagreement
+between planner and adversary, and the escalation is procedural rather than a
+deadlock.
 
 ### I4 — Client branding (owning: Surface; fast path)
 - Brand colour + logo on the portal / project brief card. Ungated per ruling 8.

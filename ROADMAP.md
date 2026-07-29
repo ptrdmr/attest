@@ -210,3 +210,48 @@ Sequence from here is unchanged: I3 (portal) → I4 (branding), with I5
 parallelizable. One human ruling is outstanding and logged in `PLAN.md`: whether
 to bound step text length and step count before there is production data, and if
 so at what numbers.
+
+## Initiative 3 underway — client portal (goal 2)
+
+**Two human rulings reshaped it before planning.** The portal **hosts the actions**
+rather than only displaying state, so clients will approve scope and sign from
+inside it — a read-only portal was recommended and rejected. And a client email
+appearing on projects belonging to different freelancers sees **one combined list**,
+with the shared-inbox consequence accepted knowingly. The first ruling is what makes
+this initiative large: it gives the consent seam a second doorway, so the plan
+forbids duplicating that logic and instead extracts it behind a shared helper under
+a no-existing-test-may-change invariant.
+
+Three sequential milestones: **I3a** the sign-in foundation, **I3b** the project
+view, **I3c** the portal-hosted actions. They must never be dispatched concurrently
+— all three claim the same four files.
+
+The plan needed **two Planner-adversary rounds, both REJECT**, which is the charter's
+limit, so it went to the human rather than looping again. Round 1 found the most
+dangerous milestone's central decision undecided — "the approval logic will be
+shared" without saying how, where the obvious reading was provably impossible — and
+found that nothing in the plan would ever tell a client the portal existed. Round 2
+proved by reproduction that the fix for that would break a green test, and found the
+checklist extraction was sharing the half that never drifted.
+
+### I3a complete — client session foundation
+
+A client signs in with a one-hour single-use magic link and gets a fourteen-day
+session, absolute rather than sliding, listing every non-draft project for their
+email across all their freelancers. **A client still gets no account**, which
+required amending this project's own department rule — the old wording said client
+access was tokenized and clients never get accounts, and the human approved the
+replacement before the build.
+
+The load-bearing constraint: the freelancer login form creates a `User` **and** a
+`Profile` with a public handle for any email typed into it, before the link is ever
+clicked. So portal auth lives in a module structurally forbidden from importing that
+code, enforced by a test rather than by discipline. The Verifier-adversary seat
+rejected this — its **fourth consecutive rejection and fourth real finding** — by
+defeating all three identity guards at once with a dynamic import, and by showing the
+absolute session cutoff could silently become a sliding window with nothing going
+red. Suite is at 338.
+
+Carried into I3c and logged in `PLAN.md`: on portal pages the client identity
+currently reads as subordinate to the freelancer nav, which matters once signing
+moves inside the portal.

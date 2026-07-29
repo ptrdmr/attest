@@ -2,7 +2,7 @@
 
 from django.urls import path
 
-from . import views
+from . import client_auth, views
 
 app_name = "surface"
 
@@ -12,6 +12,27 @@ urlpatterns = [
     path("login/sent/", views.MagicLinkSentView.as_view(), name="login-sent"),
     path("login/confirm/", views.MagicLoginView.as_view(), name="magic-login"),
     path("logout/", views.LogoutView.as_view(), name="logout"),
+    path(
+        "portal/login/",
+        client_auth.ClientPortalRequestView.as_view(),
+        name="portal-request",
+    ),
+    path(
+        "portal/login/sent/",
+        client_auth.ClientPortalSentView.as_view(),
+        name="portal-sent",
+    ),
+    path(
+        "portal/login/confirm/",
+        client_auth.ClientPortalLoginView.as_view(),
+        name="portal-login",
+    ),
+    path(
+        "portal/logout/",
+        client_auth.ClientPortalLogoutView.as_view(),
+        name="portal-logout",
+    ),
+    path("portal/", client_auth.ClientPortalView.as_view(), name="portal"),
     path("projects/", views.ProjectListView.as_view(), name="project-list"),
     path("projects/new/", views.ProjectCreateView.as_view(), name="project-create"),
     path(

@@ -13,7 +13,7 @@ alwaysApply: false
   - `**/integrations/**` — Stripe Checkout/Portal, AI draft provider, S3 evidence storage; one module per provider
 
 - **Idioms**
-  - Client access is tokenized: magic links / signed tokens with expiry — clients never get accounts in MVP; token checks happen in a shared mixin/decorator, not per-view copies
+  - Client access is credentialled by email, never by account: a magic link establishes a session carrying a verified client email, and clients still have no `User`, `Profile`, password or handle. Project-scoped action links remain tokenized. Both the session check and the token check live in shared mixins, never in per-view copies
   - AI provider is draft-only: output lands in editable form fields with an explicit human-confirm step before any client-facing state change
   - Errors to users are friendly and generic; details go to server logs (minus PII/tokens per constitution)
   - Uploads enforce MIME/size limits at the form layer with friendly errors

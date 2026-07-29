@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Your client projects · Attest{% endblock %}
+{% block content %}
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Client portal</p>
+      <h1>Your projects</h1>
+    </div>
+  </div>
+  <section class="card stack">
+    {% for project in projects %}
+      <article class="portal-project-row">
+        <div>
+          <h2>{{ project.title }}</h2>
+          <p class="muted">Freelancer: {{ project.owner.display_name }}</p>
+        </div>
+        <span class="badge">{{ project.get_status_display }}</span>
+      </article>
+    {% empty %}
+      <p>No client projects are available.</p>
+    {% endfor %}
+  </section>
+{% endblock %}

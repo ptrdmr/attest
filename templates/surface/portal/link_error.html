@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Portal link unavailable · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <p class="eyebrow">Client access</p>
+    <h1>This portal link is no longer available</h1>
+    <p>It may be invalid, expired, or already used. Request a new link to continue.</p>
+    <a class="button" href="{% url 'surface:portal-request' %}">Request a new link</a>
+  </section>
+{% endblock %}

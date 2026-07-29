@@ -1,18 +1,21 @@
 """Verifier tests for the Surface layer (M2 + M3 + M5)."""
 
+import ast
 from datetime import timedelta
 from hashlib import sha256
+import inspect
 import json
 from unittest.mock import patch
 from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.messages import get_messages
 from django.core.cache import cache
 from django.core.cache.backends.db import DatabaseCache
 from django.core import mail, signing
 from django.db import connection
-from django.test import Client, TestCase, override_settings
+from django.test import Client, RequestFactory, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -37,18 +40,25 @@ from ledger.services import (
     withdraw_acceptance_item,
 )
 from surface import billing
+from surface import client_auth
 from surface.auth import (
     MAGIC_LOGIN_MAX_AGE,
     MAGIC_LOGIN_SALT,
+    MAGIC_LOGIN_USED_NAMESPACE,
     get_or_create_freelancer,
     make_magic_login_token,
     read_and_consume_magic_login_token,
 )
 from surface.tokens import (
+    CLIENT_TOKEN_PURPOSES,
     CLIENT_TOKEN_MAX_AGE,
+    PORTAL_TOKEN_MAX_AGE,
+    PORTAL_TOKEN_SALT,
     make_change_order_token,
     make_client_token,
+    make_portal_token,
     read_client_token,
+    read_portal_token,
 )
 
 
@@ -989,6 +999,27 @@ class SubmitCriteriaViewTests(TestCase):
         self.assertEqual(len(mail.outbox), 1)
         self.assertIn("/client/review/", mail.outbox[0].body)
         self.assertContains(response, "Criteria sent for client approval")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_review_email_keeps_action_first_and_discovers_portal(self):
+        """The actual criteria-send view includes both action and portal URLs."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        client = Client()
+        login_as(client, owner)
+
+        client.post(
+            reverse("surface:criteria-submit", kwargs={"project_pk": project.pk})
+        )
+
+        body_lines = [
+            line for line in mail.outbox[0].body.splitlines() if line.strip()
+        ]
+        self.assertIn("/client/review/", body_lines[0])
+        self.assertTrue(
+            any("/portal/login/" in line for line in body_lines[1:]),
+            "Review email did not include portal discovery after its action URL.",
+        )
 
     @override_settings(**LOCMem_EMAIL)
     def test_submit_rejects_empty_criteria(self):
@@ -2073,7 +2104,7 @@ class PerItemCriteriaWorkflowTests(TestCase):
         self.assertEqual(item.state, AcceptanceItem.State.SUBMITTED)
         self.assertIsNotNone(item.submitted_at)
         self.assertEqual(len(mail.outbox), 1)
-        review_path = urlparse(mail.outbox[0].body.strip()).path
+        review_path = urlparse(mail.outbox[0].body.splitlines()[0]).path
         review_response = Client().get(review_path)
         self.assertEqual(review_response.status_code, 200)
         self.assertContains(review_response, item.text)
@@ -2711,6 +2742,29 @@ class MarkDeliveredViewTests(TestCase):
             reverse("surface:project-detail", kwargs={"project_pk": project.pk}),
         )
         self.assertContains(response, "Delivery recorded and sent for signature.")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_signing_email_keeps_action_first_and_discovers_portal(self):
+        """The actual delivery view includes both signing and portal URLs."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        project.acceptance_items.update(is_passed=True)
+        client = Client()
+        login_as(client, owner)
+
+        client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk})
+        )
+
+        body_lines = [
+            line for line in mail.outbox[0].body.splitlines() if line.strip()
+        ]
+        self.assertIn("/client/sign/", body_lines[0])
+        self.assertTrue(
+            any("/portal/login/" in line for line in body_lines[1:]),
+            "Signing email did not include portal discovery after its action URL.",
+        )
 
     @override_settings(**LOCMem_EMAIL)
     def test_mark_delivered_rejects_failed_item_with_clear_message(self):
@@ -3811,6 +3865,29 @@ class ChangeOrderCreateViewTests(TestCase):
         )
         self.assertContains(response, "Change order sent for client review.")
 
+    @override_settings(**LOCMem_EMAIL)
+    def test_change_order_email_keeps_action_first_and_discovers_portal(self):
+        """The actual proposal view includes both action and portal URLs."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        client = Client()
+        login_as(client, owner)
+
+        client.post(
+            reverse("surface:change-order-create", kwargs={"project_pk": project.pk}),
+            change_order_form_data(),
+        )
+
+        body_lines = [
+            line for line in mail.outbox[0].body.splitlines() if line.strip()
+        ]
+        self.assertIn("/client/change-order/", body_lines[0])
+        self.assertTrue(
+            any("/portal/login/" in line for line in body_lines[1:]),
+            "Change-order email did not include portal discovery after its action URL.",
+        )
+
     def test_propose_change_order_returns_404_when_not_active(self):
         """Draft projects cannot propose change orders through the Surface UI."""
         owner = make_profile()
@@ -4229,3 +4306,611 @@ class BillingPageTests(TestCase):
         )
         self.assertRedirects(blocked, reverse("surface:billing"))
         self.assertFalse(Project.objects.filter(title="No Stub Create").exists())
+
+
+class ClientPortalFoundationTests(TestCase):
+    """Account-free portal authentication, isolation, and project discovery."""
+
+    def setUp(self):
+        """Clear portal counters and create one client-visible project."""
+        cache.clear()
+        self.email = "client@example.com"
+        self.owner = make_profile(
+            handle="portal-owner",
+            email="freelancer-owner@example.com",
+        )
+        self.owner.display_name = "Portal Freelancer"
+        self.owner.save(update_fields=["display_name"])
+        self.project = make_draft_project(owner=self.owner)
+        self.project.client_email = "Client@Example.COM"
+        self.project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(self.project)
+        self.project.refresh_from_db()
+
+    def establish_portal_session(self, client, email=None):
+        """Store a current verified client identity in a test session."""
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = email or self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_complete_portal_cycle_creates_no_user_or_profile(self):
+        """Every portal route preserves the User and Profile row counts."""
+        existing_identity_email = self.owner.user.email
+        self.project.client_email = existing_identity_email
+        self.project.save(update_fields=["client_email"])
+        self.assertTrue(
+            get_user_model().objects.filter(email=existing_identity_email).exists()
+        )
+        self.assertTrue(Profile.objects.filter(user=self.owner.user).exists())
+        user_count = get_user_model().objects.count()
+        profile_count = Profile.objects.count()
+        client = Client()
+
+        def assert_identity_counts_unchanged(route_name):
+            """Assert neither account-backed identity table changed."""
+            self.assertEqual(
+                Profile.objects.count(),
+                profile_count,
+                f"Profile count changed after {route_name}",
+            )
+            self.assertEqual(
+                get_user_model().objects.count(),
+                user_count,
+                f"User count changed after {route_name}",
+            )
+
+        request_get_response = client.get(reverse("surface:portal-request"))
+        self.assertEqual(request_get_response.status_code, 200)
+        assert_identity_counts_unchanged("portal-request GET")
+
+        request_post_response = client.post(
+            reverse("surface:portal-request"),
+            {"email": existing_identity_email},
+        )
+        self.assertRedirects(
+            request_post_response,
+            reverse("surface:portal-sent"),
+            fetch_redirect_response=False,
+        )
+        assert_identity_counts_unchanged("portal-request POST")
+        self.assertEqual(len(mail.outbox), 1)
+        portal_path = urlparse(mail.outbox[0].body.splitlines()[0])
+        confirm_path = f"{portal_path.path}?{portal_path.query}"
+
+        sent_response = client.get(reverse("surface:portal-sent"))
+        self.assertEqual(sent_response.status_code, 200)
+        assert_identity_counts_unchanged("portal-sent GET")
+
+        login_get_response = client.get(confirm_path)
+        self.assertContains(login_get_response, "Confirm your client portal access")
+        assert_identity_counts_unchanged("portal-login GET")
+
+        login_post_response = client.post(
+            reverse("surface:portal-login"),
+            {"token": login_get_response.context["token"]},
+        )
+        self.assertRedirects(
+            login_post_response,
+            reverse("surface:portal"),
+            fetch_redirect_response=False,
+        )
+        assert_identity_counts_unchanged("portal-login POST")
+        self.assertEqual(
+            client.session[client_auth.CLIENT_EMAIL_SESSION_KEY],
+            existing_identity_email,
+        )
+
+        portal_response = client.get(reverse("surface:portal"))
+        self.assertEqual(portal_response.status_code, 200)
+        assert_identity_counts_unchanged("portal list GET")
+
+        logout_response = client.post(reverse("surface:portal-logout"))
+        self.assertRedirects(
+            logout_response,
+            reverse("surface:portal-request"),
+            fetch_redirect_response=False,
+        )
+        assert_identity_counts_unchanged("portal-logout POST")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_portal_routes_never_reach_freelancer_identity_functions(self):
+        """Every portal endpoint remains independent of freelancer identity creation."""
+        token = make_portal_token(self.email)
+        client = Client()
+
+        with (
+            patch("surface.auth.get_or_create_freelancer") as create_freelancer,
+            patch("surface.auth.ensure_profile") as ensure_freelancer_profile,
+        ):
+            request_get = client.get(reverse("surface:portal-request"))
+            request_post = client.post(
+                reverse("surface:portal-request"),
+                {"email": self.email},
+            )
+            sent_get = client.get(reverse("surface:portal-sent"))
+            login_get = client.get(
+                reverse("surface:portal-login"),
+                {"token": token},
+            )
+            login_post = client.post(
+                reverse("surface:portal-login"),
+                {"token": token},
+            )
+            portal_get = client.get(reverse("surface:portal"))
+            logout_post = client.post(reverse("surface:portal-logout"))
+
+        self.assertEqual(request_get.status_code, 200)
+        self.assertEqual(request_post.status_code, 302)
+        self.assertEqual(request_post.url, reverse("surface:portal-sent"))
+        self.assertEqual(sent_get.status_code, 200)
+        self.assertEqual(login_get.status_code, 200)
+        self.assertEqual(login_post.status_code, 302)
+        self.assertEqual(login_post.url, reverse("surface:portal"))
+        self.assertEqual(portal_get.status_code, 200)
+        self.assertEqual(logout_post.status_code, 302)
+        self.assertEqual(logout_post.url, reverse("surface:portal-request"))
+        create_freelancer.assert_not_called()
+        ensure_freelancer_profile.assert_not_called()
+
+    def test_client_auth_has_no_forbidden_identity_imports(self):
+        """The portal auth module cannot import freelancer identity code."""
+        module_tree = ast.parse(inspect.getsource(client_auth))
+        imported_names = {
+            alias.name
+            for node in ast.walk(module_tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        directly_imported_modules = {
+            alias.name
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        dynamic_import_calls = [
+            node
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "__import__"
+        ]
+
+        self.assertNotIn("get_or_create_freelancer", imported_names)
+        self.assertNotIn("ensure_profile", imported_names)
+        self.assertNotIn("Profile", imported_names)
+        self.assertNotIn("ledger.models", directly_imported_modules)
+        self.assertEqual(dynamic_import_calls, [])
+
+    def test_portal_and_project_token_namespaces_are_isolated_both_ways(self):
+        """No portal credential is accepted by any project-scoped purpose."""
+        portal_token = make_portal_token(self.email)
+        for purpose in ("review", "sign", "change_order"):
+            with self.subTest(purpose=purpose):
+                with self.assertRaises(signing.BadSignature):
+                    read_client_token(portal_token, purpose)
+
+        for purpose in ("review", "sign"):
+            with self.subTest(purpose=purpose):
+                with self.assertRaises(signing.BadSignature):
+                    read_portal_token(make_client_token(self.project, purpose))
+        change_order = ChangeOrder.objects.create(
+            project=self.project,
+            description="Portal isolation",
+            amount_cents=100,
+            timeline_days=1,
+        )
+        with self.assertRaises(signing.BadSignature):
+            read_portal_token(make_change_order_token(change_order))
+
+    def test_portal_token_salt_differs_from_every_project_purpose(self):
+        """The portal signer has a distinct namespace independent of payload shape."""
+        project_salts = {
+            f"surface.client.{purpose}" for purpose in CLIENT_TOKEN_PURPOSES
+        }
+        self.assertNotIn(PORTAL_TOKEN_SALT, project_salts)
+
+    def test_portal_token_rejects_invalid_nonce_shape(self):
+        """A portal-signed payload still requires a random 32-character nonce."""
+        token = signing.dumps(
+            {"email": self.email, "nonce": "too-short"},
+            salt=PORTAL_TOKEN_SALT,
+            compress=True,
+        )
+
+        with self.assertRaises(signing.BadSignature):
+            read_portal_token(token)
+
+    def test_portal_token_rejects_non_normalized_email(self):
+        """A portal-signed payload cannot carry mixed-case or padded identity."""
+        token = signing.dumps(
+            {"email": "Client@Example.COM", "nonce": "a" * 32},
+            salt=PORTAL_TOKEN_SALT,
+            compress=True,
+        )
+
+        with self.assertRaises(signing.BadSignature):
+            read_portal_token(token)
+
+    def test_portal_used_token_namespace_is_distinct_and_pinned(self):
+        """Portal consumption markers never share the freelancer namespace."""
+        self.assertEqual(
+            client_auth.PORTAL_LOGIN_USED_NAMESPACE,
+            "surface.portal-login.used",
+        )
+        self.assertNotEqual(
+            client_auth.PORTAL_LOGIN_USED_NAMESPACE,
+            MAGIC_LOGIN_USED_NAMESPACE,
+        )
+
+    def test_get_does_not_consume_and_post_consumes_portal_token_once(self):
+        """Scanner GETs are harmless and only the first confirmation POST succeeds."""
+        token = make_portal_token(self.email)
+        login_url = reverse("surface:portal-login")
+
+        get_response = Client().get(login_url, {"token": token})
+        self.assertContains(get_response, "Confirm your client portal access")
+
+        first_client = Client()
+        first_response = first_client.post(login_url, {"token": token})
+        self.assertRedirects(first_response, reverse("surface:portal"))
+
+        second_client = Client()
+        second_response = second_client.post(login_url, {"token": token})
+        self.assertContains(second_response, "no longer available")
+        self.assertNotIn(
+            client_auth.CLIENT_EMAIL_SESSION_KEY,
+            second_client.session,
+        )
+
+    def test_expired_portal_token_is_rejected(self):
+        """A portal link stops working after its one-hour lifetime."""
+        base_time = 1_700_000_000
+        with patch("django.core.signing.time.time", return_value=base_time):
+            token = make_portal_token(self.email)
+        with patch(
+            "django.core.signing.time.time",
+            return_value=base_time + PORTAL_TOKEN_MAX_AGE + 1,
+        ):
+            response = Client().get(
+                reverse("surface:portal-login"),
+                {"token": token},
+            )
+        self.assertContains(response, "no longer available")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_new_portal_link_after_consumption_is_usable(self):
+        """A consumed link does not prevent a fresh request and confirmation."""
+        first_token = make_portal_token(self.email)
+        client_auth.read_and_consume_portal_token(first_token)
+
+        request_client = Client()
+        request_client.post(
+            reverse("surface:portal-request"),
+            {"email": self.email},
+        )
+        parsed = urlparse(mail.outbox[0].body.splitlines()[0])
+        query = parsed.query
+        second_token = query.partition("token=")[2]
+        from urllib.parse import unquote
+
+        second_token = unquote(second_token)
+        self.assertNotEqual(second_token, first_token)
+        self.assertEqual(
+            client_auth.read_and_consume_portal_token(second_token),
+            self.email,
+        )
+
+    @override_settings(DEBUG=False, **LOCMem_EMAIL)
+    def test_unknown_draft_only_and_limited_requests_have_enumeration_parity(self):
+        """Every valid request has identical visible status, messages, and sent page."""
+        draft = make_draft_project(owner=self.owner)
+        draft.client_email = "draft-only@example.com"
+        draft.save(update_fields=["client_email"])
+        limited_project = make_draft_project(owner=self.owner)
+        limited_project.client_email = "limited-client@example.com"
+        limited_project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(limited_project)
+        for _request_number in range(client_auth.PORTAL_REQUEST_LIMIT):
+            client_auth.portal_link_request_allowed(limited_project.client_email)
+
+        def visible_outcome(email):
+            """Return all user-visible channels for one portal request."""
+            request_client = Client()
+            response = request_client.post(
+                reverse("surface:portal-request"),
+                {"email": email},
+            )
+            visible_messages = tuple(
+                (message.level, message.message, message.tags)
+                for message in get_messages(response.wsgi_request)
+            )
+            sent_response = request_client.get(reverse("surface:portal-sent"))
+            return (
+                response.status_code,
+                response.url,
+                visible_messages,
+                sent_response.status_code,
+                sent_response.content,
+            )
+
+        unknown_outcome = visible_outcome("unknown@example.com")
+        draft_outcome = visible_outcome(draft.client_email)
+        limited_outcome = visible_outcome(limited_project.client_email)
+        successful_outcome = visible_outcome(self.email)
+
+        self.assertEqual(unknown_outcome, successful_outcome)
+        self.assertEqual(draft_outcome, successful_outcome)
+        self.assertEqual(limited_outcome, successful_outcome)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_server_timestamp_expires_session_while_cookie_remains_valid(self):
+        """Absolute client expiry does not rely on Django's sliding cookie age."""
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp() - client_auth.CLIENT_SESSION_MAX_AGE - 1
+        )
+        session["unrelated_session_value"] = "preserved"
+        session.save()
+
+        response = client.get(reverse("surface:portal"))
+
+        self.assertRedirects(
+            response,
+            reverse("surface:portal-request"),
+            fetch_redirect_response=False,
+        )
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+        self.assertEqual(client.session["unrelated_session_value"], "preserved")
+
+    def test_successful_reads_do_not_slide_absolute_session_cutoff(self):
+        """Activity preserves verification time and cannot extend the original cutoff."""
+        client = Client()
+        current_time = timezone.now()
+        original_verified_at = (
+            current_time.timestamp() - client_auth.CLIENT_SESSION_MAX_AGE + 60
+        )
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = original_verified_at
+        session.save()
+
+        with patch("surface.client_auth.timezone.now", return_value=current_time):
+            active_response = client.get(reverse("surface:portal"))
+
+        self.assertEqual(active_response.status_code, 200)
+        self.assertEqual(
+            client.session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY],
+            original_verified_at,
+        )
+
+        after_original_cutoff = current_time + timedelta(seconds=61)
+        with patch(
+            "surface.client_auth.timezone.now",
+            return_value=after_original_cutoff,
+        ):
+            expired_response = client.get(reverse("surface:portal"))
+
+        self.assertEqual(expired_response.status_code, 302)
+        self.assertEqual(expired_response.url, reverse("surface:portal-request"))
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_expired_client_identity_is_hidden_without_context_mutation(self):
+        """The header hides an expired client while pure context lookup preserves it."""
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp() - client_auth.CLIENT_SESSION_MAX_AGE - 1
+        )
+        session.save()
+
+        response = client.get(reverse("surface:portal-request"))
+
+        self.assertNotContains(response, 'data-identity="client"')
+        self.assertNotContains(response, self.email)
+        self.assertEqual(
+            client.session[client_auth.CLIENT_EMAIL_SESSION_KEY],
+            self.email,
+        )
+        self.assertIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_portal_lists_case_insensitive_matches_without_drafts(self):
+        """A client sees all and only matching non-draft projects across owners."""
+        other_owner = make_profile(handle="second-portal-owner")
+        second_project = make_draft_project(owner=other_owner)
+        second_project.title = "Second freelancer project"
+        second_project.client_email = self.email
+        second_project.save(update_fields=["title", "client_email"])
+        submit_criteria_for_approval(second_project)
+        hidden_draft = make_draft_project(owner=other_owner)
+        hidden_draft.title = "Private draft"
+        hidden_draft.client_email = self.email
+        hidden_draft.save(update_fields=["title", "client_email"])
+        foreign_project = make_draft_project(owner=other_owner)
+        foreign_project.title = "Different client"
+        foreign_project.client_email = "other@example.com"
+        foreign_project.save(update_fields=["title", "client_email"])
+        submit_criteria_for_approval(foreign_project)
+        client = Client()
+        self.establish_portal_session(client, "CLIENT@EXAMPLE.COM")
+
+        response = client.get(reverse("surface:portal"))
+
+        self.assertContains(response, self.project.title)
+        self.assertContains(response, "Portal Freelancer")
+        self.assertContains(response, second_project.title)
+        self.assertNotContains(response, hidden_draft.title)
+        self.assertNotContains(response, foreign_project.title)
+
+    def test_client_sign_out_preserves_freelancer_and_billing_session(self):
+        """Client sign-out removes two client keys and leaves the other hat intact."""
+        client = Client()
+        login_as(client, self.owner)
+        self.establish_portal_session(client)
+
+        response = client.post(reverse("surface:portal-logout"))
+
+        self.assertRedirects(response, reverse("surface:portal-request"))
+        self.assertIn("_auth_user_id", client.session)
+        self.assertTrue(client.session[billing._PRO_SESSION_KEY])
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_freelancer_logout_flushes_client_session(self):
+        """Freelancer logout intentionally ends both identities in one browser."""
+        client = Client()
+        login_as(client, self.owner)
+        self.establish_portal_session(client)
+
+        response = client.post(reverse("surface:logout"))
+
+        self.assertRedirects(response, reverse("surface:login-request"))
+        self.assertNotIn("_auth_user_id", client.session)
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+
+    def test_switching_freelancers_flushes_existing_client_session(self):
+        """Django deliberately flushes client state when login changes user identity."""
+        client = Client()
+        self.establish_portal_session(client)
+        original_verified_at = client.session[
+            client_auth.CLIENT_VERIFIED_AT_SESSION_KEY
+        ]
+        first_token = make_magic_login_token(self.owner.user)
+
+        first_response = client.post(
+            reverse("surface:magic-login"),
+            {"token": first_token},
+        )
+
+        self.assertRedirects(
+            first_response,
+            reverse("surface:project-list"),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(int(client.session["_auth_user_id"]), self.owner.user_id)
+        self.assertEqual(
+            client.session[client_auth.CLIENT_EMAIL_SESSION_KEY],
+            self.email,
+        )
+        self.assertEqual(
+            client.session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY],
+            original_verified_at,
+        )
+
+        second_owner = make_profile(
+            handle="second-login-owner",
+            email="second-login-owner@example.com",
+        )
+        second_token = make_magic_login_token(second_owner.user)
+        second_response = client.post(
+            reverse("surface:magic-login"),
+            {"token": second_token},
+        )
+
+        self.assertRedirects(
+            second_response,
+            reverse("surface:project-list"),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(int(client.session["_auth_user_id"]), second_owner.user_id)
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_two_identity_strips_render_distinctly_with_both_emails(self):
+        """The two-hats header labels freelancer and client identity separately."""
+        client = Client()
+        login_as(client, self.owner)
+        self.establish_portal_session(client)
+
+        response = client.get(reverse("surface:portal"))
+
+        self.assertContains(response, 'data-identity="freelancer"')
+        self.assertContains(response, 'data-identity="client"')
+        self.assertContains(response, self.owner.user.email)
+        self.assertContains(response, self.email)
+
+    def test_portal_login_rotates_session_without_losing_freelancer(self):
+        """Client verification closes fixation while retaining an authenticated user."""
+        client = Client()
+        login_as(client, self.owner)
+        old_session_key = client.session.session_key
+        token = make_portal_token(self.email)
+
+        response = client.post(
+            reverse("surface:portal-login"),
+            {"token": token},
+        )
+
+        self.assertRedirects(response, reverse("surface:portal"))
+        self.assertNotEqual(client.session.session_key, old_session_key)
+        self.assertEqual(int(client.session["_auth_user_id"]), self.owner.user_id)
+
+    def test_live_project_client_email_cannot_be_edited(self):
+        """The portal identity dependency fails if live project edits are widened."""
+        client = Client()
+        login_as(client, self.owner)
+        original_email = self.project.client_email
+
+        response = client.post(
+            reverse(
+                "surface:project-update",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            project_form_data(client_email="intruder@example.com"),
+        )
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.project.client_email, original_email)
+
+    def test_action_email_body_keeps_action_first_and_adds_portal_discovery(self):
+        """All three action email types append the plain portal request URL."""
+        from surface.views import _with_portal_discovery
+
+        request = RequestFactory().get("/")
+        request.META["HTTP_HOST"] = "testserver"
+        action_url = "http://testserver/client/review/action-token/"
+
+        body = _with_portal_discovery(request, action_url)
+
+        self.assertEqual(body.splitlines()[0], action_url)
+        self.assertIn("http://testserver/portal/login/", body.splitlines()[-1])
+
+    @override_settings(
+        DEBUG=True,
+        EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend",
+    )
+    def test_console_portal_request_exposes_one_time_dev_link(self):
+        """DEBUG console delivery provides a one-click QP-safe portal URL."""
+        client = Client()
+        response = client.post(
+            reverse("surface:portal-request"),
+            {"email": self.email},
+            follow=True,
+        )
+
+        self.assertContains(response, "Continue to client portal")
+        self.assertContains(response, "/portal/login/confirm/?token=")
+        second_response = client.get(reverse("surface:portal-sent"))
+        self.assertNotContains(second_response, "Continue to client portal")
+
+    @override_settings(DEBUG=True)
+    def test_quoted_printable_portal_token_is_repaired_in_debug(self):
+        """Portal confirmation shares the console token repair primitive."""
+        token = make_portal_token(self.email)
+        mangled = "3D" + token[:20] + "=" + token[20:]
+
+        response = Client().get(
+            reverse("surface:portal-login"),
+            {"token": mangled},
+        )
+
+        self.assertContains(response, "Confirm your client portal access")

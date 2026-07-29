@@ -10,6 +10,15 @@ The Capability Record is private by default and published only when the
 freelancer explicitly opts in. Until then it 404s for everyone but its owner,
 who can preview it from `/record/`, and it carries `X-Robots-Tag: noindex`.
 
+Clients sign in to a portal at `/portal/login/` with their own magic link and see
+every non-draft project attached to their email address, across every freelancer
+they work with. **A client never gets an account** — no user row, no password, no
+profile, no public handle — only a session carrying an email verified by the link.
+Portal login links last one hour and work once; the session they establish lasts
+fourteen days from verification, and that cutoff is absolute rather than sliding.
+Draft projects stay private to the freelancer. The existing project-scoped links
+for approving scope and signing off continue to work unchanged.
+
 A published record never shows a signed attestation as a clean sweep when it
 was not one. Acceptance criteria that were parked or withdrawn before signing
 are disclosed on the record as a "Scope adjusted" badge and a count, so a
@@ -19,7 +28,8 @@ reader can tell that the delivered scope differs from the scope agreed.
 
 - Django 6 + SQLite (dev) / Postgres via `DATABASE_URL` (prod)
 - Django templates + HTMX (no JS build pipeline)
-- Email magic links (freelancers) + signed expiring tokens (clients)
+- Email magic links (freelancers and clients) + signed expiring tokens for
+  project-scoped client actions
 - SHA-256 hash of canonical attestation JSON; signed rows are append-only
 - Stripe / AI drafting / S3 evidence behind interfaces (stubbed until keys exist)
 
