@@ -1638,6 +1638,54 @@ deadlock.
 - **Shared-file ownership at dispatch:** `surface/urls.py` and the `base.html`
   nav belong to I5's boundary, not to any concurrent milestone.
 
+#### Human rulings taken 2026-07-29, before planning
+
+The human's framing: **a front-end search for visitors who browse freelancers
+without creating an account of any kind.** That is in line with what exists rather
+than a new direction — `PublicRecordView` already serves a published record to
+anonymous visitors and M7b-2's tests pin anonymous 200 on public and 404 on
+private, so account-free reading is shipped. I5 supplies the discovery layer that
+currently has no entry point.
+
+1. **Attested capability is the primary search and browse axis; self-declared text
+   is a secondary filter only.** `CapabilityTag` (`profile`, `name`,
+   `attested_count`, `last_attested_at`) is derived from signed attestations and
+   recomputed, so a visitor can ask which freelancers hold client-signed deliveries
+   in a capability — a claim no ordinary directory can make, and the product's
+   premise. `Project.skills_csv` and profile text are freelancer-declared and may
+   filter or refine, but **must never carry the headline claim in a listing**.
+   Ruled against making the two equal, precisely because equal billing would let
+   declared text read as though it were attested.
+2. **The directory and published records are search-engine indexable.** Organic
+   discovery is accepted as a growth channel. This confirms current behaviour
+   rather than changing it: M7b-2 emits `X-Robots-Tag: noindex` only while a record
+   is unpublished, so published records are already indexable and no change to that
+   view is authorized here. The directory itself must not emit `noindex`.
+
+#### Constraints its Planner must carry
+
+- **Dispute state must be correct in listings, not only on detail pages.** Domain
+  Law forbids presenting a disputed attestation as clean, and a directory is a
+  **new** surface presenting derived aggregates. A listing ranked or filtered on
+  `attested_count` could show a freelancer with a disputed project as cleanly
+  credentialed while their detail page carries the notice. This is the reason I5 is
+  full dispatch. Note the already-logged Refit candidate that the
+  `disputed_count`/"withheld" notice is not hash-tamper-aware.
+- **Richer profile fields mean a migration**, which requires explicit
+  authorization. `Profile` today carries only `user`, `handle`, `display_name`,
+  `headline`, `is_public`, `created_at` — no skills, bio, location or rate. The
+  authorized field list must be enumerated in the plan, as M7b-1's single-field
+  authorization was.
+- **Split by department at dispatch**, per the charter's one-owning-department
+  rule: Ledger for fields, derivation and query services; Surface for the directory,
+  search and nav. Precedent is M4a/M4b and M7b-1/M7b-2.
+- **No new dependencies**, so search stays ORM-level — capability-tag joins plus
+  `icontains` on SQLite, not a full-text engine. Adequate at MVP scale and it keeps
+  the constitution intact.
+- **Strict opt-in means the directory ships empty** until freelancers publish
+  (`is_public` defaults False per ruling 7). Correct, but it makes the empty state a
+  first-class design problem rather than an afterthought.
+
 ## Standing rules
 - Gate (fresh-context, Opus) runs on the final combined diff before EVERY commit
 - Orchestrator owns git; specialists never commit
