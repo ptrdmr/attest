@@ -44,6 +44,7 @@ from ledger.services import (
 )
 from surface import billing
 from surface import client_auth
+from surface import consent
 from surface import portal_views
 from surface.auth import (
     MAGIC_LOGIN_MAX_AGE,
@@ -5591,3 +5592,509 @@ class ClientPortalProjectViewTests(TestCase):
                 )
         post_response = self.client.post(self.detail_url())
         self.assertEqual(post_response.status_code, 405)
+
+
+class PortalConsentActionTests(TestCase):
+    """Portal approval and signing through the shared consent seam."""
+
+    def setUp(self):
+        """Create submitted scope and a matching verified client session."""
+        self.owner = make_profile(handle="portal-consent-owner")
+        self.project = make_draft_project(owner=self.owner)
+        self.project.client_email = "Portal-Consent@Example.COM"
+        self.project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(self.project)
+        self.project.refresh_from_db()
+        self.client = Client()
+        self.client_email = "portal-consent@example.com"
+        session = self.client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.client_email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+
+    def approve_url(self):
+        """Return the session-authenticated approval URL."""
+        return reverse(
+            "surface:portal-approve",
+            kwargs={"project_pk": self.project.pk},
+        )
+
+    def sign_url(self):
+        """Return the session-authenticated signing URL."""
+        return reverse(
+            "surface:portal-sign",
+            kwargs={"project_pk": self.project.pk},
+        )
+
+    def approval_fingerprint(self):
+        """Render portal approval and return its current hidden fingerprint."""
+        response = self.client.get(self.approve_url())
+        return response.context["approval_form"]["batch_fingerprint"].value()
+
+    def create_fixed_signed_attestation(self):
+        """Create a stable signed record for portal presentation assertions."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        return Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": []},
+            payload_hash="9" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Portal Confirmation Client",
+            signed_at=datetime(2026, 3, 14, 9, 26, tzinfo=UTC),
+            signature_meta={},
+        )
+
+    def test_portal_approval_accepts_exact_batch_and_activates_project(self):
+        """The session doorway approves the rendered batch through shared logic."""
+        response = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": self.approval_fingerprint()},
+        )
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Scope approved")
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+        self.assertFalse(
+            self.project.acceptance_items.exclude(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_portal_approval_rejects_stale_fingerprint_without_mutation(self):
+        """A stale session form re-renders current scope and commits nothing."""
+        response = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": "0" * 64},
+        )
+
+        self.project.refresh_from_db()
+        self.assertContains(response, "changed after this page was shown")
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_portal_approval_empty_batch_never_calls_ledger(self):
+        """A handled empty batch is distinct from stale scope and stays inert."""
+        approve_criteria(self.project)
+        with (
+            patch("surface.consent.services.approve_acceptance_items") as approve_items,
+            patch("surface.consent.services.approve_criteria") as approve_project,
+        ):
+            response = self.client.post(
+                self.approve_url(),
+                {"batch_fingerprint": "0" * 64},
+            )
+
+        approve_items.assert_not_called()
+        approve_project.assert_not_called()
+        self.assertContains(response, "No criteria are currently awaiting approval.")
+        self.assertContains(response, "These criteria have already been handled.")
+        self.assertNotContains(response, "changed after this page was shown")
+
+    def test_portal_approval_invalid_form_empty_batch_uses_only_stale_framing(self):
+        """An invalid replay does not call an empty batch already handled too."""
+        approve_criteria(self.project)
+
+        response = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": ""},
+        )
+
+        self.assertContains(response, "changed after this page was shown")
+        self.assertContains(response, "No criteria are currently awaiting approval.")
+        self.assertNotContains(response, "These criteria have already been handled.")
+
+    def test_portal_approval_rolls_back_items_when_activation_fails(self):
+        """The shared savepoint prevents a partially approved session batch."""
+        fingerprint = self.approval_fingerprint()
+        with patch(
+            "surface.consent.services.approve_criteria",
+            side_effect=InvalidTransition("status changed"),
+        ):
+            response = self.client.post(
+                self.approve_url(),
+                {"batch_fingerprint": fingerprint},
+            )
+
+        self.project.refresh_from_db()
+        self.assertContains(response, "changed after this page was shown")
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_portal_sign_rejects_mismatched_verified_email_with_404(self):
+        """A session for another email cannot reach the signing service."""
+        advance_to_delivered(self.project)
+        session = self.client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = "other-client@example.com"
+        session.save()
+
+        with patch("surface.consent.services.sign_attestation") as sign_record:
+            response = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Wrong Client", "confirm": "on"},
+            )
+
+        self.assertEqual(response.status_code, 404)
+        sign_record.assert_not_called()
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertFalse(self.project.attestations.exists())
+
+    def test_portal_sign_records_project_client_email_exactly(self):
+        """Portal and token signing preserve the same project email spelling."""
+        advance_to_delivered(self.project)
+        sign_token = make_client_token(self.project, "sign")
+        token_attestation = Attestation(
+            project=self.project,
+            payload_hash="a" * 64,
+            signed_at=timezone.now(),
+        )
+        with patch(
+            "surface.consent.services.sign_attestation",
+            return_value=token_attestation,
+        ) as sign_record:
+            token_response = Client().post(
+                reverse("surface:client-sign", kwargs={"token": sign_token}),
+                {"signature_name": "Token Client", "confirm": "on"},
+            )
+        token_client_email = sign_record.call_args.kwargs["client_email"]
+
+        response = self.client.post(
+            self.sign_url(),
+            {"signature_name": "Portal Client", "confirm": "on"},
+        )
+
+        self.project.refresh_from_db()
+        attestation = self.project.attestations.get(is_current=True)
+        self.assertEqual(token_response.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signature recorded")
+        self.assertEqual(self.project.status, Project.Status.ATTESTED)
+        self.assertEqual(token_client_email, self.project.client_email)
+        self.assertEqual(attestation.client_email, self.project.client_email)
+        self.assertEqual(attestation.client_email, token_client_email)
+
+    def test_portal_signed_confirmation_explains_hash_and_signature_time(self):
+        """Post-signing confirmation presents readable trust-anchor metadata."""
+        attestation = self.create_fixed_signed_attestation()
+
+        response = self.client.get(self.sign_url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, attestation.payload_hash)
+        self.assertContains(response, "Mar 14, 2026, 9:26 AM UTC")
+        self.assertContains(
+            response,
+            "This is a fingerprint of the exact record you signed; if any detail "
+            "is altered, the fingerprint changes so the record can be checked later.",
+        )
+
+    def test_signed_surfaces_share_identical_trust_anchor_partial(self):
+        """Confirmation and detail render trust metadata from one partial."""
+        self.create_fixed_signed_attestation()
+
+        signed_response = self.client.get(self.sign_url())
+        detail_response = self.client.get(
+            reverse(
+                "surface:portal-project",
+                kwargs={"project_pk": self.project.pk},
+            )
+        )
+
+        def trust_anchor_markup(response):
+            """Extract the shared signed-record metadata block."""
+            content = response.content.decode()
+            start = content.index("<dl data-signed-record-meta>")
+            end = content.index("</dl>", start) + len("</dl>")
+            return content[start:end]
+
+        include_tag = (
+            '{% include "surface/partials/signed_record_meta.html" '
+            "with attestation=attestation only %}"
+        )
+        signed_template = (
+            settings.BASE_DIR / "templates" / "surface" / "portal" / "signed.html"
+        ).read_text(encoding="utf-8")
+        detail_template = (
+            settings.BASE_DIR / "templates" / "surface" / "portal" / "detail.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            trust_anchor_markup(signed_response),
+            trust_anchor_markup(detail_response),
+        )
+        self.assertIn(include_tag, signed_template)
+        self.assertIn(include_tag, detail_template)
+
+    def test_portal_sign_lost_race_renders_recovery_without_dead_form(self):
+        """A signing transition race explains the change and links back."""
+        advance_to_delivered(self.project)
+        with patch(
+            "surface.consent.services.sign_attestation",
+            side_effect=InvalidTransition("status changed"),
+        ):
+            response = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Portal Client", "confirm": "on"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signing status changed")
+        self.assertContains(response, "changed while you were signing")
+        self.assertContains(response, "Return to project")
+        self.assertNotContains(response, "Type your full name")
+        self.assertNotContains(response, ">Sign delivery record</button>", html=False)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertFalse(self.project.attestations.exists())
+
+    def test_portal_sign_lost_race_shows_concurrently_signed_record(self):
+        """A completed signature race resolves to the successful signed record."""
+        advance_to_delivered(self.project)
+        concurrent_attestations = []
+
+        def finish_signature_first(**_kwargs):
+            """Complete the competing signature, then report the stale attempt."""
+            concurrent_attestations.append(
+                sign_attestation(
+                    self.project,
+                    self.project.client_email,
+                    "Concurrent Portal Client",
+                    {},
+                )
+            )
+            raise InvalidTransition("another signature completed")
+
+        with patch(
+            "surface.consent.services.sign_attestation",
+            side_effect=finish_signature_first,
+        ):
+            response = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Stale Portal Client", "confirm": "on"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signature recorded")
+        self.assertContains(response, concurrent_attestations[0].payload_hash)
+        self.assertNotContains(response, "Signing status changed")
+        self.assertNotContains(response, "Type your full name")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.ATTESTED)
+        self.assertEqual(self.project.attestations.count(), 1)
+
+    def test_portal_sign_uses_shared_delivery_row_with_prominent_warning(self):
+        """Portal signing keeps outstanding work attached to its criterion."""
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Portal outstanding signing step",
+            order=1,
+            is_done=False,
+        )
+        advance_to_delivered(self.project)
+
+        response = self.client.get(self.sign_url())
+        content = response.content.decode()
+        criterion_position = content.index(item.text)
+        warning_position = content.index('class="outstanding-steps-notice"')
+        result_position = content.index("<strong>Passed</strong>")
+        template = (
+            settings.BASE_DIR / "templates" / "surface" / "portal" / "sign.html"
+        ).read_text(encoding="utf-8")
+        stylesheet = (
+            settings.BASE_DIR / "static" / "css" / "app.css"
+        ).read_text(encoding="utf-8")
+        prominence_rule = stylesheet.split(
+            ".portal-signing-page .outstanding-steps-notice {",
+            1,
+        )[1].split("}", 1)[0]
+
+        self.assertContains(
+            response,
+            'class="outstanding-steps-notice" role="alert"',
+        )
+        self.assertContains(response, 'class="narrow portal-signing-page"')
+        self.assertContains(response, "Portal outstanding signing step")
+        self.assertLess(criterion_position, warning_position)
+        self.assertLess(warning_position, result_position)
+        self.assertIn(
+            '{% include "surface/partials/delivery_row.html" with row=row only %}',
+            template,
+        )
+        self.assertIn("border-width: 3px", prominence_rule)
+        self.assertIn("box-shadow:", prominence_rule)
+        self.assertIn("font-size: 1.05rem", prominence_rule)
+
+    def test_new_portal_routes_preserve_identity_row_counts(self):
+        """Every new action route remains account-free on GET and POST."""
+        login_as(self.client, self.owner)
+        user_count = get_user_model().objects.count()
+        profile_count = Profile.objects.count()
+
+        approve_get = self.client.get(self.approve_url())
+        approve_post = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": "0" * 64},
+        )
+        advance_to_delivered(self.project)
+        sign_get = self.client.get(self.sign_url())
+        sign_post = self.client.post(
+            self.sign_url(),
+            {"signature_name": "Missing confirmation"},
+        )
+
+        for response in (approve_get, approve_post, sign_get, sign_post):
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(get_user_model().objects.count(), user_count)
+        self.assertEqual(Profile.objects.count(), profile_count)
+
+    def test_new_portal_routes_never_reach_freelancer_identity_functions(self):
+        """Approval and signing cannot call account-backed identity helpers."""
+        login_as(self.client, self.owner)
+        with (
+            patch("surface.auth.get_or_create_freelancer") as create_freelancer,
+            patch("surface.auth.ensure_profile") as ensure_freelancer_profile,
+        ):
+            approve_get = self.client.get(self.approve_url())
+            approve_post = self.client.post(
+                self.approve_url(),
+                {"batch_fingerprint": "0" * 64},
+            )
+            advance_to_delivered(self.project)
+            sign_get = self.client.get(self.sign_url())
+            sign_post = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Missing confirmation"},
+            )
+
+        for response in (approve_get, approve_post, sign_get, sign_post):
+            self.assertEqual(response.status_code, 200)
+        create_freelancer.assert_not_called()
+        ensure_freelancer_profile.assert_not_called()
+
+    def test_consent_module_has_only_ledger_project_dependencies(self):
+        """The neutral consent seam cannot reach Surface identity code."""
+        module_tree = ast.parse(inspect.getsource(consent))
+        imported_names = {
+            alias.name
+            for node in ast.walk(module_tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        imported_modules = {
+            node.module
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.ImportFrom)
+        } | {
+            alias.name
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        dynamic_import_calls = [
+            node
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "__import__")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "importlib"
+                    and node.func.attr == "import_module"
+                )
+            )
+        ]
+
+        self.assertEqual(
+            {"services", "AcceptanceItem", "Project"} & imported_names,
+            {"services", "AcceptanceItem", "Project"},
+        )
+        self.assertNotIn("Profile", imported_names)
+        self.assertNotIn("create_user", imported_names)
+        self.assertNotIn("get_user_model", imported_names)
+        self.assertNotIn("get_or_create_freelancer", imported_names)
+        self.assertNotIn("ensure_profile", imported_names)
+        self.assertNotIn("django.contrib.auth", imported_modules)
+        self.assertFalse(
+            any(
+                module_name and module_name.startswith("surface")
+                for module_name in imported_modules
+            )
+        )
+        self.assertEqual(dynamic_import_calls, [])
+
+    def test_portal_action_page_keeps_two_identities_distinct_and_client_primary(self):
+        """Every consent-reachable portal response puts client identity first."""
+        login_as(self.client, self.owner)
+
+        responses = {
+            "list": self.client.get(reverse("surface:portal")),
+            "detail": self.client.get(
+                reverse(
+                    "surface:portal-project",
+                    kwargs={"project_pk": self.project.pk},
+                )
+            ),
+            "approve": self.client.get(self.approve_url()),
+        }
+        advance_to_delivered(self.project)
+        responses["sign"] = self.client.get(self.sign_url())
+        sign_project_via_service(self.project)
+        responses["signed confirmation"] = self.client.get(self.sign_url())
+        stylesheet = (
+            settings.BASE_DIR / "static" / "css" / "app.css"
+        ).read_text(encoding="utf-8")
+        client_rule = stylesheet.split(
+            "body:has([data-portal-page]) .client-strip {",
+            1,
+        )[1].split("}", 1)[0]
+        freelancer_rule = stylesheet.split(
+            "body:has([data-portal-page]) .site-header {",
+            1,
+        )[1].split("}", 1)[0]
+
+        for route_name, response in responses.items():
+            with self.subTest(route=route_name):
+                content = response.content.decode()
+                self.assertEqual(response.status_code, 200)
+                self.assertContains(response, 'data-identity="freelancer"')
+                self.assertContains(response, 'data-identity="client"')
+                self.assertContains(response, self.owner.user.email)
+                self.assertContains(response, self.client_email)
+                self.assertContains(response, "data-portal-page")
+                self.assertLess(
+                    content.index('data-identity="client"'),
+                    content.index('<header class="site-header">'),
+                )
+        self.assertIn("order: -2", client_rule)
+        self.assertIn("order: -1", freelancer_rule)
+
+    def test_non_portal_page_keeps_freelancer_identity_first(self):
+        """Ordinary application pages retain freelancer-first DOM order."""
+        login_as(self.client, self.owner)
+
+        response = self.client.get(reverse("surface:project-list"))
+        content = response.content.decode()
+
+        self.assertContains(response, 'data-identity="freelancer"')
+        self.assertContains(response, 'data-identity="client"')
+        self.assertContains(response, self.owner.user.email)
+        self.assertContains(response, self.client_email)
+        self.assertLess(
+            content.index('<header class="site-header">'),
+            content.index('data-identity="client"'),
+        )

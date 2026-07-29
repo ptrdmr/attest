@@ -1,12 +1,23 @@
-"""Read-only project displays for verified client portal sessions."""
+"""Project displays and consent actions for verified client portal sessions."""
 
-from django.shortcuts import get_object_or_404
+from django.http import Http404
+from django.shortcuts import get_object_or_404, render
+from django.views import View
 from django.views.generic import TemplateView
 
+from ledger import services
 from ledger.models import AcceptanceItem, Project
 
 from .client_auth import ClientSessionMixin
+from .consent import (
+    APPROVAL_ACCEPTED,
+    APPROVAL_STALE,
+    _approve_submitted_batch,
+    _sign_delivery_record,
+    _submitted_batch_fingerprint,
+)
 from .delivery import _delivery_rows
+from .forms import ClientApprovalForm, SignatureForm
 
 CLIENT_STATUS_LABELS = {
     Project.Status.CRITERIA_PENDING: "Awaiting your approval",
@@ -74,6 +85,7 @@ class ClientPortalView(ClientSessionMixin, TemplateView):
             {"project": project, "status_label": client_status_label(project.status)}
             for project in projects
         ]
+        context["portal_page"] = True
         return context
 
 
@@ -105,6 +117,149 @@ class ClientPortalProjectView(
                 ),
                 "attestation": attestation,
                 "signed_rows": _signed_delivery_rows(attestation),
+                "has_submitted_items": any(
+                    row["item"].state == AcceptanceItem.State.SUBMITTED
+                    for row in acceptance_rows
+                ),
+                "portal_page": True,
             }
         )
         return context
+
+
+class PortalApproveView(
+    ClientSessionMixin,
+    ClientProjectMixin,
+    View,
+):
+    """Review and approve submitted scope from a verified client session."""
+
+    template_name = "surface/portal/approve.html"
+
+    def get(self, request, project_pk):
+        """Render the current submitted batch and its consent fingerprint."""
+        return self._render(request)
+
+    def post(self, request, project_pk):
+        """Validate and approve the exact submitted batch the client reviewed."""
+        form = ClientApprovalForm(request.POST)
+        if not form.is_valid():
+            return self._render(request, stale_batch=True)
+        outcome = _approve_submitted_batch(
+            self.project,
+            form.cleaned_data["batch_fingerprint"],
+        )
+        if outcome == APPROVAL_ACCEPTED:
+            return self._render(request, approved=True)
+        return self._render(
+            request,
+            stale_batch=outcome == APPROVAL_STALE,
+        )
+
+    def _render(self, request, *, stale_batch=False, approved=False):
+        """Render current scope with exactly one approval outcome."""
+        self.project.refresh_from_db()
+        pending_items = list(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.SUBMITTED
+            ).prefetch_related("steps")
+        )
+        return render(
+            request,
+            self.template_name,
+            {
+                "project": self.project,
+                "pending_acceptance_items": pending_items,
+                "approval_form": ClientApprovalForm(
+                    initial={
+                        "batch_fingerprint": _submitted_batch_fingerprint(
+                            pending_items
+                        )
+                    }
+                ),
+                "stale_batch": stale_batch,
+                "approved": approved,
+                "portal_page": True,
+            },
+        )
+
+
+class PortalSignView(
+    ClientSessionMixin,
+    ClientProjectMixin,
+    View,
+):
+    """Show and sign a delivery record from a verified client session."""
+
+    template_name = "surface/portal/sign.html"
+    signed_template_name = "surface/portal/signed.html"
+
+    def get(self, request, project_pk):
+        """Render a delivered record or its existing signed confirmation."""
+        if self.project.status == Project.Status.ATTESTED:
+            return self._already_signed(request)
+        if self.project.status != Project.Status.DELIVERED:
+            raise Http404
+        return self._render(request, SignatureForm())
+
+    def post(self, request, project_pk):
+        """Bind the verified client identity and delegate signing to Ledger."""
+        if self.project.status == Project.Status.ATTESTED:
+            return self._already_signed(request)
+        if self.project.status != Project.Status.DELIVERED:
+            raise Http404
+        form = SignatureForm(request.POST)
+        if not form.is_valid():
+            return self._render(request, form)
+        try:
+            attestation = _sign_delivery_record(
+                project=self.project,
+                client_email=self.project.client_email,
+                client_name_typed=form.cleaned_data["signature_name"],
+                signature_meta={},
+            )
+        except services.InvalidTransition:
+            self.project.refresh_from_db()
+            if self.project.status == Project.Status.ATTESTED:
+                return self._already_signed(request)
+            return self._render(
+                request,
+                form=None,
+                signing_unavailable=True,
+            )
+        return render(
+            request,
+            self.signed_template_name,
+            {
+                "project": self.project,
+                "attestation": attestation,
+                "portal_page": True,
+            },
+        )
+
+    def _already_signed(self, request):
+        """Show the current signed record without invoking Ledger again."""
+        attestation = self.project.attestations.filter(is_current=True).first()
+        return render(
+            request,
+            self.signed_template_name,
+            {
+                "project": self.project,
+                "attestation": attestation,
+                "portal_page": True,
+            },
+        )
+
+    def _render(self, request, form, *, signing_unavailable=False):
+        """Render delivery evidence using the shared state-sensitive partial."""
+        return render(
+            request,
+            self.template_name,
+            {
+                "project": self.project,
+                "acceptance_rows": _delivery_rows(self.project),
+                "form": form,
+                "signing_unavailable": signing_unavailable,
+                "portal_page": True,
+            },
+        )

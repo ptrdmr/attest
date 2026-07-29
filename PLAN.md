@@ -1243,6 +1243,135 @@ runs, since the extraction question was already settled.
 invariant is checkable against a committed baseline rather than being disentangled
 from the implementer's work in a single uncommitted diff.
 
+#### I3c implementation round 1 — Implementer-adversary REJECT, and one boundary extension (2026-07-29)
+
+Suite 358 → 369, tests diff additions-only, all four non-negotiable constraints
+verified, extraction confirmed behaviour-preserving line by line against
+`bbc958e`, and no hole found in the identity guards for the two new routes. The
+adversary rejected on five findings, all accepted:
+
+- **Blocker: the portal recorded the wrong email spelling.** `PortalSignView`
+  passed the verified session email to the signing helper while the token path
+  passes `project.client_email`. Ruled: **both paths record
+  `project.client_email`.** `ClientProjectMixin` resolves the project with
+  `client_email__iexact`, so the two values are provably equal up to letter case
+  by the time `post()` runs — the adversary confirmed `__iexact` case-folds with
+  no whitespace normalization, so anything else would already have 404'd. The
+  session spelling therefore encodes zero extra truth while making an immutable,
+  hashed payload that feeds the public Capability Record depend on which doorway
+  the client used. The plan authorized adding a gate, not changing what is
+  recorded.
+- **Major: a client losing a signing race got a bare 404.** `InvalidTransition`
+  inside `PortalSignView.post` was converted to `Http404`, and the path had no
+  test. The 404 convention exists so access failures do not disclose existence,
+  but here existence is already disclosed — the client holds a verified session
+  and the mixin has proven the project is theirs. Ruled: the client must be told
+  what happened and given a way forward, following the portal approve path's own
+  precedent of re-rendering with a notice rather than erroring, and it must be
+  pinned by a test that actually raises `InvalidTransition` inside `post()`.
+- **Major: the carried-forward outstanding-steps prominence was missed**, for the
+  third milestone running. `.outstanding-steps-notice` was byte-identical before
+  and after, and the test named for it would pass with prominence entirely
+  absent. Ruled: fix with **page-scoped CSS only — the shared partial must not be
+  forked**, which keeps I3b's parity test intact, and the test must fail if the
+  prominence is removed.
+- **Major: "client identity primary" was visual only.** `base.html` DOM order was
+  unchanged; the client strip was hoisted purely by flex `order` under
+  `body:has([data-portal-page])`. Tab order and screen-reader reading follow DOM
+  order, so on the signing page the very users least able to catch the ambiguity
+  visually still met the freelancer identity first — and with no `:has()` support
+  the layout silently reverts to freelancer-first. Since the requirement exists
+  because "an ambiguous header here is how someone signs the wrong thing", a
+  cosmetic satisfaction of it is not satisfaction. **Boundary extended by
+  orchestrator authority to `templates/base.html` and
+  `templates/surface/partials/**`** so the client strip can genuinely lead the
+  document on portal pages, with DOM order asserted for a portal page and
+  freelancer-first order asserted to survive on non-portal pages. No concurrent
+  milestone claims either path, so this is not a file-collision risk.
+- **Major: `approve.html` reproduced a previously-litigated wording defect.** Its
+  two empty-state messages render together and unconditionally, so an
+  invalid-form resubmission against an already-approved batch shows "the criteria
+  changed after this page was shown", "no criteria are currently awaiting
+  approval" and "these criteria have already been handled" at once.
+  `templates/surface/client/review.html` already solved this with
+  `{% elif not stale_batch %}`; the portal template dropped the distinction.
+  Same family as I1b-4 and the I3b polarity gap.
+- **Minor, accepted without change:** `PortalApproveView` has no project-status
+  guard, so a GET for an `active` or `attested` project renders a dead-end shell.
+  The token doorway's equivalent views carry no status guard either and the
+  wording shown is accurate in every such state, so this matches the existing
+  idiom rather than breaking it. Logged, not fixed.
+
+#### I3c execution log (2026-07-29)
+
+Suite 358 → **375**. Hazard-zone builder seat throughout, and the tests diff stayed
+**additions-only against `bbc958e` at every round**, so the binding invariant held
+without a single existing test being edited.
+
+**Built:** `surface/consent.py` (the shared seam: fingerprint, guarded
+compare-and-swap approval with its savepoint, and the signing call),
+`PortalApproveView` and `PortalSignView` in `surface/portal_views.py` as thin
+callers beside the token path's own thin callers, `templates/surface/portal/`
+`approve.html` / `sign.html` / `signed.html`, and three extracted partials —
+`client_strip.html`, `site_header.html` and `signed_record_meta.html`.
+
+**Verifier-adversary round 2: REJECT** on the new portal tests, its sixth
+consecutive real finding. All four gaps were mutations that left **all 14 new tests
+green**, and the headline one was the sharpest yet: **removing `"portal_page": True`
+from `PortalSignView._render` alone** reverted the signing page's DOM to
+freelancer-first while every test stayed green — reintroducing, on the one page
+where a client actually signs, the exact accessibility defect the previous fix round
+had just closed. The root cause is worth remembering: **portal-page treatment has
+two independent mechanisms**, the `portal_page` context flag driving DOM order and
+the `data-portal-page` attribute driving the CSS, and a route can set one without
+the other. Closed with a single test that iterates every portal route rather than
+five near-duplicates, so a route added later is harder to omit. It also found the
+prominence CSS rule orphaned from the class that activates it, the `ATTESTED` branch
+of the signing-race handler untested, and — the subtlest — that the identity guards
+never established a freelancer session, so an `ensure_profile` call gated on
+`request.user.is_authenticated` would have passed both of them. Accepted its minor
+about CSS `order` being inert without `display: flex` unchanged, on the standing
+ruling that DOM order is the substantive guarantee and CSS is presentation.
+
+**Final acceptance found one real defect and dismissed two reports.**
+`templates/surface/portal/signed.html` showed a bare hash with **no signature time
+and no explanation** — a repeat of the defect I3b's own final acceptance had already
+ruled on for the detail page, reappearing on the one surface where it matters most,
+immediately after the client signs. Fixed by extracting `signed_record_meta.html`
+and including it from both surfaces, so the explanation has one source and the two
+cannot drift.
+
+Dismissed, with evidence rather than judgment:
+- **The walkthrough reported the two-hats scenario as a critical blocker, and it is
+  not.** This is the *second* time a browser walkthrough has reported this exact
+  false positive for the same reason — its browser already held a different
+  freelancer's session, so the login hit Django's identity-change path, which
+  correctly flushes. Verified against
+  `test_switching_freelancers_flushes_existing_client_session`, which proves a
+  **first** freelancer login preserves the client session while a **switch** flushes
+  it. Re-run with the identities established freelancer-first, the two-hats state
+  works: both identities coexist and are labelled unmistakably (`Client:` versus
+  `Freelancer:`, `Sign out as client` versus `Log out`), the client strip leads on
+  portal pages, the ordering flips back on freelancer pages, and client sign-out
+  leaves the freelancer session intact. **Lesson for the next walkthrough: reset
+  identity state first, and establish the freelancer session before the client
+  one.**
+- **A reported em-dash encoding defect does not exist.** The response is served
+  `text/html; charset=utf-8`, `base.html` declares the meta charset, the stored
+  values are clean, and a raw-byte check of the served page found a correct UTF-8
+  em-dash and no mojibake. It was an artifact of the walkthrough tool's text
+  extraction.
+
+**One positive design note worth recording.** The addendum's instruction that the
+identity guards must "grow to cover the two new routes" could have been read as
+requiring edits to the existing matrix tests — which would have violated the
+binding invariant. The builder instead added a new test class that independently
+re-proves row counts and unreachability for the new routes, and the adversary
+verified that as the correct resolution rather than a shortcut. The new module's
+AST check is also stricter than the one it was modelled on: it bans any
+`__import__` or `importlib.import_module` call outright rather than only calls
+naming specific targets, which is the I3a bypass closed at the root.
+
 #### Role sequence and test strategy
 
 Full dispatch for all three, hazard-zone builder seat throughout, and **the
@@ -2370,6 +2499,20 @@ service guard, not assumed.
   could add explicit order_by; attestations signed pre-M6b carry no
   "skills" payload key (dev data only — repair path if ever needed is a
   client-re-signed amendment, never a payload edit).
+- 2026-07-29: I3c executed, closing initiative I3. Suite 358 → 375, tests
+  additions-only throughout. Implementer-adversary REJECT (blocker: the portal
+  recorded the session email spelling into an immutable hashed payload; majors: a
+  bare 404 for a client losing a signing race, and both carried-forward UI items
+  either missed or satisfied only cosmetically). Verifier-adversary REJECT, its
+  sixth consecutive real finding, all four gaps being mutations that left every new
+  test green. Final acceptance caught a bare hash with no signature time on the
+  post-signing page, repeating a defect I3b had already ruled on. Two walkthrough
+  reports investigated and dismissed with evidence: the two-hats "blocker" (a
+  repeat false positive from a stale freelancer session) and an em-dash encoding
+  defect (a tooling artifact; the served bytes are clean UTF-8).
+- Process lesson (orchestrator): **a browser walkthrough must reset identity state
+  before testing two-hats, and establish the freelancer session before the client
+  one.** This false positive has now cost two milestones' investigation time.
 - Refit candidate (logged by the I3c gate, 2026-07-29): two pre-existing tests
   (`surface/tests.py` lines 461 and 5085) override the email backend to the console
   one to exercise the DEBUG-gated dev-link branches, and echo two full magic-link

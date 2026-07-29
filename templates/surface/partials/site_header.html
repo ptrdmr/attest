@@ -1,0 +1,15 @@
+<header class="site-header">
+  <a class="brand" href="{% url 'surface:home' %}">Attest</a>
+  {% if request.user.is_authenticated %}
+    <nav aria-label="Freelancer application" data-identity="freelancer">
+      <span class="identity-label">Freelancer: {{ request.user.email }}</span>
+      <a href="{% url 'surface:project-list' %}">Projects</a>
+      <a href="{% url 'surface:record' %}">Record</a>
+      <a href="{% url 'surface:billing' %}">Billing</a>
+    </nav>
+    <form method="post" action="{% url 'surface:logout' %}">
+      {% csrf_token %}
+      <button class="button-link" type="submit">Log out</button>
+    </form>
+  {% endif %}
+</header>

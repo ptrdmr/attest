@@ -1,0 +1,11 @@
+<dl data-signed-record-meta>
+  <dt>Signed</dt>
+  <dd>{{ attestation.signed_at|date:"M j, Y, g:i A T" }}</dd>
+  <dt>SHA-256 record hash</dt>
+  <dd>
+    <p class="muted">
+      This is a fingerprint of the exact record you signed; if any detail is altered, the fingerprint changes so the record can be checked later.
+    </p>
+    <span class="break-word record-hash">{{ attestation.payload_hash }}</span>
+  </dd>
+</dl>

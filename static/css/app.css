@@ -66,6 +66,31 @@ nav a {
   margin: 0;
 }
 
+body:has([data-portal-page]) {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+body:has([data-portal-page]) .client-strip {
+  order: -2;
+  min-height: 64px;
+  justify-content: center;
+  color: #172033;
+  background: #eaf0ff;
+  border-bottom: 2px solid #3157c8;
+}
+
+body:has([data-portal-page]) .site-header {
+  order: -1;
+  min-height: 48px;
+  background: #f8f9fc;
+}
+
+body:has([data-portal-page]) main {
+  order: 0;
+}
+
 .container {
   width: min(960px, 90vw);
   margin: 2.5rem auto;
@@ -320,6 +345,12 @@ button:disabled {
   background: #fff1d6;
   font-size: 1rem;
   font-weight: 650;
+}
+
+.portal-signing-page .outstanding-steps-notice {
+  border-width: 3px;
+  box-shadow: 0 0 0 4px rgb(182 106 0 / 14%);
+  font-size: 1.05rem;
 }
 
 .criterion-form {

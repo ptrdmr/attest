@@ -3,7 +3,7 @@
 {% block main_class %}container wide{% endblock %}
 {% block content %}
   <article id="portal-project-detail">
-    <div class="page-heading">
+    <div class="page-heading" data-portal-page>
       <div>
         <a href="{% url 'surface:portal' %}">← Your projects</a>
         <p class="eyebrow">Client project · {{ project.owner.display_name }}</p>
@@ -65,10 +65,14 @@
           <p><strong>{{ status_label }}</strong></p>
           {% if project.status == "criteria_pending" %}
             <p>The freelancer has sent the scope for your approval.</p>
+            {% if has_submitted_items %}
+              <p><a href="{% url 'surface:portal-approve' project.pk %}">Review scope</a></p>
+            {% endif %}
           {% elif project.status == "active" %}
             <p>Work is underway. Step badges show live progress.</p>
           {% elif project.status == "delivered" %}
             <p>The delivery record is ready for your signature.</p>
+            <p><a href="{% url 'surface:portal-sign' project.pk %}">Review delivery record</a></p>
           {% elif project.status == "attested" %}
             <p>The delivery record has been signed.</p>
           {% elif project.status == "disputed" %}
@@ -87,17 +91,7 @@
                 <li>The frozen record contains no acceptance criteria.</li>
               {% endfor %}
             </ol>
-            <dl>
-              <dt>Signed</dt>
-              <dd>{{ attestation.signed_at|date:"M j, Y, g:i A T" }}</dd>
-              <dt>SHA-256 record hash</dt>
-              <dd>
-                <p class="muted">
-                  This is a fingerprint of the exact record you signed; if any detail is altered, the fingerprint changes so the record can be checked later.
-                </p>
-                <span class="break-word record-hash">{{ attestation.payload_hash }}</span>
-              </dd>
-            </dl>
+            {% include "surface/partials/signed_record_meta.html" with attestation=attestation only %}
           </section>
         {% endif %}
       </div>

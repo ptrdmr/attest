@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Review project scope · Client portal · Attest{% endblock %}
+{% block content %}
+  <div class="narrow" data-portal-page>
+    <p><a href="{% url 'surface:portal-project' project.pk %}">← Project details</a></p>
+    <section class="card">
+      <p class="eyebrow">Client scope approval</p>
+      <h1>{{ project.title }}</h1>
+      <p>Review the submitted criteria and steps before approving this scope.</p>
+    </section>
+
+    {% if approved %}
+      <section class="card" role="status">
+        <h2>Scope approved</h2>
+        <p>Thank you. The approved criteria are now part of the project scope.</p>
+        <p><a href="{% url 'surface:portal-project' project.pk %}">Return to project</a></p>
+      </section>
+    {% else %}
+      <section class="card">
+        {% if stale_batch %}
+          <p class="message error" role="alert">
+            The submitted criteria changed after this page was shown. Review the current scope before approving.
+          </p>
+        {% endif %}
+        {% if pending_acceptance_items %}
+          <h2>Submitted scope</h2>
+          <ol class="delivery-record">
+            {% for item in pending_acceptance_items %}
+              <li>
+                <p class="pre-line"><strong>{{ item.text }}</strong></p>
+                {% if item.steps.all %}
+                  <div class="criterion-steps">
+                    <p class="muted">Steps</p>
+                    <ol class="step-list">
+                      {% for step in item.steps.all %}
+                        <li><span class="pre-line">{{ step.text }}</span></li>
+                      {% endfor %}
+                    </ol>
+                  </div>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ol>
+          <form method="post" action="{% url 'surface:portal-approve' project.pk %}">
+            {% csrf_token %}
+            {{ approval_form.batch_fingerprint }}
+            <button type="submit">Approve submitted scope</button>
+          </form>
+        {% else %}
+          <p>No criteria are currently awaiting approval.</p>
+          {% if not stale_batch %}
+            <p>These criteria have already been handled.</p>
+          {% endif %}
+        {% endif %}
+      </section>
+    {% endif %}
+  </div>
+{% endblock %}

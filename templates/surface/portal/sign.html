@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Sign delivery record · Client portal · Attest{% endblock %}
+{% block content %}
+  <div class="narrow portal-signing-page" data-portal-page>
+    <p><a href="{% url 'surface:portal-project' project.pk %}">← Project details</a></p>
+    <section class="card">
+      <p class="eyebrow">Client electronic signature</p>
+      <h1>{{ project.title }}</h1>
+      <p>Review the delivery record below before signing.</p>
+    </section>
+    <section class="card">
+      <h2>Project brief</h2>
+      <p class="pre-line">{{ project.brief }}</p>
+      <h2>Delivery checklist</h2>
+      <ol class="delivery-record">
+        {% for row in acceptance_rows %}
+          {% include "surface/partials/delivery_row.html" with row=row only %}
+        {% endfor %}
+      </ol>
+    </section>
+    {% if signing_unavailable %}
+      <section class="card" role="status">
+        <h2>Signing status changed</h2>
+        <p>
+          The delivery record changed while you were signing. Review the project's current status before trying again.
+        </p>
+        <p><a href="{% url 'surface:portal-project' project.pk %}">Return to project</a></p>
+      </section>
+    {% else %}
+      <section class="card">
+        <h2>Sign this record</h2>
+        <form method="post" action="{% url 'surface:portal-sign' project.pk %}">
+          {% csrf_token %}
+          {{ form.as_p }}
+          <button type="submit">Sign delivery record</button>
+        </form>
+        <p class="muted">Your verified client email, signature, and signing time become part of the permanent attestation.</p>
+      </section>
+    {% endif %}
+  </div>
+{% endblock %}

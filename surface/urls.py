@@ -38,6 +38,16 @@ urlpatterns = [
         portal_views.ClientPortalProjectView.as_view(),
         name="portal-project",
     ),
+    path(
+        "portal/projects/<int:project_pk>/approve/",
+        portal_views.PortalApproveView.as_view(),
+        name="portal-approve",
+    ),
+    path(
+        "portal/projects/<int:project_pk>/sign/",
+        portal_views.PortalSignView.as_view(),
+        name="portal-sign",
+    ),
     path("projects/", views.ProjectListView.as_view(), name="project-list"),
     path("projects/new/", views.ProjectCreateView.as_view(), name="project-create"),
     path(
