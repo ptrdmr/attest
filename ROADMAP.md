@@ -252,6 +252,32 @@ defeating all three identity guards at once with a dynamic import, and by showin
 absolute session cutoff could silently become a sliding window with nothing going
 red. Suite is at 338.
 
-Carried into I3c and logged in `PLAN.md`: on portal pages the client identity
-currently reads as subordinate to the freelancer nav, which matters once signing
-moves inside the portal.
+### I3b complete — the portal project page
+
+A client can now open a project and read the brief, the agreed scope with live
+progress on its granular steps, change-order history and delivery state, all in plain
+language instead of the internal status vocabulary. **Once signed, the page replays
+the frozen attestation payload** with its hash and signature time — closing a real
+gap, since a client who signed previously had no way to ever re-read what they signed.
+
+The delivery-checklist markup is now a shared partial used by both the signing page
+and the portal, with a parity test, because that markup is what once told a client a
+suspended criterion was "Not passed" and letting the portal re-implement it would have
+reproduced the bug on a new surface.
+
+The Verifier-adversary rejected this too — **five consecutive milestones, five real
+findings** — most notably a *new* identity bypass, where the guards banned one style of
+dynamic import but not `importlib`, and the row-count test used an email that already
+had an account, so a portal route could have minted a user for a fresh client email
+undetected. It also caught a dispute warning that could render on every project, and a
+frozen replay that pinned criterion text but not its pass/fail result.
+
+**Final acceptance caught what both adversaries missed**: a signed project rendered the
+checklist twice, live scope above the frozen record, so a client would read the
+*unsigned* one first. Ruled that once an attestation exists the page shows the signed
+record only. Suite is at 352.
+
+Carried into I3c and logged in `PLAN.md`: the client identity reads as subordinate to
+the freelancer nav, and the "steps still outstanding" caution sits with its criterion
+rather than at page level. Both are right for read-only pages and both want revisiting
+the moment signing moves inside the portal.

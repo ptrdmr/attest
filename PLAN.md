@@ -1060,8 +1060,11 @@ sentence.
   the first draft carried it over from M7a's list, and no settings change is needed.
 - **I3b — Portal project view (read-only).** Project detail with scope, progress,
   change-order history, delivery state and the signed record. Boundaries:
-  `surface/views.py`, `surface/urls.py`, `surface/tests.py`,
-  `templates/surface/portal/**`, `static/css/app.css`.
+  **`surface/portal_views.py` (new)**, `surface/client_auth.py`,
+  **`surface/delivery.py` (new)**, `surface/views.py`, `surface/urls.py`,
+  `surface/tests.py`, `templates/surface/portal/**`,
+  `templates/surface/partials/**`, `templates/surface/client/sign.html`,
+  `static/css/app.css`.
   - **I3b shares the delivery checklist as a template partial, not just as a
     Python helper.** The first revision extracted `_delivery_rows(project)` from
     `ClientSignView._render` and called the duplication closed. Round 2 showed that
@@ -1260,6 +1263,113 @@ a page where the client is the subject. Both are explicitly labelled, so the pla
 "unmistakable" bar is met for I3a, which contains no signing. I3c introduces signing
 into the portal and is where subordinate framing starts to matter — make the client
 identity primary on portal pages then.
+
+#### I3b addendum — decisions I3a's isolation forced (2026-07-28)
+
+I3a put the portal views in `surface/client_auth.py` precisely because
+`surface/views.py` imports `get_or_create_freelancer` and `ensure_profile` at module
+scope, which would have made the import-absence test meaningless. That decision has
+two consequences the original plan did not foresee, and both must be settled before
+a builder starts.
+
+- **Portal display views go in a new `surface/portal_views.py`, not in
+  `surface/views.py` and not piled into `client_auth.py`.** Putting them in
+  `views.py` would place a portal route in a module that reaches identity-creating
+  code, quietly undoing I3a's guarantee for every route added from here on. Piling
+  them into `client_auth.py` would work but turns an auth module into a grab-bag.
+  So: `client_auth.py` keeps sign-in, session and mixin; `portal_views.py` holds
+  portal display. **The import-absence test must be extended to cover both
+  modules**, and the row-count and unreachability matrices must grow to include
+  every new portal route — I3a's Implementer-adversary specifically warned that
+  I3b would add routes onto this foundation.
+- **`_delivery_rows(project)` goes in a new neutral `surface/delivery.py`**, not in
+  `views.py`. If it stayed in `views.py`, `portal_views.py` would have to import
+  that module and thereby open a path to the identity functions. `delivery.py`
+  imports Ledger models and nothing else, and both `ClientSignView` and the portal
+  import it. The current inline construction is at `surface/views.py` lines
+  1286-1309, building `{item, steps, has_undone_steps}`.
+
+#### I3b — what the client actually reads
+
+- **Status wording is client-facing, not the internal vocabulary.** The freelancer's
+  states are `criteria_pending`, `active`, `delivered`, `attested`, `disputed`, and
+  the I3a walkthrough flagged that a client reads "Criteria pending" as jargon.
+  Map them to what the client is being told: awaiting their approval, work in
+  progress, delivered and awaiting their signature, signed, and disputed. **Apply
+  the mapping to the I3a project list as well as the new detail page**, so the two
+  never disagree — a list saying one thing and a detail page another is worse than
+  either wording alone.
+- **The page shows scope, live step progress, change-order history, delivery state,
+  and, once signed, the frozen payload's checklist with its hash and signature
+  time.** The last is the point of the initiative: today a client who signs has no
+  way to re-read what they signed.
+- **A disputed project is labelled disputed**, per Domain Law, on this surface from
+  its first commit rather than as a follow-up.
+- **No actions.** Approving and signing arrive in I3c. Nothing on this page may
+  mutate anything, and there must be no control that looks actionable and is not.
+- **A project that is not this client's returns 404**, matching the convention that
+  access failures do not disclose existence — the same 404-not-403 choice the
+  freelancer-owned views make.
+
+#### I3b execution log (2026-07-28)
+
+Suite 338 → **352**. Hazard-zone builder seat retained deliberately: I3b is not auth
+code, but it edits the isolation guarantee's blast radius and the signing page.
+
+**Built:** `surface/portal_views.py` and `templates/surface/portal/detail.html`
+(read-only project page: brief, live scope with step progress, change-order history,
+delivery state, dispute notice, frozen signed-record replay);
+`surface/delivery.py` and `templates/surface/partials/delivery_row.html` (the shared
+extraction); client-facing status wording applied to both the list and the detail
+page.
+
+**Implementer-adversary: ACCEPT**, no blockers or majors. It confirmed all three
+identity guards were extended to the new module and route, that `sign.html` lost only
+the extracted markup with zero test lines touched, and — by measurement rather than
+inspection — that the page is flat at six queries regardless of row count. Its two
+minors (no legacy-payload test, no amendment test) were queued rather than fixed
+immediately and folded into the Verifier round.
+
+**Verifier-adversary: REJECT, then ACCEPT.** Fifth consecutive rejection from this
+seat, fifth real finding. The headline one was a **new** identity bypass: the AST
+check banned `__import__` but not `importlib.import_module`, the mock only watched
+two named functions so a direct `create_user` was invisible, and the row-count cycle
+used an email that already had a `User` — so a portal route could mint an account for
+a virgin client email with all three guards green. It also caught the
+**dispute-notice polarity** gap, where always rendering the notice stayed green
+across four tests, which is precisely the bug I2b shipped and had to fix; that the
+frozen replay pinned text and steps but **not `is_passed`**, so a client could be
+shown the wrong Pass/Fail on a checklist we call frozen; that read-only was only
+form-shaped, so an anchor styled as a button passed; and that list/detail status
+"agreement" was substring containment, so a longer detail label satisfied a shorter
+list expectation while the two genuinely disagreed. All closed and re-proved under
+the exposing mutations.
+
+**Final acceptance found what both adversaries missed.** The hand walkthrough showed
+a signed project rendering **the same checklist twice** — live "Scope and progress"
+above the frozen "Signed delivery record". Identical in the dev data, so it read as
+duplication, but they can diverge, and if they do the client reads the **unsigned**
+one first. Same family as I1b-4 and the disputed-record rule: the authoritative
+record must not be subordinate to or confusable with something that is not the
+record. **Ruled: when a current attestation exists, the page shows the signed record
+and not the live scope list**, `disputed` included, with the dispute notice retained.
+Unsigned statuses keep the live section. The builder correctly reported that one
+already-reviewed parity test asserted both lists on an attested page and therefore
+conflicted with the ruling, rather than quietly rewriting it.
+
+Visual review added one change: the SHA-256 hash rendered as a bare string, which is
+the product's trust anchor presented as noise, so it now carries one plain sentence
+explaining that it is a fingerprint of the record that changes if any detail is
+altered.
+
+**Carried into I3c**, alongside I3a's item about client-identity prominence: the
+caution that a criterion is marked passed while steps remain undone currently sits
+with its criterion, which is right on a read-only page. A walkthrough suggested
+promoting it to a page-level alert and I ruled against it — page level would detach
+it from the criterion it describes, so a client would know something was outstanding
+without knowing what. **When signing moves into the portal in I3c, revisit it**: the
+client will then be about to sign on this page, and the signing page's more prominent
+treatment should govern.
 
 #### Plan review history
 

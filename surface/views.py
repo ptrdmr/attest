@@ -37,6 +37,7 @@ from .auth import (
     read_and_consume_magic_login_token,
     read_unconsumed_magic_login_token,
 )
+from .delivery import _delivery_rows
 from .forms import (
     AcceptanceItemForm,
     AcceptanceStepDoneForm,
@@ -1285,25 +1286,12 @@ class ClientSignView(ClientTokenMixin, View):
 
     def _render(self, request, form):
         """Render delivery evidence without exposing the signing token."""
-        acceptance_items = list(
-            self.project.acceptance_items.prefetch_related("steps")
-        )
-        acceptance_rows = [
-            {
-                "item": item,
-                "steps": list(item.steps.all()),
-                "has_undone_steps": any(
-                    not step.is_done for step in item.steps.all()
-                ),
-            }
-            for item in acceptance_items
-        ]
         return render(
             request,
             self.template_name,
             {
                 "project": self.project,
-                "acceptance_rows": acceptance_rows,
+                "acceptance_rows": _delivery_rows(self.project),
                 "form": form,
             },
         )

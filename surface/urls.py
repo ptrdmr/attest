@@ -2,7 +2,7 @@
 
 from django.urls import path
 
-from . import client_auth, views
+from . import client_auth, portal_views, views
 
 app_name = "surface"
 
@@ -32,7 +32,12 @@ urlpatterns = [
         client_auth.ClientPortalLogoutView.as_view(),
         name="portal-logout",
     ),
-    path("portal/", client_auth.ClientPortalView.as_view(), name="portal"),
+    path("portal/", portal_views.ClientPortalView.as_view(), name="portal"),
+    path(
+        "portal/projects/<int:project_pk>/",
+        portal_views.ClientPortalProjectView.as_view(),
+        name="portal-project",
+    ),
     path("projects/", views.ProjectListView.as_view(), name="project-list"),
     path("projects/new/", views.ProjectCreateView.as_view(), name="project-create"),
     path(

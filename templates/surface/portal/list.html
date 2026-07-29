@@ -8,14 +8,14 @@
     </div>
   </div>
   <section class="card stack">
-    {% for project in projects %}
-      <article class="portal-project-row">
+    {% for row in project_rows %}
+      <a class="portal-project-row" href="{% url 'surface:portal-project' row.project.pk %}">
         <div>
-          <h2>{{ project.title }}</h2>
-          <p class="muted">Freelancer: {{ project.owner.display_name }}</p>
+          <h2>{{ row.project.title }}</h2>
+          <p class="muted">Freelancer: {{ row.project.owner.display_name }}</p>
         </div>
-        <span class="badge">{{ project.get_status_display }}</span>
-      </article>
+        <span class="badge">{{ row.status_label }}</span>
+      </a>
     {% empty %}
       <p>No client projects are available.</p>
     {% endfor %}

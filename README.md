@@ -19,6 +19,13 @@ fourteen days from verification, and that cutoff is absolute rather than sliding
 Draft projects stay private to the freelancer. The existing project-scoped links
 for approving scope and signing off continue to work unchanged.
 
+Each project opens onto a read-only page showing the brief, the agreed scope with
+live progress on its granular steps, change-order history and delivery state — in
+plain language rather than the internal status vocabulary. **Once a project is
+signed, that page replays the frozen attestation payload** with its hash and
+signature time, and stops showing live scope, so what a client re-reads is exactly
+what they signed rather than whatever the rows say today.
+
 A published record never shows a signed attestation as a clean sweep when it
 was not one. Acceptance criteria that were parked or withdrawn before signing
 are disclosed on the record as a "Scope adjusted" badge and a count, so a

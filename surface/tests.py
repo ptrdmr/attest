@@ -1,10 +1,11 @@
 """Verifier tests for the Surface layer (M2 + M3 + M5)."""
 
 import ast
-from datetime import timedelta
+from datetime import datetime, timedelta, UTC
 from hashlib import sha256
 import inspect
 import json
+import re
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -23,12 +24,14 @@ from django.utils import timezone
 from ledger.models import (
     AcceptanceItem,
     AcceptanceStep,
+    Attestation,
     ChangeOrder,
     Profile,
     Project,
 )
 from ledger.services import (
     InvalidTransition,
+    amend_attestation,
     approve_criteria,
     compute_payload_hash,
     flag_dispute,
@@ -41,6 +44,7 @@ from ledger.services import (
 )
 from surface import billing
 from surface import client_auth
+from surface import portal_views
 from surface.auth import (
     MAGIC_LOGIN_MAX_AGE,
     MAGIC_LOGIN_SALT,
@@ -4408,6 +4412,15 @@ class ClientPortalFoundationTests(TestCase):
         self.assertEqual(portal_response.status_code, 200)
         assert_identity_counts_unchanged("portal list GET")
 
+        detail_response = client.get(
+            reverse(
+                "surface:portal-project",
+                kwargs={"project_pk": self.project.pk},
+            )
+        )
+        self.assertEqual(detail_response.status_code, 200)
+        assert_identity_counts_unchanged("portal project GET")
+
         logout_response = client.post(reverse("surface:portal-logout"))
         self.assertRedirects(
             logout_response,
@@ -4415,6 +4428,40 @@ class ClientPortalFoundationTests(TestCase):
             fetch_redirect_response=False,
         )
         assert_identity_counts_unchanged("portal-logout POST")
+
+    def test_virgin_client_detail_get_creates_no_identity_rows(self):
+        """A detail route cannot mint identity rows for a brand-new client email."""
+        virgin_email = "virgin-portal-detail@example.com"
+        self.assertFalse(
+            get_user_model().objects.filter(email__iexact=virgin_email).exists()
+        )
+        virgin_project = make_draft_project(owner=self.owner)
+        virgin_project.client_email = virgin_email
+        virgin_project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(virgin_project)
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = virgin_email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+        user_count = get_user_model().objects.count()
+        profile_count = Profile.objects.count()
+
+        response = client.get(
+            reverse(
+                "surface:portal-project",
+                kwargs={"project_pk": virgin_project.pk},
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(get_user_model().objects.count(), user_count)
+        self.assertEqual(Profile.objects.count(), profile_count)
+        self.assertFalse(
+            get_user_model().objects.filter(email__iexact=virgin_email).exists()
+        )
 
     @override_settings(**LOCMem_EMAIL)
     def test_portal_routes_never_reach_freelancer_identity_functions(self):
@@ -4441,6 +4488,12 @@ class ClientPortalFoundationTests(TestCase):
                 {"token": token},
             )
             portal_get = client.get(reverse("surface:portal"))
+            detail_get = client.get(
+                reverse(
+                    "surface:portal-project",
+                    kwargs={"project_pk": self.project.pk},
+                )
+            )
             logout_post = client.post(reverse("surface:portal-logout"))
 
         self.assertEqual(request_get.status_code, 200)
@@ -4451,39 +4504,58 @@ class ClientPortalFoundationTests(TestCase):
         self.assertEqual(login_post.status_code, 302)
         self.assertEqual(login_post.url, reverse("surface:portal"))
         self.assertEqual(portal_get.status_code, 200)
+        self.assertEqual(detail_get.status_code, 200)
         self.assertEqual(logout_post.status_code, 302)
         self.assertEqual(logout_post.url, reverse("surface:portal-request"))
         create_freelancer.assert_not_called()
         ensure_freelancer_profile.assert_not_called()
 
     def test_client_auth_has_no_forbidden_identity_imports(self):
-        """The portal auth module cannot import freelancer identity code."""
-        module_tree = ast.parse(inspect.getsource(client_auth))
-        imported_names = {
-            alias.name
-            for node in ast.walk(module_tree)
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-            for alias in node.names
-        }
-        directly_imported_modules = {
-            alias.name
-            for node in ast.walk(module_tree)
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        }
-        dynamic_import_calls = [
-            node
-            for node in ast.walk(module_tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "__import__"
-        ]
+        """Portal auth and display modules cannot import freelancer identity code."""
+        for module in (client_auth, portal_views):
+            with self.subTest(module=module.__name__):
+                module_tree = ast.parse(inspect.getsource(module))
+                imported_names = {
+                    alias.name
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, (ast.Import, ast.ImportFrom))
+                    for alias in node.names
+                }
+                directly_imported_modules = {
+                    alias.name
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, ast.Import)
+                    for alias in node.names
+                }
+                dynamic_import_calls = [
+                    node
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "__import__"
+                ]
+                forbidden_dynamic_module_calls = [
+                    node
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "importlib"
+                    and node.func.attr == "import_module"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value
+                    in {"django.contrib.auth", "surface.auth"}
+                ]
 
-        self.assertNotIn("get_or_create_freelancer", imported_names)
-        self.assertNotIn("ensure_profile", imported_names)
-        self.assertNotIn("Profile", imported_names)
-        self.assertNotIn("ledger.models", directly_imported_modules)
-        self.assertEqual(dynamic_import_calls, [])
+                self.assertNotIn("get_or_create_freelancer", imported_names)
+                self.assertNotIn("ensure_profile", imported_names)
+                self.assertNotIn("Profile", imported_names)
+                self.assertNotIn("importlib", imported_names)
+                self.assertNotIn("import_module", imported_names)
+                self.assertNotIn("ledger.models", directly_imported_modules)
+                self.assertEqual(dynamic_import_calls, [])
+                self.assertEqual(forbidden_dynamic_module_calls, [])
 
     def test_portal_and_project_token_namespaces_are_isolated_both_ways(self):
         """No portal credential is accepted by any project-scoped purpose."""
@@ -4914,3 +4986,484 @@ class ClientPortalFoundationTests(TestCase):
         )
 
         self.assertContains(response, "Confirm your client portal access")
+
+
+class ClientPortalProjectViewTests(TestCase):
+    """Read-only client project detail, progress, and signed-record replay."""
+
+    def setUp(self):
+        """Create one submitted project and a verified matching client session."""
+        self.owner = make_profile(handle="portal-detail-owner")
+        self.project = make_draft_project(owner=self.owner)
+        self.project.client_email = "portal-detail@example.com"
+        self.project.brief = "Client-readable project brief"
+        self.project.save(update_fields=["client_email", "brief"])
+        submit_criteria_for_approval(self.project)
+        self.project.refresh_from_db()
+        self.client = Client()
+        session = self.client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = "PORTAL-DETAIL@example.com"
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+
+    def detail_url(self, project=None):
+        """Return the portal detail URL for one project."""
+        return reverse(
+            "surface:portal-project",
+            kwargs={"project_pk": (project or self.project).pk},
+        )
+
+    @staticmethod
+    def portal_detail_markup(response):
+        """Return only the read-only project article, excluding global navigation."""
+        content = response.content.decode()
+        start = content.index('<article id="portal-project-detail">')
+        end = content.index("</article>", start) + len("</article>")
+        return content[start:end]
+
+    @staticmethod
+    def signed_record_markup(response):
+        """Return only the frozen signed-record section."""
+        return response.content.decode().split(
+            '<section class="card signed-record" data-signed-record>',
+            1,
+        )[1].split("</section>", 1)[0]
+
+    @staticmethod
+    def delivery_item_markup_from_content(content, item_text):
+        """Return shared delivery-row markup surrounding one criterion."""
+        item_position = content.index(item_text)
+        start = content.rfind("<li data-delivery-item>", 0, item_position)
+        end = content.index("</li>", item_position) + len("</li>")
+        return content[start:end]
+
+    @classmethod
+    def delivery_item_markup(cls, response, item_text):
+        """Return shared delivery-row markup from a full response."""
+        return cls.delivery_item_markup_from_content(
+            response.content.decode(),
+            item_text,
+        )
+
+    @staticmethod
+    def status_badge_text(markup):
+        """Extract exactly one client-facing status badge's text."""
+        match = re.search(r'<span class="badge(?: failed)?">([^<]+)</span>', markup)
+        if match is None:
+            raise AssertionError("Client-facing status badge was not rendered.")
+        return match.group(1).strip()
+
+    def assert_checklist_mode(self, response, *, live, signed):
+        """Assert exactly the authoritative checklist mode expected for a status."""
+        detail_markup = self.portal_detail_markup(response)
+        live_count = detail_markup.count("<h2>Scope and progress</h2>")
+        signed_count = detail_markup.count("<h2>Signed delivery record</h2>")
+        self.assertEqual(live_count, int(live))
+        self.assertEqual(signed_count, int(signed))
+        self.assertEqual(live_count + signed_count, 1)
+
+    def test_other_client_and_draft_projects_return_404(self):
+        """Project existence is hidden from foreign clients and for private drafts."""
+        foreign_project = make_draft_project(owner=self.owner)
+        foreign_project.client_email = "someone-else@example.com"
+        foreign_project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(foreign_project)
+        private_draft = make_draft_project(owner=self.owner)
+        private_draft.client_email = "portal-detail@example.com"
+        private_draft.save(update_fields=["client_email"])
+
+        foreign_response = self.client.get(self.detail_url(foreign_project))
+        draft_response = self.client.get(self.detail_url(private_draft))
+
+        self.assertEqual(foreign_response.status_code, 404)
+        self.assertEqual(draft_response.status_code, 404)
+
+    def test_all_client_statuses_use_consistent_plain_language(self):
+        """List and detail render every visible status with the same client wording."""
+        expected_labels = {
+            Project.Status.CRITERIA_PENDING: "Awaiting your approval",
+            Project.Status.ACTIVE: "Work in progress",
+            Project.Status.DELIVERED: "Delivered — awaiting your signature",
+            Project.Status.ATTESTED: "Signed",
+            Project.Status.DISPUTED: "Disputed",
+        }
+        for status, label in expected_labels.items():
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                detail_response = self.client.get(self.detail_url())
+                list_response = self.client.get(reverse("surface:portal"))
+
+                self.assertEqual(detail_response.status_code, 200)
+                detail_badge = self.status_badge_text(
+                    self.portal_detail_markup(detail_response)
+                )
+                list_content = list_response.content.decode()
+                row_start = list_content.index('<a class="portal-project-row"')
+                row_end = list_content.index("</a>", row_start)
+                list_badge = self.status_badge_text(
+                    list_content[row_start:row_end]
+                )
+                self.assertEqual(detail_badge, label)
+                self.assertEqual(list_badge, label)
+                self.assertEqual(detail_badge, list_badge)
+
+    def test_detail_shows_scope_live_steps_and_change_order_history(self):
+        """Active detail exposes client-visible scope, progress, and prior changes."""
+        approve_criteria(self.project)
+        self.project.refresh_from_db()
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Completed granular step",
+            order=1,
+            is_done=True,
+        )
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Outstanding granular step",
+            order=2,
+            is_done=False,
+        )
+        AcceptanceItem.objects.create(
+            project=self.project,
+            text="Private freelancer draft criterion",
+            order=2,
+            state=AcceptanceItem.State.DRAFT,
+        )
+        ChangeOrder.objects.create(
+            project=self.project,
+            description="Approved reporting extension",
+            amount_cents=12000,
+            timeline_days=3,
+            status=ChangeOrder.Status.APPROVED,
+            resolved_at=timezone.now(),
+        )
+
+        response = self.client.get(self.detail_url())
+
+        self.assertContains(response, self.project.brief)
+        self.assertContains(response, item.text)
+        self.assertContains(response, "Completed granular step")
+        self.assertContains(response, "Outstanding granular step")
+        self.assertContains(response, "Done")
+        self.assertContains(response, "Not done")
+        self.assertContains(response, "Approved reporting extension")
+        self.assertContains(response, "Approved")
+        self.assertNotContains(response, "Private freelancer draft criterion")
+
+    def test_delivery_rows_render_identically_on_sign_and_portal_surfaces(self):
+        """Shared partial matches unsigned live scope and signed payload replay."""
+        approve_criteria(self.project)
+        self.project.refresh_from_db()
+        parked_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Shared suspended criterion",
+            order=2,
+            state=AcceptanceItem.State.SUSPENDED,
+            submitted_at=timezone.now(),
+            approved_at=timezone.now(),
+            is_passed=False,
+        )
+        AcceptanceStep.objects.create(
+            item=parked_item,
+            text="Shared unfinished step",
+            order=1,
+            is_done=False,
+        )
+        self.project.acceptance_items.filter(
+            state=AcceptanceItem.State.APPROVED
+        ).update(is_passed=True)
+        mark_delivered(self.project)
+        self.project.refresh_from_db()
+        token = make_client_token(self.project, "sign")
+
+        sign_response = Client().get(
+            reverse("surface:client-sign", kwargs={"token": token})
+        )
+        delivered_portal_response = self.client.get(self.detail_url())
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        Attestation.objects.create(
+            project=self.project,
+            payload={
+                "acceptance_items": [
+                    {
+                        "text": parked_item.text,
+                        "state": AcceptanceItem.State.SUSPENDED,
+                        "is_passed": False,
+                        "evidence_url": "",
+                        "steps": [
+                            {"text": "Shared unfinished step", "is_done": False}
+                        ],
+                    }
+                ]
+            },
+            payload_hash="a" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Parity Signer",
+            signature_meta={},
+        )
+        portal_response = self.client.get(self.detail_url())
+        sign_markup = self.delivery_item_markup(sign_response, parked_item.text)
+
+        self.assertEqual(
+            sign_markup,
+            self.delivery_item_markup(
+                delivered_portal_response,
+                parked_item.text,
+            ),
+        )
+        self.assertEqual(
+            sign_markup,
+            self.delivery_item_markup_from_content(
+                self.signed_record_markup(portal_response),
+                parked_item.text,
+            ),
+        )
+
+    def test_signed_record_replays_frozen_payload_not_live_rows(self):
+        """Signed checklist comes from immutable payload even if live rows differ."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        live_item = self.project.acceptance_items.get()
+        live_item.text = "Changed live criterion after signing"
+        live_item.is_passed = False
+        live_item.save(update_fields=["text", "is_passed"])
+        frozen_text = "Frozen criterion the client signed"
+        frozen_step = "Frozen signed step"
+        signed_at = datetime(2026, 3, 14, 9, 26, tzinfo=UTC)
+        attestation = Attestation.objects.create(
+            project=self.project,
+            payload={
+                "acceptance_items": [
+                    {
+                        "text": frozen_text,
+                        "state": "approved",
+                        "is_passed": True,
+                        "evidence_url": "",
+                        "steps": [{"text": frozen_step, "is_done": True}],
+                    }
+                ]
+            },
+            payload_hash="f" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Frozen Signer",
+            signed_at=signed_at,
+            signature_meta={},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assert_checklist_mode(response, live=False, signed=True)
+        self.assertIn(frozen_text, signed_markup)
+        self.assertIn(frozen_step, signed_markup)
+        self.assertNotIn(live_item.text, signed_markup)
+        self.assertNotIn(live_item.text, self.portal_detail_markup(response))
+        self.assertIn("<strong>Passed</strong>", signed_markup)
+        self.assertNotIn("<strong>Not passed</strong>", signed_markup)
+        self.assertIn(attestation.payload_hash, signed_markup)
+        self.assertIn("Mar 14, 2026, 9:26 AM UTC", signed_markup)
+
+    def test_signed_record_explains_hash_fingerprint(self):
+        """Signed detail explains the intact copyable hash in client language."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        payload_hash = "e" * 64
+        Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": []},
+            payload_hash=payload_hash,
+            client_email=self.project.client_email,
+            client_name_typed="Hash Explanation Signer",
+            signature_meta={},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assertIn(
+            "This is a fingerprint of the exact record you signed; if any detail "
+            "is altered, the fingerprint changes so the record can be checked later.",
+            signed_markup,
+        )
+        self.assertIn(
+            f'<span class="break-word record-hash">{payload_hash}</span>',
+            signed_markup,
+        )
+
+    def test_legacy_signed_payload_missing_item_fields_renders_safely(self):
+        """Legacy checklist items without newer keys remain readable."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        legacy_text = "Legacy frozen criterion"
+        Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": [{"text": legacy_text}]},
+            payload_hash="b" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Legacy Signer",
+            signature_meta={},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(legacy_text, signed_markup)
+        self.assertIn("<strong>No result recorded</strong>", signed_markup)
+        self.assertNotIn("excluded from this delivery", signed_markup)
+
+    def test_portal_replays_current_amendment_not_superseded_record(self):
+        """Portal selects the current amendment at the signed-record call site."""
+        approve_criteria(self.project)
+        self.project.refresh_from_db()
+        item = self.project.acceptance_items.get()
+        item.is_passed = True
+        item.save(update_fields=["is_passed"])
+        mark_delivered(self.project)
+        original = sign_attestation(
+            self.project,
+            self.project.client_email,
+            "Original Signer",
+            {},
+        )
+        amended_text = "Criterion frozen in current amendment"
+        AcceptanceItem.objects.filter(pk=item.pk).update(text=amended_text)
+        amendment = amend_attestation(
+            original,
+            self.project.client_email,
+            "Amendment Signer",
+            {},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assertIn(amended_text, signed_markup)
+        self.assertIn(amendment.payload_hash, signed_markup)
+        self.assertNotIn(original.payload_hash, signed_markup)
+        self.assertNotIn(original.payload["acceptance_items"][0]["text"], signed_markup)
+
+    def test_detail_query_count_is_flat_across_multiple_items(self):
+        """Detail prefetches step rows instead of querying once per criterion."""
+        AcceptanceItem.objects.create(
+            project=self.project,
+            text="Second submitted criterion",
+            order=2,
+            state=AcceptanceItem.State.SUBMITTED,
+            submitted_at=timezone.now(),
+        )
+
+        with self.assertNumQueries(6):
+            response = self.client.get(self.detail_url())
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_unsigned_statuses_show_live_scope_without_signed_record(self):
+        """Pending, active, and delivered projects retain the live progress view."""
+        for status in (
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+            Project.Status.DELIVERED,
+        ):
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                response = self.client.get(self.detail_url())
+
+                self.assert_checklist_mode(response, live=True, signed=False)
+
+    def test_every_visible_status_renders_exactly_one_checklist(self):
+        """No client-visible status can render live and signed checklists together."""
+        for status in (
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+            Project.Status.DELIVERED,
+        ):
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                response = self.client.get(self.detail_url())
+                self.assert_checklist_mode(response, live=True, signed=False)
+
+        Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": []},
+            payload_hash="c" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Checklist Mode Signer",
+            signature_meta={},
+        )
+        for status in (Project.Status.ATTESTED, Project.Status.DISPUTED):
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                response = self.client.get(self.detail_url())
+                self.assert_checklist_mode(response, live=False, signed=True)
+
+    def test_disputed_project_is_explicitly_labelled_not_clean(self):
+        """Disputed signed work carries both status and non-clean warning."""
+        clean_response = self.client.get(self.detail_url())
+        self.assertNotContains(
+            clean_response,
+            "not presented as a clean attestation",
+        )
+        self.assertNotContains(clean_response, 'class="dispute-notice"', html=False)
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.DISPUTED
+        )
+        Attestation.objects.create(
+            project=self.project,
+            payload={
+                "acceptance_items": [
+                    {
+                        "text": "Disputed frozen criterion",
+                        "state": "approved",
+                        "is_passed": True,
+                        "steps": [],
+                    }
+                ]
+            },
+            payload_hash="d" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Disputed Signer",
+            signature_meta={},
+            is_disputed=True,
+            disputed_at=timezone.now(),
+        )
+
+        response = self.client.get(self.detail_url())
+
+        self.assert_checklist_mode(response, live=False, signed=True)
+        self.assertContains(response, "Disputed")
+        self.assertContains(response, "not presented as a clean attestation")
+        self.assertContains(response, 'class="dispute-notice"', html=False)
+
+    def test_detail_has_no_mutating_controls_and_rejects_post(self):
+        """I3b exposes no project action while POST remains unsupported."""
+        response = self.client.get(self.detail_url())
+        detail_markup = self.portal_detail_markup(response)
+
+        self.assertNotIn("<form", detail_markup)
+        self.assertNotIn("<button", detail_markup)
+        action_links = re.findall(
+            r"<a\b[^>]*>.*?</a>",
+            detail_markup,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for link_markup in action_links:
+            with self.subTest(link=link_markup):
+                self.assertNotRegex(
+                    link_markup,
+                    r'class="[^"]*\bbutton\b',
+                )
+                self.assertNotRegex(
+                    link_markup,
+                    r">\s*[^<]*(?:Confirm|Approve|Sign)\b",
+                )
+        post_response = self.client.post(self.detail_url())
+        self.assertEqual(post_response.status_code, 405)

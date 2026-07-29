@@ -199,20 +199,3 @@ class ClientPortalLogoutView(View):
         """Clear client keys while preserving freelancer and billing state."""
         clear_client_session(request.session)
         return redirect("surface:portal-request")
-
-
-class ClientPortalView(ClientSessionMixin, TemplateView):
-    """List every non-draft project for the verified client email."""
-
-    template_name = "surface/portal/list.html"
-
-    def get_context_data(self, **kwargs):
-        """Add case-insensitively matched projects with freelancer attribution."""
-        context = super().get_context_data(**kwargs)
-        context["projects"] = (
-            Project.objects.filter(client_email__iexact=self.client_email)
-            .exclude(status=Project.Status.DRAFT)
-            .select_related("owner")
-            .order_by("-created_at", "-pk")
-        )
-        return context
