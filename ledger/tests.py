@@ -9,9 +9,10 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, models, transaction
 from django.db.migrations.executor import MigrationExecutor
-from django.db.models.signals import post_delete, pre_delete
-from django.test import TestCase, TransactionTestCase
+from django.db.models.signals import post_delete, post_save, pre_delete
+from django.test import Client, TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 from django.utils import timezone
 
 from ledger.models import (
@@ -49,6 +50,7 @@ from ledger.services import (
     public_attestations,
     pull_back_acceptance_item,
     recompute_capability_tags,
+    recompute_capability_tags_after_attestation_save,
     reopen_active,
     resolve_dispute,
     resume_acceptance_item,
@@ -3408,6 +3410,366 @@ class CapabilityTagTests(TestCase):
             ("django", 1),
             ("htmx", 1),
         ])
+
+
+class DisputeCacheFreshnessTests(TestCase):
+    """Every dispute write path keeps the CapabilityTag cache authoritative."""
+
+    def setUp(self):
+        """Sign one skill-bearing project and authenticate a superuser."""
+        self.profile = make_profile()
+        self.project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="Django REST",
+            owner=self.profile,
+        )
+        mark_all_items_passed(self.project)
+        self.attestation = sign_attestation(
+            self.project,
+            "signer@acme.com",
+            "Signer",
+            safe_signature_meta(),
+        )
+        self.assertEqual(self.attestation.payload["skills"], ["django-rest"])
+        self.admin_user = User.objects.create_superuser(
+            username="ledger-admin",
+            email="admin@example.com",
+            password="testpass",
+        )
+        self.client = Client()
+        self.client.force_login(self.admin_user)
+
+    def assert_cache_rows(self, profile, expected_rows):
+        """Assert exact cached names, counts, and signed timestamps."""
+        actual_rows = list(
+            CapabilityTag.objects.filter(profile=profile)
+            .order_by("name")
+            .values_list("name", "attested_count", "last_attested_at")
+        )
+        self.assertEqual(actual_rows, expected_rows)
+
+    def run_admin_action(self, action, attestations):
+        """Post one attestation admin action and return its followed response."""
+        return self.client.post(
+            reverse("admin:ledger_attestation_changelist"),
+            {
+                "action": action,
+                "_selected_action": [
+                    attestation.pk for attestation in attestations
+                ],
+                "index": "0",
+            },
+            follow=True,
+        )
+
+    def test_service_dispute_round_trip_refreshes_exact_cache_rows(self):
+        """Service flag removes and resolve restores the exact signed cache row."""
+        expected_rows = [
+            ("django-rest", 1, self.attestation.signed_at),
+        ]
+        self.assert_cache_rows(self.profile, expected_rows)
+
+        flag_dispute(self.project)
+        self.assert_cache_rows(self.profile, [])
+
+        resolve_dispute(self.project)
+        self.assert_cache_rows(self.profile, expected_rows)
+
+    def test_direct_save_dispute_round_trip_refreshes_exact_cache_rows(self):
+        """The post-save layer refreshes both directions of a direct marker write."""
+        expected_rows = [
+            ("django-rest", 1, self.attestation.signed_at),
+        ]
+        self.attestation.is_disputed = True
+        self.attestation.disputed_at = timezone.now()
+        self.attestation.save(
+            update_fields=("is_disputed", "disputed_at"),
+        )
+        self.assert_cache_rows(self.profile, [])
+
+        self.attestation.is_disputed = False
+        self.attestation.disputed_at = None
+        self.attestation.save(
+            update_fields=("is_disputed", "disputed_at"),
+        )
+        self.assert_cache_rows(self.profile, expected_rows)
+
+    def test_direct_is_current_save_unconditionally_refreshes_cache(self):
+        """A non-dispute update still triggers the unconditional cache receiver."""
+        expected_rows = [
+            ("django-rest", 1, self.attestation.signed_at),
+        ]
+        self.attestation.is_current = False
+        self.attestation.save(update_fields=("is_current",))
+        self.assert_cache_rows(self.profile, [])
+
+        self.attestation.is_current = True
+        self.attestation.save(update_fields=("is_current",))
+        self.assert_cache_rows(self.profile, expected_rows)
+
+    def test_queryset_update_dispute_round_trip_refreshes_exact_cache_rows(self):
+        """The queryset wrapper refreshes both directions of bulk marker writes."""
+        expected_rows = [
+            ("django-rest", 1, self.attestation.signed_at),
+        ]
+        Attestation.objects.filter(pk=self.attestation.pk).update(
+            is_disputed=True,
+            disputed_at=timezone.now(),
+        )
+        self.assert_cache_rows(self.profile, [])
+
+        Attestation.objects.filter(pk=self.attestation.pk).update(
+            is_disputed=False,
+            disputed_at=None,
+        )
+        self.assert_cache_rows(self.profile, expected_rows)
+
+    def test_related_manager_update_refreshes_exact_cache_rows(self):
+        """The related-manager bulk path cannot bypass the queryset cache wrapper."""
+        expected_rows = [
+            ("django-rest", 1, self.attestation.signed_at),
+        ]
+        self.project.attestations.update(
+            is_disputed=True,
+            disputed_at=timezone.now(),
+        )
+        self.assert_cache_rows(self.profile, [])
+
+        self.project.attestations.update(
+            is_disputed=False,
+            disputed_at=None,
+        )
+        self.assert_cache_rows(self.profile, expected_rows)
+
+    def test_admin_action_dispute_round_trip_refreshes_exact_cache_rows(self):
+        """Admin actions preserve service transitions and exact cache contents."""
+        expected_rows = [
+            ("django-rest", 1, self.attestation.signed_at),
+        ]
+        with (
+            patch(
+                "ledger.admin.flag_dispute",
+                wraps=flag_dispute,
+            ) as flag_service,
+            patch(
+                "ledger.admin.resolve_dispute",
+                wraps=resolve_dispute,
+            ) as unused_resolve_service,
+        ):
+            flag_response = self.run_admin_action(
+                "flag_selected_disputes",
+                [self.attestation],
+            )
+        flag_service.assert_called_once()
+        unused_resolve_service.assert_not_called()
+        flagged_project = flag_service.call_args.args[0]
+        self.assertEqual(flagged_project.pk, self.project.pk)
+        self.assertEqual(flag_response.status_code, 200)
+        self.assertContains(
+            flag_response,
+            "1 project(s) flagged as disputed; "
+            "0 duplicate attestation(s) skipped; "
+            "0 invalid transition(s) skipped.",
+        )
+        self.assert_cache_rows(self.profile, [])
+
+        with (
+            patch(
+                "ledger.admin.resolve_dispute",
+                wraps=resolve_dispute,
+            ) as resolve_service,
+            patch(
+                "ledger.admin.flag_dispute",
+                wraps=flag_dispute,
+            ) as unused_flag_service,
+        ):
+            resolve_response = self.run_admin_action(
+                "resolve_selected_disputes",
+                [self.attestation],
+            )
+        resolve_service.assert_called_once()
+        unused_flag_service.assert_not_called()
+        resolved_project = resolve_service.call_args.args[0]
+        self.assertEqual(resolved_project.pk, self.project.pk)
+        self.assertEqual(resolve_response.status_code, 200)
+        self.assertContains(
+            resolve_response,
+            "1 project(s) resolved; "
+            "0 duplicate attestation(s) skipped; "
+            "0 invalid transition(s) skipped.",
+        )
+        self.assert_cache_rows(self.profile, expected_rows)
+
+    def test_attestation_admin_hostile_marker_post_succeeds_without_changes(self):
+        """Read-only dispute fields ignore a hostile POST that otherwise succeeds."""
+        attempted_disputed_at = timezone.now() + timedelta(days=1)
+        response = self.client.post(
+            reverse(
+                "admin:ledger_attestation_change",
+                args=[self.attestation.pk],
+            ),
+            {
+                "is_disputed": "on",
+                "disputed_at_0": attempted_disputed_at.date().isoformat(),
+                "disputed_at_1": attempted_disputed_at.time().isoformat(),
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            reverse("admin:ledger_attestation_changelist"),
+        )
+        self.attestation.refresh_from_db()
+        self.assertFalse(self.attestation.is_disputed)
+        self.assertIsNone(self.attestation.disputed_at)
+
+    def test_attestation_admin_renders_dispute_markers_read_only(self):
+        """The change form renders marker rows without editable marker inputs."""
+        response = self.client.get(
+            reverse(
+                "admin:ledger_attestation_change",
+                args=[self.attestation.pk],
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        rendered_form = response.content.decode()
+        # Forbid an intervening form-row so a later readonly field cannot
+        # satisfy the match on behalf of the marker row being asserted.
+        self.assertRegex(
+            rendered_form,
+            r'(?s)class="form-row field-is_disputed"'
+            r'(?:(?!form-row).)*?class="readonly"',
+        )
+        self.assertRegex(
+            rendered_form,
+            r'(?s)class="form-row field-disputed_at"'
+            r'(?:(?!form-row).)*?class="readonly"',
+        )
+        self.assertNotContains(response, 'name="is_disputed"')
+        self.assertNotContains(response, 'name="disputed_at_0"')
+        self.assertNotContains(response, 'name="disputed_at_1"')
+
+    def test_post_save_cache_receiver_is_connected_to_attestation(self):
+        """Pin AppConfig.ready wiring to Attestation and no unrelated sender."""
+        synchronous_receivers, asynchronous_receivers = post_save._live_receivers(
+            Attestation
+        )
+        unrelated_receivers, unrelated_async_receivers = post_save._live_receivers(
+            Profile
+        )
+
+        self.assertIn(
+            recompute_capability_tags_after_attestation_save,
+            synchronous_receivers,
+        )
+        self.assertNotIn(
+            recompute_capability_tags_after_attestation_save,
+            unrelated_receivers,
+        )
+        self.assertEqual(asynchronous_receivers, [])
+        self.assertEqual(unrelated_async_receivers, [])
+
+    def test_queryset_project_move_refreshes_old_and_new_owner_caches(self):
+        """Owner-union refresh prevents stale tags after a bulk project reassignment."""
+        new_owner = make_profile()
+        target_project = make_project_with_items(
+            status=Project.Status.ATTESTED,
+            owner=new_owner,
+        )
+        existing_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="Python",
+            owner=new_owner,
+        )
+        mark_all_items_passed(existing_project)
+        existing_attestation = sign_attestation(
+            existing_project,
+            "other-signer@acme.com",
+            "Other Signer",
+            safe_signature_meta(),
+        )
+        self.assert_cache_rows(
+            self.profile,
+            [("django-rest", 1, self.attestation.signed_at)],
+        )
+        self.assert_cache_rows(
+            new_owner,
+            [("python", 1, existing_attestation.signed_at)],
+        )
+
+        Attestation.objects.filter(project=self.project).update(
+            project=target_project,
+        )
+
+        self.assert_cache_rows(self.profile, [])
+        self.assert_cache_rows(
+            new_owner,
+            [
+                ("django-rest", 1, self.attestation.signed_at),
+                ("python", 1, existing_attestation.signed_at),
+            ],
+        )
+
+    def test_admin_action_deduplicates_attestations_from_one_project(self):
+        """Two selected amendments cause one transition and report one duplicate."""
+        amendment = amend_attestation(
+            self.attestation,
+            "amended@acme.com",
+            "Amended Signer",
+            safe_signature_meta(),
+        )
+
+        response = self.run_admin_action(
+            "flag_selected_disputes",
+            [self.attestation, amendment],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            "1 project(s) flagged as disputed; "
+            "1 duplicate attestation(s) skipped; "
+            "0 invalid transition(s) skipped.",
+        )
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DISPUTED)
+        self.assert_cache_rows(self.profile, [])
+
+    def test_admin_action_skips_invalid_project_and_processes_valid_peer(self):
+        """An invalid transition is reported without blocking a valid selection."""
+        invalid_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="Python",
+        )
+        mark_all_items_passed(invalid_project)
+        invalid_attestation = sign_attestation(
+            invalid_project,
+            "invalid@acme.com",
+            "Invalid State Signer",
+            safe_signature_meta(),
+        )
+        Project.objects.filter(pk=invalid_project.pk).update(
+            status=Project.Status.DRAFT,
+        )
+
+        response = self.run_admin_action(
+            "flag_selected_disputes",
+            [invalid_attestation, self.attestation],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            "1 project(s) flagged as disputed; "
+            "0 duplicate attestation(s) skipped; "
+            "1 invalid transition(s) skipped.",
+        )
+        self.project.refresh_from_db()
+        invalid_project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DISPUTED)
+        self.assertEqual(invalid_project.status, Project.Status.DRAFT)
+        self.assert_cache_rows(self.profile, [])
 
 
 class ModelConstraintTests(TestCase):

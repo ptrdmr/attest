@@ -1737,6 +1737,17 @@ result.
    every request. A directory that filters and ranks on `CapabilityTag` has **no
    live recomputation to fall back on**, so cache correctness becomes the
    correctness of the whole surface.
+   **CORRECTION 2026-07-30, found by the I5c Compliance Gate — the sentence above
+   about the detail page is wrong, and it understated the urgency of I5c.** Only the
+   *Signed attestations* list recomputes live. The **Verified skills** card on the same
+   page renders the cache directly (`surface/views.py:1306` passes
+   `profile.capability_tags.all()`; `templates/surface/record/detail.html:43-52` loops it
+   with attested counts). So the three finding-3 bypass paths were a **live exposure on a
+   public page today**, not a hazard waiting for the directory: an out-of-band dispute
+   write left a disputed skill displayed as verified. I5c was therefore a fix, not merely
+   hardening ahead of I5d/I5e. Lesson: "does any surface read this?" was answered by
+   reasoning about which *service* recomputes, when it needed a grep for the template
+   variable — the cache had two consumers on one page and the plan saw one.
 3. **The dispute-cache bypass is wider than one admin form — I first recorded this
    finding as narrower than it is, and the Planner-adversary was right to reject it.**
    Verified directly against the code: `Attestation.IMMUTABLE_FIELDS`
@@ -2118,13 +2129,18 @@ allowlist — turning a comment-level assumption into a failing test if anyone b
 Recon re-verified every code location the milestone touches. One plan correction and
 four decisions a builder would otherwise have to invent in a hazard zone.
 
-- **Correction to finding 3's citations.** It cites `ledger/tests.py:2825` and `:2852`
-  as the direct dispute writes. Those line numbers have drifted — today they are
-  `payload`/`payload_hash` immutability tests. The actual direct dispute writes are
-  `ledger/tests.py:3079-3080` (`save(update_fields=("is_disputed",))`) and `:3105-3107`
-  (both markers). Finding 3's substance is unaffected and was re-verified: the three
-  bypass paths are real, and `AttestationQuerySet.update()` at `ledger/models.py:192-199`
-  still blocks only `IMMUTABLE_FIELDS`, which excludes both dispute markers.
+- **Correction to finding 3's citations — and a convention change, because these rotted
+  twice in one day.** Finding 3 cited `ledger/tests.py:2825` and `:2852`; by the time I5c
+  was dispatched those lines held `payload`/`payload_hash` immutability tests. I replaced
+  them with fresh line numbers, and the characterization commit (`f4fe098`) inserted 74
+  lines above them within the hour, breaking them again — the Implementer-adversary
+  caught the second break. **Cite tests by name, not by line.** The direct dispute writes
+  are `PublicDisplayTests.test_is_disputed_filter_excludes_independently_of_project_status`
+  and `PublicDisplayTests.test_i1a_payload_hidden_when_is_disputed_on_attested_project`,
+  both using `save(update_fields=(...))` on the dispute markers. Finding 3's substance is
+  unaffected and was re-verified: the three bypass paths are real, and
+  `AttestationQuerySet.update()` still blocks only `IMMUTABLE_FIELDS`, which excludes both
+  dispute markers.
 - **Decision C1 — the `post_save` receiver recomputes unconditionally, on create and
   update alike, with no change-detection predicate.** Any predicate is somewhere a false
   negative can hide, and a false negative here is precisely the bypass this milestone
@@ -2152,6 +2168,64 @@ four decisions a builder would otherwise have to invent in a hazard zone.
 - **Decision C4 — `models.py` imports `recompute_capability_tags` at function scope.**
   `ledger/services.py` imports from `ledger/models.py` at module level, so the reverse
   import at module scope is circular. This is a known trap, not a style preference.
+
+#### I5c execution log (2026-07-30)
+
+Owning department Ledger, hazard zone, full dispatch, Verifier-first. Suite
+**414 → 426 green**, ruff clean. Characterization tests landed separately as `f4fe098`
+**before** the guard was touched, so the record shows they passed against unmodified
+code rather than being shaped to fit the change.
+
+- **Implementer-adversary (Sonnet 5): ACCEPT**, two minor findings, one substantive.
+  `AttestationQuerySet.update()` snapshotted affected owners only *before* the write, but
+  `project` is not in `IMMUTABLE_FIELDS`, so a bulk write may move an attestation to a
+  project with a **different owner** — old owner recomputed, new owner never. Nothing in
+  the repo does this. Fixed anyway, on the reasoning that a layer holding only for the
+  writes we currently happen to make is the same assumption that produced finding 3.
+  The wrapper now recomputes the **union** of pre- and post-update owners, resolving
+  post-update owners from snapshotted row pks (re-evaluating `self` cannot work — the
+  caller's filter may be predicated on the very field that changed).
+- **Verifier-adversary (Grok 4.5), 18 mutations: REJECT.** Most cells proved load-bearing.
+  Four survivors, of which two mattered: the hostile admin POST asserted only
+  `status_code == 302`, so making the markers editable **and** short-circuiting the change
+  view to a bare redirect kept it green; and the admin action could be replaced by an
+  inline mimic that never called `flag_dispute`/`resolve_dispute`, because the cells pinned
+  end state rather than the service seam the milestone exists to create. One reported
+  survivor was **rejected as an equivalent mutant**: moving the immutability guard after
+  `super().update()` is invisible because the raise rolls the write back, and the
+  requirement is "a blocked update persists nothing", which is already pinned. Pinning
+  where the guard *sits* would assert an implementation detail.
+- **Second, fresh adversary scoped to the fixes: REJECT again**, and it was right to be
+  dispatched fresh. It found the service-seam spy could still be fooled by
+  call-then-undo-then-inline, and that the read-only regex could match a *later* readonly
+  row on behalf of the marker row. Both now closed — the sibling service is asserted
+  uncalled, and the regex forbids an intervening `form-row`.
+- **Accepted limitation, and the reasoning, because this was a real judgment call.**
+  Decision C1 requires the receiver to be unconditional. The adversary showed a predicate
+  on `{is_disputed, disputed_at, is_current}` survives the whole suite. That predicate is
+  behaviourally correct for every reachable case; it differs only when an attestation is
+  moved to a project with a different owner **via instance save**, where our own receiver
+  has the same blind spot (it recomputes `instance.project.owner`, the new owner, and
+  leaves the old owner stale) — the identical gap the union fix closed on the bulk path.
+  **Ruled out of scope by the human**: transferring signed work between freelancers is not
+  a feature, has no view, service or admin control, and reaching it requires hand-written
+  ORM in a shell. Recorded rather than fixed, and recorded rather than silently dropped,
+  because the symmetry argument for fixing it is real and a future reader deserves to see
+  it was weighed. **If a project-transfer feature is ever planned, this is a prerequisite.**
+- **Compliance Gate (fresh-context, Opus 5): PASS**, all eight items verified
+  independently rather than from the plan — including `makemigrations --check` to prove no
+  schema change, and its own full-suite run. It also **corrected finding 2** (see the
+  correction recorded there): the capability cache is already rendered on the public
+  record page, so this milestone closed a live exposure rather than pre-hardening for the
+  directory. Four non-blocking advisories, the substantive one being that `project` is
+  absent from `IMMUTABLE_FIELDS` — pre-existing, out of gate scope, and the root of the
+  accepted limitation above. It judged that limitation defensible on the specific ground
+  that it is an *attribution-accuracy* gap, not a dispute-cleanliness one: every recompute
+  filters on `is_disputed`, so no disputed row can be laundered clean through it.
+- Process note: the first mutation run hung, kept running past its interrupt, and left a
+  live mutation in `ledger/admin.py`. The lessons are now in
+  `.cursor/rules/stance_adversary.mdc` and `.cursor/rules/agent_org.mdc` (`fec9f3f`); the
+  exclusive-tree rule already existed from 2026-07-19 and the orchestrator broke it.
 
 #### I5b execution log (2026-07-29)
 

@@ -1,5 +1,5 @@
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 
 
@@ -190,13 +190,29 @@ class AttestationQuerySet(models.QuerySet):
     """Block bulk mutation or deletion of signed attestation data."""
 
     def update(self, **kwargs):
-        """Apply a bulk update unless it targets immutable fields."""
+        """Apply a permitted bulk update and refresh affected capability caches."""
         blocked = set(kwargs) & set(Attestation.IMMUTABLE_FIELDS)
         if blocked:
             raise ImmutableAttestation(
                 "Signed attestation fields cannot be bulk-updated."
             )
-        return super().update(**kwargs)
+        from .services import recompute_capability_tags
+
+        with transaction.atomic():
+            affected_rows = tuple(
+                self.values_list("pk", "project__owner_id")
+            )
+            affected_attestation_ids = [row[0] for row in affected_rows]
+            affected_profile_ids = {row[1] for row in affected_rows}
+            updated_count = super().update(**kwargs)
+            affected_profile_ids.update(
+                Attestation.objects.filter(
+                    pk__in=affected_attestation_ids,
+                ).values_list("project__owner_id", flat=True)
+            )
+            for profile in Profile.objects.filter(pk__in=affected_profile_ids):
+                recompute_capability_tags(profile)
+        return updated_count
 
     def delete(self):
         """Reject bulk deletion of signed attestation rows."""

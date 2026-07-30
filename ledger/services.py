@@ -714,6 +714,15 @@ def recompute_capability_tags(profile):
     return tags
 
 
+def recompute_capability_tags_after_attestation_save(
+    sender,
+    instance,
+    **kwargs,
+):
+    """Refresh capability tags after any attestation save."""
+    recompute_capability_tags(instance.project.owner)
+
+
 def public_attestations(profile):
     """Return clean signed attestations safe for the public record."""
     candidates = (
