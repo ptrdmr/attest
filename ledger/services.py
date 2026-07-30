@@ -34,6 +34,51 @@ def set_profile_visibility(profile, is_public):
     return profile
 
 
+_PROFILE_DETAIL_FIELDS = (
+    "display_name",
+    "headline",
+    "bio",
+    "location",
+    "website_url",
+)
+
+
+def set_profile_details(profile, **fields):
+    """Set supplied Profile identity fields and return the saved Profile.
+
+    Raises ValueError for handle, unknown keys, blank display_name, or an empty
+    call. Raises ValidationError when a supplied value fails field validation.
+    """
+    if "handle" in fields:
+        raise ValueError("handle cannot be changed.")
+    unexpected_keys = set(fields) - set(_PROFILE_DETAIL_FIELDS)
+    if unexpected_keys:
+        raise ValueError("Profile details contain unsupported fields.")
+    if not fields:
+        raise ValueError("At least one profile field must be supplied.")
+
+    update_fields = []
+    for field_name in _PROFILE_DETAIL_FIELDS:
+        if field_name not in fields:
+            continue
+        value = fields[field_name]
+        if field_name == "display_name":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("display_name must not be empty.")
+            value = value.strip()
+        setattr(profile, field_name, value)
+        update_fields.append(field_name)
+
+    exclude = [
+        field.name
+        for field in profile._meta.concrete_fields
+        if field.name not in update_fields
+    ]
+    profile.full_clean(validate_unique=False, exclude=exclude)
+    profile.save(update_fields=tuple(update_fields))
+    return profile
+
+
 def _transition(project, expected_status, target_status):
     """Move a project between two explicitly permitted workflow states."""
     if project.status != expected_status:

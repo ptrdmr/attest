@@ -1874,7 +1874,8 @@ edges are: **I5b requires I5a's fields**, **I5e requires I5d's services**, and
   plus a `set_profile_details(profile, **fields)` service, because
   `dept_surface.mdc` forbids Surface writing trust-object fields directly — the same
   reason M7b-1 added `set_profile_visibility`.
-  **Schema authorization requested, this list only:** `bio` (`TextField`,
+  **Schema authorization GRANTED by the human 2026-07-29, this list only** — any
+  further field requires a fresh grant: `bio` (`TextField`,
   `blank=True`), `location` (`CharField(max_length=120, blank=True)`), and
   `website_url` (`URLField(blank=True)`). `headline` already exists and needs no
   migration, only an editing surface.
@@ -2058,6 +2059,71 @@ one an authenticated developer never stumbles into by accident.
   decision 6's third empty state entirely). The pattern worth remembering: the
   decisions were right each time and the canonical test list was what lost fidelity —
   and the test list is what builders work from.
+
+#### I5a execution log (2026-07-29)
+
+Owning department Ledger, full dispatch. Suite **375 → 387 green**, ruff clean on all
+four touched files.
+
+- **Human granted the schema authorization** for exactly `bio`, `location`,
+  `website_url` before dispatch. Migration `0005` contains three `AddField`
+  operations and nothing else.
+- **Implementer-builder (Composer 2.5) → Implementer-adversary (Sonnet 5): REJECT,
+  one blocker.** `set_profile_details` defaulted absent keys to `""` and included
+  them in `update_fields`, so a caller omitting `bio` silently **persisted the
+  erasure** of an existing bio. The adversary correctly judged this worse than the
+  silent `handle` ignore the builder had been told to reject, since it destroys data
+  rather than doing nothing. It also found unknown kwargs were swallowed, where
+  `_safe_signature_meta` in the same file already establishes the allowlist idiom.
+- **Orchestrator ruling on the fix.** The adversary offered three resolutions and
+  asked the builder to choose; that choice was the orchestrator's. Ruled **partial-
+  update semantics**: absent key means untouched, empty string means cleared, unknown
+  keys rejected, `handle` keeps its own distinct error per ruling 4. Chosen over
+  documenting full-replace because a docstring does not stop the next caller — a form
+  that fails to render a field now leaves it alone instead of erasing it. Django posts
+  cleared fields as empty strings, so "cleared" stays distinguishable from "absent".
+- **Orchestrator caught one thing neither seat did:** `_PROFILE_DETAIL_FIELDS` came
+  back as a `frozenset` that was then *iterated* to build `update_fields`, making the
+  tuple's order non-deterministic. Changed to a tuple. This project has already been
+  bitten once by a milestone relying on incidental ordering.
+- **Verifier-builder (Composer 2.5): 12 tests added.** It also repaired a regression
+  I5a caused: `ProfileIsPublicMigrationTests` rolled the schema back to `0002` and
+  then inserted via the **live** `Profile` model, so the three new columns broke it.
+  Fixed with the historical-model pattern `AcceptanceItemStateMigrationTests` already
+  used. Note the builder first reported this as "pre-existing" — it was not; the suite
+  was green at HEAD. An audit of the other two migration test classes found them
+  clean, so no Refit candidate is owed.
+- **Verifier-adversary (Grok 4.5): ACCEPT after mutation testing**, nine mutations
+  run one at a time, every one failing the test it should. Because the work was
+  uncommitted, the seat was explicitly forbidden from `git checkout`/`restore`/`stash`
+  and given SHA-256 hashes of the three files to restore against; the orchestrator
+  re-verified all three byte-exact afterwards. It found one real hole empirically
+  rather than by reading: the unknown-key test passed even when the service persisted
+  `is_public=True` **and then** raised, because the test never checked the hostile
+  field. Closed by asserting `is_public` is still `False` after rejection — which
+  matters more than it looks, since that field is the strict opt-in flag. It also
+  showed the `0005` migration test ignored a `max_length` 120→500 model drift, now
+  pinned on the historical field.
+- **Note carried to I5b, not a defect:** after a `ValidationError` the caller's
+  in-memory `Profile` still holds the rejected values. That is what a form needs for
+  redisplay, but an I5b view must not then call `profile.save()` for some other reason
+  on the same instance.
+- **Carried to I5c by the Compliance Gate (advisory, non-blocking, accepted).**
+  `ProfileAdmin` declares `list_display`, `search_fields` and `readonly_fields` but no
+  explicit `fields`, so Django defaults to every editable field and the three new ones
+  now render on the staff change form without anyone choosing that. Related and more
+  substantive: **`handle` is not in `ProfileAdmin.readonly_fields`**, so ruling 4's
+  immutability currently rests on the service and form layers only — an admin can
+  still change a public record URL. That is pre-existing rather than introduced here,
+  which is why it did not block, but it becomes materially worse once records are
+  indexable, since a changed handle breaks inbound links and frees the old one. I5c
+  already owns `ledger/admin.py` and is the admin-write-path milestone, so it absorbs
+  both: add `handle` to `ProfileAdmin.readonly_fields` with a test, and set an explicit
+  `fields` list. Logged rather than fixed now, per the cleanup doctrine.
+- Gate (fresh-context, Opus 5): **PASS**. It verified the authorization field-for-field,
+  confirmed the whole diff contains only two deleted lines (one reworded plan line and
+  the one repaired test call) so nothing was weakened to make the suite pass, and ran
+  the suite itself.
 
 ## Standing rules
 - Gate (fresh-context, Opus) runs on the final combined diff before EVERY commit

@@ -3,8 +3,10 @@
 import json
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, models, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models.signals import post_delete, pre_delete
@@ -51,6 +53,7 @@ from ledger.services import (
     resolve_dispute,
     resume_acceptance_item,
     set_acceptance_step_done,
+    set_profile_details,
     set_profile_visibility,
     sign_attestation,
     submit_acceptance_item_for_approval,
@@ -265,6 +268,188 @@ class ProfileVisibilityTests(TestCase):
         self.assertEqual(public_attestation_ids, [attestation.pk])
 
 
+class SetProfileDetailsTests(TestCase):
+    """Profile identity field updates via set_profile_details."""
+
+    def test_set_profile_details_partial_update_preserves_other_fields(self):
+        """Updating one field must not erase the other four in the database."""
+        profile = make_profile()
+        set_profile_details(
+            profile,
+            display_name="Full Name",
+            headline="Headline",
+            bio="Bio text",
+            location="City",
+            website_url="https://example.com",
+        )
+
+        set_profile_details(profile, bio="Updated bio only")
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.display_name, "Full Name")
+        self.assertEqual(stored.headline, "Headline")
+        self.assertEqual(stored.bio, "Updated bio only")
+        self.assertEqual(stored.location, "City")
+        self.assertEqual(stored.website_url, "https://example.com")
+
+    def test_set_profile_details_limits_update_fields_to_supplied_keys(self):
+        """save() must receive update_fields covering only supplied columns."""
+        profile = make_profile()
+        set_profile_details(
+            profile,
+            display_name="Name",
+            headline="Head",
+            bio="Bio",
+            location="Here",
+            website_url="https://example.com",
+        )
+        profile = Profile.objects.get(pk=profile.pk)
+        profile.headline = "Mutated in memory"
+
+        with patch.object(profile, "save", wraps=profile.save) as mock_save:
+            set_profile_details(profile, location="New City")
+            mock_save.assert_called_once()
+            _, kwargs = mock_save.call_args
+            self.assertEqual(kwargs.get("update_fields"), ("location",))
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.headline, "Head")
+        self.assertEqual(stored.location, "New City")
+
+    def test_set_profile_details_rejects_handle_change(self):
+        """Handle immutability is enforced before any write."""
+        profile = make_profile(handle="immutable-handle")
+        original_handle = profile.handle
+
+        with self.assertRaisesMessage(ValueError, "handle cannot be changed."):
+            set_profile_details(profile, handle="new-handle")
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.handle, original_handle)
+
+    def test_set_profile_details_rejects_unknown_keyword(self):
+        """Unsupported keys raise before persisting anything."""
+        profile = make_profile()
+        set_profile_details(profile, display_name="Name", bio="Bio")
+
+        with self.assertRaisesMessage(
+            ValueError,
+            "Profile details contain unsupported fields.",
+        ):
+            set_profile_details(profile, is_public=True)
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.display_name, "Name")
+        self.assertEqual(stored.bio, "Bio")
+        self.assertIs(stored.is_public, False)
+
+    def test_set_profile_details_rejects_empty_call(self):
+        """At least one supported field must be supplied."""
+        profile = make_profile()
+        set_profile_details(profile, display_name="Name")
+
+        with self.assertRaisesMessage(
+            ValueError,
+            "At least one profile field must be supplied.",
+        ):
+            set_profile_details(profile)
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.display_name, "Name")
+
+    def test_set_profile_details_rejects_blank_display_name(self):
+        """display_name must remain a non-empty string."""
+        profile = make_profile()
+        set_profile_details(profile, display_name="Valid Name")
+
+        for bad_value in ("", "   ", 123):
+            with self.subTest(bad_value=bad_value):
+                with self.assertRaisesMessage(
+                    ValueError,
+                    "display_name must not be empty.",
+                ):
+                    set_profile_details(profile, display_name=bad_value)
+                stored = Profile.objects.get(pk=profile.pk)
+                self.assertEqual(stored.display_name, "Valid Name")
+
+    def test_set_profile_details_strips_display_name_whitespace(self):
+        """Surrounding whitespace is removed from display_name before save."""
+        profile = make_profile()
+        set_profile_details(profile, display_name="  Trimmed Name  ")
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.display_name, "Trimmed Name")
+
+    def test_set_profile_details_rejects_malformed_website_url(self):
+        """Invalid website_url values fail validation without persisting."""
+        profile = make_profile()
+        set_profile_details(
+            profile,
+            display_name="Name",
+            website_url="https://example.com",
+        )
+
+        with self.assertRaises(ValidationError):
+            set_profile_details(profile, website_url="not-a-url")
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.website_url, "https://example.com")
+
+    def test_set_profile_details_rejects_overlong_location(self):
+        """location longer than 120 characters is rejected."""
+        profile = make_profile()
+        set_profile_details(
+            profile,
+            display_name="Name",
+            location="Short",
+        )
+
+        with self.assertRaises(ValidationError):
+            set_profile_details(profile, location="x" * 121)
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.location, "Short")
+
+    def test_set_profile_details_persists_valid_full_update(self):
+        """All five identity fields persist when supplied together."""
+        profile = make_profile()
+        set_profile_details(
+            profile,
+            display_name="Full Name",
+            headline="Headline",
+            bio="Bio text",
+            location="City",
+            website_url="https://example.com/path",
+        )
+
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.display_name, "Full Name")
+        self.assertEqual(stored.headline, "Headline")
+        self.assertEqual(stored.bio, "Bio text")
+        self.assertEqual(stored.location, "City")
+        self.assertEqual(stored.website_url, "https://example.com/path")
+
+    def test_set_profile_details_can_clear_optional_field_with_empty_string(self):
+        """Explicit empty string clears an optional field; absence leaves it."""
+        profile = make_profile()
+        set_profile_details(
+            profile,
+            display_name="Name",
+            bio="Has bio",
+            headline="Headline",
+        )
+
+        set_profile_details(profile, bio="")
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.bio, "")
+        self.assertEqual(stored.headline, "Headline")
+
+        set_profile_details(profile, headline="New headline")
+        stored = Profile.objects.get(pk=profile.pk)
+        self.assertEqual(stored.bio, "")
+        self.assertEqual(stored.headline, "New headline")
+
+
 class ProfileIsPublicMigrationTests(TransactionTestCase):
     """Migration 0002 adds reversible is_public with a private default."""
 
@@ -302,7 +487,12 @@ class ProfileIsPublicMigrationTests(TransactionTestCase):
         self.assertIs(is_public_field.default, False)
         self.assertIn("is_public", profile_columns())
 
-        profile = make_profile()
+        user = User.objects.create_user(username="migration-visibility")
+        profile = AppliedProfile.objects.create(
+            user_id=user.pk,
+            handle="migration-visibility",
+            display_name="Migration Visibility",
+        )
         profile.refresh_from_db()
         self.assertIs(profile.is_public, False)
 
@@ -510,6 +700,71 @@ class AcceptanceStepMigrationTests(TransactionTestCase):
             "ledger_acceptancestep",
             connection.introspection.table_names(),
         )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, latest_migration)])
+
+
+class ProfileDetailFieldsMigrationTests(TransactionTestCase):
+    """Migration 0005 adds reversible profile identity fields."""
+
+    def test_0005_profile_detail_fields_applies_and_reverses(self):
+        """bio, location, and website_url apply forward and roll back cleanly."""
+        executor = MigrationExecutor(connection)
+        app_label = "ledger"
+        before_migration = "0004_acceptancestep"
+        detail_fields_migration = (
+            "0005_profile_bio_profile_location_profile_website_url"
+        )
+        latest_migration = next(
+            name
+            for app, name in executor.loader.graph.leaf_nodes()
+            if app == app_label
+        )
+        new_columns = {"bio", "location", "website_url"}
+
+        def profile_columns():
+            with connection.cursor() as cursor:
+                cursor.execute("PRAGMA table_info(ledger_profile)")
+                return {row[1] for row in cursor.fetchall()}
+
+        executor.migrate([(app_label, before_migration)])
+        before_state = executor.loader.project_state((app_label, before_migration))
+        BeforeProfile = before_state.apps.get_model(app_label, "Profile")
+        before_field_names = {
+            field.name for field in BeforeProfile._meta.get_fields()
+        }
+        self.assertFalse(new_columns & before_field_names)
+        self.assertFalse(new_columns & profile_columns())
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, detail_fields_migration)])
+        applied_state = executor.loader.project_state(
+            (app_label, detail_fields_migration)
+        )
+        AppliedProfile = applied_state.apps.get_model(app_label, "Profile")
+        applied_field_names = {
+            field.name for field in AppliedProfile._meta.get_fields()
+        }
+        self.assertTrue(new_columns <= applied_field_names)
+        self.assertTrue(new_columns <= profile_columns())
+        bio_field = AppliedProfile._meta.get_field("bio")
+        location_field = AppliedProfile._meta.get_field("location")
+        website_url_field = AppliedProfile._meta.get_field("website_url")
+        self.assertIsInstance(bio_field, models.TextField)
+        self.assertIsInstance(location_field, models.CharField)
+        self.assertEqual(location_field.max_length, 120)
+        self.assertIsInstance(website_url_field, models.URLField)
+
+        executor = MigrationExecutor(connection)
+        executor.migrate([(app_label, before_migration)])
+        reversed_state = executor.loader.project_state((app_label, before_migration))
+        ReversedProfile = reversed_state.apps.get_model(app_label, "Profile")
+        reversed_field_names = {
+            field.name for field in ReversedProfile._meta.get_fields()
+        }
+        self.assertFalse(new_columns & reversed_field_names)
+        self.assertFalse(new_columns & profile_columns())
 
         executor = MigrationExecutor(connection)
         executor.migrate([(app_label, latest_migration)])
