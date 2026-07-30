@@ -1,8 +1,10 @@
 # Go-to-Market — Positioning, Channels, and Success Criteria
 
-Planning document, drafted 2026-07-30. Companion to `PLAN.md` (build order) and
-`ROADMAP.md` (feature sequence). This file answers two questions: how we take
-Attest to market, and how we will know whether it worked.
+Planning document, drafted 2026-07-30 and **revised the same day against the I3
+client portal** (I3a–I3c) and the I5 rulings of 2026-07-29, both of which landed
+while it was being written. Companion to `PLAN.md` (build order) and `ROADMAP.md`
+(feature sequence). This file answers two questions: how we take Attest to
+market, and how we will know whether it worked.
 
 Nothing here is a build authorization. Items that would change code are logged
 as candidates for a Planner, and open product judgements are listed at the end
@@ -21,6 +23,14 @@ orders block delivery until resolved; the client signs that each criterion was
 met. The freelancer's benefit is realized *during* the project: fewer "just one
 more thing" arguments, and a signed sign-off at the end. This value does not
 depend on Attest being known or trusted by anyone.
+
+I3 materially strengthened this half. The client portal gives the client a
+persistent, re-visitable place to read the brief, watch progress against agreed
+scope, approve scope and sign — and, once signed, to re-read the frozen
+attestation payload rather than whatever the rows say today. That last detail is
+a better *marketing* asset than it looks: "you can always go back and see exactly
+what you agreed to, unchanged" is a promise to the client, and the client is the
+party whose reluctance kills adoption.
 
 **Product B — portable verified reputation (deferred, compounding, cold-start
 dependent).** The Capability Record at `/u/<handle>/`, with SHA-256 record
@@ -57,7 +67,7 @@ production deploy today would be a dead end for every visitor.** Evidence:
    `DEBUG=0`, and there is no real gateway, so the entitlement gate on
    `ProjectCreateView` rejects everyone.
 
-```149:151:config/settings.py
+```150:152:config/settings.py
 ATTEST_BILLING_STUB_MODE = (
     os.environ.get("ATTEST_BILLING_STUB_MODE", "1" if DEBUG else "0") == "1"
 )
@@ -67,11 +77,13 @@ ATTEST_BILLING_STUB_MODE = (
    `ATTEST_BILLING_STUB_MODE=1`, a signup leads to a billing page reading
    "Checkout is not configured yet. Contact support."
 
-2. **No email means no product.** The backend falls back to console output
-   unless `EMAIL_HOST` is set. Every client interaction — criteria review,
-   change orders, signing — is reachable only by emailed link. Until a real
-   transactional sender with SPF/DKIM/DMARC exists, the client half of the
-   product does not function.
+2. **No email means no product, and I3 raised the stakes.** The backend falls
+   back to console output unless `EMAIL_HOST` is set. Every client interaction —
+   criteria review, change orders, signing, and now portal sign-in itself — is
+   reachable only by emailed link. The portal made email the front door to a
+   whole surface rather than to three one-off actions, so deliverability moved
+   from important to load-bearing. Until a real transactional sender with
+   SPF/DKIM/DMARC exists, the client half of the product does not function.
 
 3. **No serving stack.** No Postgres driver, no application server, no
    `STATIC_ROOT`/`collectstatic` strategy, no container or platform manifest,
@@ -86,11 +98,11 @@ ATTEST_BILLING_STUB_MODE = (
 5. **No real user has ever used it.** One internal hand-driven walkthrough
    (2026-07-27) is the entire usage history.
 
-What *is* ready is the thing that is usually not: the domain logic. 310 tests
+What *is* ready is the thing that is usually not: the domain logic. 375 tests
 pass, immutability and consent races are adversary-reviewed, and the privacy
-posture (private-by-default records, parked-scope disclosure) is unusually
-honest for a reputation product. **The gap is entirely distribution surface and
-operational plumbing, not correctness.**
+posture (private-by-default records, parked-scope disclosure, clients with no
+account at all) is unusually honest for a reputation product. **The gap is
+entirely distribution surface and operational plumbing, not correctness.**
 
 ---
 
@@ -147,10 +159,12 @@ What it does **not** prove, and what marketing may therefore not imply:
 - **Not identity verification.** The signer is whoever held that mailbox. There
   is no KYC, and the client email is typed in by the freelancer.
 - **Not an audit-trail-grade e-signature.** The Ledger accepts `user_agent`,
-  `ip_hash` and `ip_truncated` in `signature_meta`, but the signing view passes
-  an empty dict, so nothing is captured:
+  `ip_hash` and `ip_truncated` in `signature_meta`, but nothing is captured —
+  and since I3c there are now **two** signing doorways that both pass an empty
+  dict, the token-link page and the portal:
 
-```1258:1261:surface/views.py
+```1238:1242:surface/views.py
+            attestation = _sign_delivery_record(
                 project=self.project,
                 client_email=self.project.client_email,
                 client_name_typed=form.cleaned_data["signature_name"],
@@ -168,7 +182,11 @@ record hasn't changed since."** That is defensible, specific, and still strong.
 `signature_meta` with hashed or truncated IP and user agent. The Ledger already
 validates exactly those keys and forbids raw IP storage, so the evidentiary
 strength of every attestation improves without a schema change or a privacy
-regression. This is the cheapest available upgrade to the core claim.
+regression. I3c's extraction of `_sign_delivery_record` into `surface/consent.py`
+makes this cheaper than it was — one shared seam now stands between both signing
+doorways and the Ledger — but note that both call sites currently pass the empty
+dict explicitly, so the seam is where the derivation belongs. This is the
+cheapest available upgrade to the core claim.
 
 ---
 
@@ -180,55 +198,87 @@ buyers of freelance services. They hire repeatedly. A client who has a clean
 experience approving scope and signing off is the highest-intent lead we will
 ever get, because they can *demand* Attest from the next freelancer they hire.
 
-That channel is currently not just unused but actively harmful.
+**I3 turned that loop from an argument into a product feature.** The portal lists
+every non-draft project attached to a client's email *across every freelancer
+they work with*. So a client who works with two Attest freelancers sees them side
+by side, and a client who works with one sees a conspicuously short list. That is
+the structural condition for the client to start asking for it — the ruling that
+made the list combined rather than per-freelancer is, whether or not it was
+argued this way, the single most growth-relevant decision in the initiative.
 
-**The client emails are naked URLs.** Body is the link, nothing else:
+The channel is still under-built, but it is no longer untouched.
 
-```123:134:surface/views.py
-def _send_review_link(request, project):
-    """Email a fresh purpose-bound criteria review URL."""
-    review_token = make_client_token(project, "review")
-    review_url = request.build_absolute_uri(
-        reverse("surface:client-review", kwargs={"token": review_token})
-    )
-    return _send_email(
-        request,
-        subject="Review project criteria",
-        body=review_url,
-        recipient=project.client_email,
-    )
+**What is now right.** The three client action emails append a portal
+invitation, so a client is told the portal exists:
+
+```116:119:surface/views.py
+def _with_portal_discovery(request, action_url):
+    """Keep an action URL first and append the client portal request page."""
+    portal_url = request.build_absolute_uri(reverse("surface:portal-request"))
+    return f"{action_url}\n\nView all your projects in Attest: {portal_url}"
 ```
 
-A subject line of "Review project criteria" and a body containing only a long
-tokenized URL, from an unknown sender, with no freelancer name and no
-explanation, is a spam-filter magnet that reads as phishing to a human who gets
-past the filter. **This is the single highest-leverage marketing defect in the
-codebase, and it presents as a deliverability bug rather than a marketing one.**
+**What is still wrong.** That is one line of context bolted to a bare URL, and it
+is the *most* developed of the five emails. The bodies still do not say who the
+email is from, what is being asked, or why the link is so long, and the subject
+lines are unchanged — "Review project criteria" is a subject with no project
+name, no sender, and no verb aimed at a human. Two of the five emails are still
+nothing but a URL: the freelancer login link, and the **portal login link, which
+is now the front door to the client's whole experience**:
 
-All four of the product's emails share this shape — the three client-facing ones
-(criteria review, signing, change order) and the freelancer's own login link,
-whose body is likewise just `login_url` under the subject "Your Attest login
-link." So the defect costs us the client channel *and* our own signup completion.
+```106:111:surface/client_auth.py
+        send_mail(
+            subject="Your Attest client portal link",
+            message=portal_url,
+            from_email=None,
+            recipient_list=[email],
+        )
+```
+
+An unexplained long tokenized URL from an unknown sender is a spam-filter magnet
+that reads as phishing to whoever gets past the filter. **This remains the
+highest-leverage marketing defect in the codebase, and it presents as a
+deliverability bug rather than a marketing one.** It also now gates a bigger
+surface than it did before I3, because a portal nobody can log in to is worth
+nothing.
 
 Three further gaps on the same surface:
 
-- **Client pages never explain what Attest is** or that the process protects the
-  client too. No context, no link, nothing a curious client can follow.
-- **The signing confirmation wastes peak goodwill.** `signed.html` shows a
-  timestamp and a hash at the exact moment a client has just confirmed the work
-  was done well. It offers no copy of the record, no explanation, and no "you
-  can ask any freelancer for this."
-- **The public record is unverifiable by its reader.** It prints a SHA-256 hash
-  and a "Verified" badge with no explanation of what was verified, who verified
-  it, or how to check. To a prospective client, an unexplained self-published
+- **Client pages still never explain what Attest is** or that the process
+  protects the client too. The portal gives the client a home, but nothing on it
+  answers "who are these people and why am I here."
+- **The signing confirmation still wastes peak goodwill, and now does so
+  inconsistently.** The portal's confirmation includes the plain-language hash
+  explanation from `signed_record_meta.html`; the token-link confirmation at
+  `templates/surface/client/signed.html` still prints a bare timestamp and hash.
+  Neither offers a copy of the record or a "you can ask any freelancer for this"
+  at the one moment a client has just confirmed the work was done well.
+- **The public record is still unverifiable by its reader — and this one is now
+  a copy-paste away from fixed.** Someone wrote exactly the right sentence for
+  I3b, and it is shown only to the client who already signed:
+
+```6:8:templates/surface/partials/signed_record_meta.html
+    <p class="muted">
+      This is a fingerprint of the exact record you signed; if any detail is altered, the fingerprint changes so the record can be checked later.
+    </p>
+```
+
+  The public Capability Record prints the raw hash and a "Verified" badge with no
+  explanation at all. So the explanatory copy exists and is good, but it is
+  deployed to the audience that needs it least (a client who was just there) and
+  withheld from the audience the moat depends on (a prospective client deciding
+  whether to trust a stranger). To that reader, an unexplained self-published
   "Verified" badge is decoration at best and suspicious at worst.
 
-**Candidates for a Planner, in leverage order:** (1) rewrite all four emails as
-real messages — who it is from, what is being asked, what Attest is, why the
-link is long; (2) a public "how this is verified" explainer the record links to;
-(3) a client-facing footer and a post-signature moment on the client templates.
-Item 1 is a prerequisite for measuring anything about the client funnel, because
-a spam-foldered email is indistinguishable from client apathy.
+**Candidates for a Planner, in leverage order:** (1) rewrite all five emails as
+real messages — who it is from, what is being asked, what Attest is, why the link
+is long — starting with the portal login link, since it now gates a whole
+surface; (2) carry the existing hash explanation onto the public record and add a
+"how this is verified" page it can link to; (3) a client-facing explanation of
+what Attest is on the portal, and a real post-signature moment on both
+confirmation pages. Item 1 is a prerequisite for measuring anything about the
+client funnel, because a spam-foldered email is indistinguishable from client
+apathy.
 
 ---
 
@@ -245,13 +295,28 @@ Assumes a very small team and no meaningful ad budget.
    words:** r/freelance, r/forhire, r/web_design, Indie Hackers, designer and
    developer Discords, and groups of people who have left the big platforms.
    Contribute dispute and scope-creep experience; do not pitch.
-3. **The client loop (section 5).** The only compounding channel we own. Must be
-   fixed and instrumented before it can be counted on.
+3. **The client loop (section 5).** The only compounding channel we own, and I3
+   made it structural rather than aspirational. Must be finished and instrumented
+   before it can be counted on.
 4. **Content and SEO on the dispute cluster:** acceptance criteria templates,
    "client won't pay the final invoice," scope-creep clauses, statement-of-work
    templates. Slow payback but high intent. The AI draft stub is already most of
    a no-signup public "acceptance criteria generator," which is a strong link
-   asset and lead magnet.
+   asset and lead magnet. **Organic search is no longer an open question:** the
+   I5 ruling of 2026-07-29 accepted it as a growth channel and confirmed that
+   published records are indexable and the directory must not emit `noindex`.
+   That ruling also settled the harder positioning question in our favour —
+   attested capability is the primary browse axis, and freelancer-declared text
+   "must never carry the headline claim in a listing." A directory that can
+   answer "who holds client-signed deliveries in this capability" is a claim no
+   ordinary directory can make, and it is the most defensible SEO surface we
+   will have.
+   **The catch the plan already names:** strict opt-in means the directory ships
+   empty, which makes its empty state a first-class marketing problem. An empty
+   directory is worse than no directory, because it is public evidence that
+   nobody uses this. Do not launch the directory as a discovery channel until
+   there are enough published records to make a search result look inhabited;
+   until then it is a private asset, not a channel.
 5. **Partnerships with the all-in-one tools rather than a frontal fight** — only
    after activation is proven.
 6. **Explicitly not paid acquisition,** until activation and retention are
@@ -326,6 +391,16 @@ The funnel, each stage a discrete event to instrument:
 | 9 | **Retention** | Second project started with no prompting from us |
 | 10 | Thesis | Record viewed by a non-owner; freelancer reports it affected a deal |
 
+**I3 added a stage worth measuring on its own: the client who comes back.** A
+portal sign-in that is *not* a response to an action email — no criteria to
+approve, nothing to sign — is a client choosing to check on their project. That
+is the earliest honest read on whether the client half has value, it arrives long
+before any retention or moat signal, and it is the leading indicator for the
+pivot in failure mode 5. Two derived measures matter: **portal sign-ins per
+client** beyond the first, and **clients whose portal list holds projects from
+more than one freelancer**, which is the client loop actually closing. Neither is
+measurable today.
+
 Proposed thresholds — these are **judgement calls offered for a human ruling**,
 not established benchmarks:
 
@@ -374,7 +449,7 @@ Cohort gates, in order:
 
 ## 8. What failure looks like
 
-Five failure modes, each with the leading indicator that identifies it.
+Six failure modes, each with the leading indicator that identifies it.
 
 1. **Client-side friction kill.** Clients never open or approve. *Indicator:*
    stage 4 → 5 below 50%. Most likely cause today is the bare-URL email, not
@@ -393,11 +468,21 @@ Five failure modes, each with the leading indicator that identifies it.
    to the agency buyer.
 5. **Wrong buyer.** The pain is real but sits with the freelancer while the
    benefit accrues to the client. *Indicator:* clients asking whether they can
-   require this of their *other* contractors. This is failure of the B2C thesis
-   and simultaneously the strongest available pivot signal — the buyer would be
-   the company hiring contractors, not the freelancer.
+   require this of their *other* contractors — and, now measurable in principle,
+   clients returning to the portal unprompted and clients whose list spans more
+   than one freelancer. This is failure of the B2C thesis and simultaneously the
+   strongest available pivot signal — the buyer would be the company hiring
+   contractors, not the freelancer. I3's combined cross-freelancer list is what
+   makes this pivot cheap if the signal appears, because the client-side product
+   already exists.
+6. **The empty directory.** I5 ships a public directory that is empty until
+   freelancers publish, on top of records that are private by default.
+   *Indicator:* a live directory with a single-digit number of published records.
+   Public emptiness is not a neutral state; it is evidence against us, indexed by
+   search engines. *Response:* keep the directory unlaunched, or unindexed, until
+   the record count makes it credible.
 
-A sixth risk is reputational rather than metric: **trust-artifact skepticism.**
+A further risk is reputational rather than metric: **trust-artifact skepticism.**
 A self-published "Verified" badge with no third-party verification path can read
 as self-certification. Mitigated by the public verification explainer in
 section 5 and by the claim discipline in section 4.
@@ -432,8 +517,11 @@ Written down in advance so sunk cost cannot argue later.
 - **Clients repeatedly ask to standardize Attest across their own contractors**
   → flip to B2B before scaling anything B2C.
 - **Approval rate stays below 50% after the emails are rewritten and
-  deliverability is confirmed** → the client burden is too high; the portal
-  (I3) becomes the top priority rather than a roadmap item.
+  deliverability is confirmed** → the client burden is too high. Note that the
+  obvious remedy has already been spent: the portal shipped in I3, so if approval
+  is still failing with real emails *and* a persistent portal, the problem is the
+  ask itself rather than the plumbing, and the honest response is to make scope
+  approval lighter rather than to build another surface.
 
 ---
 
@@ -446,6 +534,11 @@ constitution's prohibition on logging client PII:
   rather than to any client PII.
 - Non-owner Capability Record views, distinguishing owner previews from genuine
   outside reads, with no visitor PII retained.
+- **Portal sign-ins, separating the prompted from the unprompted** — a sign-in
+  following an action email is a compliance event, a sign-in with nothing pending
+  is an interest event, and only the second one tells us anything. Plus the count
+  of client sessions whose project list spans more than one freelancer, which is
+  the client loop closing.
 - Email send *and* delivery outcome. `_send_email` returns a boolean on SMTP
   exceptions and no test covers the failure path; delivery, bounces and spam
   placement are entirely invisible.
@@ -486,19 +579,47 @@ the work; both are reasons not to under-scope it.
 5. **Analytics dependency** — approve a third-party analytics package, or build
    the minimal internal event table?
 6. **Deployment target** — where does this run, and under what domain? Every
-   client email link and every public record URL depends on the answer.
+   client email link, every portal link and every public record URL depends on
+   the answer, and the client portal makes a credible sending domain a hard
+   requirement rather than a nicety.
+7. **Do we market to clients directly?** I3 built a client-side product good
+   enough to stand on its own, and the combined cross-freelancer list is the
+   beginning of a two-sided position. Marketing to clients would be a different
+   company than the one this plan describes, so it should be a deliberate ruling
+   rather than a drift. The cheap version — making the portal explain itself well
+   enough that a client asks their next freelancer for it — is section 5's item 3
+   and needs no such ruling.
+
+**Already ruled, recorded here so the plan is not re-litigated:** organic search
+is an accepted growth channel, published records and the directory are indexable,
+and attested capability — never self-declared text — carries the headline claim
+in any listing (I5 rulings, 2026-07-29). Sections 4 and 6 are written to match.
 
 ---
 
 ## Appendix — evidence base
 
-- Test suite verified green on 2026-07-30: `Ran 310 tests ... OK`.
+- Test suite verified green on 2026-07-30 at first draft (`Ran 310 tests ... OK`)
+  and again after merging the I3 portal work (`Ran 375 tests ... OK`).
 - Route, journey and access inventory taken from `surface/urls.py`,
-  `surface/views.py`, `surface/forms.py`, `surface/auth.py`, `surface/tokens.py`,
-  `ledger/models.py`, `ledger/services.py`, and `templates/`.
+  `surface/views.py`, `surface/portal_views.py`, `surface/client_auth.py`,
+  `surface/consent.py`, `surface/forms.py`, `surface/auth.py`,
+  `surface/tokens.py`, `ledger/models.py`, `ledger/services.py`, and
+  `templates/`.
 - Launch-readiness gaps cross-checked against `PLAN.md`, `ROADMAP.md`,
-  `config/settings.py`, `requirements.txt`, and git history (32 commits,
-  2026-07-18 → 2026-07-27, no deployment artifacts).
+  `config/settings.py`, `requirements.txt`, and git history (no deployment
+  artifacts as of the I3 merge).
+- **Revision note.** The first draft was written against `608e749`. I3a–I3c and
+  the I5 rulings landed immediately afterwards, so every code claim was
+  re-verified against the merged tree and the citations re-numbered. What changed
+  materially: the portal is built, so it is no longer a remedy held in reserve;
+  the client emails now carry a portal invitation, so the channel is
+  under-built rather than untouched; a plain-language hash explanation now exists
+  but only on the client's own signed record; a second signing doorway also
+  passes empty `signature_meta`; and organic search plus record indexability are
+  settled rulings rather than open questions. Nothing in sections 2, 7, 8 or 9
+  was invalidated — the deployment, billing, email and instrumentation gaps all
+  survive unchanged.
 
 **Review provenance, recorded because the charter requires an adversary pass.**
 An independent Planner-adversary seat could not be dispatched — three subagent
