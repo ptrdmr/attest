@@ -1,18 +1,22 @@
 """Verifier tests for the Surface layer (M2 + M3 + M5)."""
 
-from datetime import timedelta
+import ast
+from datetime import datetime, timedelta, UTC
 from hashlib import sha256
+import inspect
 import json
+import re
 from unittest.mock import patch
 from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.messages import get_messages
 from django.core.cache import cache
 from django.core.cache.backends.db import DatabaseCache
 from django.core import mail, signing
 from django.db import connection
-from django.test import Client, TestCase, override_settings
+from django.test import Client, RequestFactory, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -20,12 +24,14 @@ from django.utils import timezone
 from ledger.models import (
     AcceptanceItem,
     AcceptanceStep,
+    Attestation,
     ChangeOrder,
     Profile,
     Project,
 )
 from ledger.services import (
     InvalidTransition,
+    amend_attestation,
     approve_criteria,
     compute_payload_hash,
     flag_dispute,
@@ -37,18 +43,27 @@ from ledger.services import (
     withdraw_acceptance_item,
 )
 from surface import billing
+from surface import client_auth
+from surface import consent
+from surface import portal_views
 from surface.auth import (
     MAGIC_LOGIN_MAX_AGE,
     MAGIC_LOGIN_SALT,
+    MAGIC_LOGIN_USED_NAMESPACE,
     get_or_create_freelancer,
     make_magic_login_token,
     read_and_consume_magic_login_token,
 )
 from surface.tokens import (
+    CLIENT_TOKEN_PURPOSES,
     CLIENT_TOKEN_MAX_AGE,
+    PORTAL_TOKEN_MAX_AGE,
+    PORTAL_TOKEN_SALT,
     make_change_order_token,
     make_client_token,
+    make_portal_token,
     read_client_token,
+    read_portal_token,
 )
 
 
@@ -991,6 +1006,27 @@ class SubmitCriteriaViewTests(TestCase):
         self.assertContains(response, "Criteria sent for client approval")
 
     @override_settings(**LOCMem_EMAIL)
+    def test_review_email_keeps_action_first_and_discovers_portal(self):
+        """The actual criteria-send view includes both action and portal URLs."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        client = Client()
+        login_as(client, owner)
+
+        client.post(
+            reverse("surface:criteria-submit", kwargs={"project_pk": project.pk})
+        )
+
+        body_lines = [
+            line for line in mail.outbox[0].body.splitlines() if line.strip()
+        ]
+        self.assertIn("/client/review/", body_lines[0])
+        self.assertTrue(
+            any("/portal/login/" in line for line in body_lines[1:]),
+            "Review email did not include portal discovery after its action URL.",
+        )
+
+    @override_settings(**LOCMem_EMAIL)
     def test_submit_rejects_empty_criteria(self):
         """Submit without criteria shows an error and leaves the project draft."""
         owner = make_profile()
@@ -1280,6 +1316,50 @@ class ClientApproveViewTests(TestCase):
         self.assertContains(response, "No criteria are currently awaiting approval.")
         self.assertContains(response, "These criteria have already been handled.")
         self.assertNotContains(response, "criteria changed after this page was shown")
+
+    def test_client_approve_blank_fingerprint_is_stale_not_empty(self):
+        """A blank consent fingerprint is stale while submitted scope still exists."""
+        response = self.client.post(
+            reverse("surface:client-approve", kwargs={"token": self.token}),
+            {"batch_fingerprint": ""},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "criteria changed after this page was shown")
+        self.assertNotContains(response, "No criteria are currently awaiting approval.")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_active_project_batch_does_not_reapprove_initial_criteria(self):
+        """Later submitted scope is approved without replaying initial activation."""
+        approve_criteria(self.project)
+        later_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Later submitted criterion",
+            order=2,
+            state=AcceptanceItem.State.SUBMITTED,
+            submitted_at=timezone.now(),
+        )
+        fingerprint = review_fingerprint(self.client, self.token)
+
+        with patch("ledger.services.approve_criteria") as approve_project:
+            response = self.client.post(
+                reverse("surface:client-approve", kwargs={"token": self.token}),
+                {"batch_fingerprint": fingerprint},
+            )
+
+        approve_project.assert_not_called()
+        later_item.refresh_from_db()
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Thank you")
+        self.assertEqual(later_item.state, AcceptanceItem.State.APPROVED)
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
 
     def test_approval_losing_a_race_is_not_reported_as_thanks(self):
         """A rolled-back approval re-renders review instead of confirming."""
@@ -2073,7 +2153,7 @@ class PerItemCriteriaWorkflowTests(TestCase):
         self.assertEqual(item.state, AcceptanceItem.State.SUBMITTED)
         self.assertIsNotNone(item.submitted_at)
         self.assertEqual(len(mail.outbox), 1)
-        review_path = urlparse(mail.outbox[0].body.strip()).path
+        review_path = urlparse(mail.outbox[0].body.splitlines()[0]).path
         review_response = Client().get(review_path)
         self.assertEqual(review_response.status_code, 200)
         self.assertContains(review_response, item.text)
@@ -2713,6 +2793,29 @@ class MarkDeliveredViewTests(TestCase):
         self.assertContains(response, "Delivery recorded and sent for signature.")
 
     @override_settings(**LOCMem_EMAIL)
+    def test_signing_email_keeps_action_first_and_discovers_portal(self):
+        """The actual delivery view includes both signing and portal URLs."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        project.acceptance_items.update(is_passed=True)
+        client = Client()
+        login_as(client, owner)
+
+        client.post(
+            reverse("surface:mark-delivered", kwargs={"project_pk": project.pk})
+        )
+
+        body_lines = [
+            line for line in mail.outbox[0].body.splitlines() if line.strip()
+        ]
+        self.assertIn("/client/sign/", body_lines[0])
+        self.assertTrue(
+            any("/portal/login/" in line for line in body_lines[1:]),
+            "Signing email did not include portal discovery after its action URL.",
+        )
+
+    @override_settings(**LOCMem_EMAIL)
     def test_mark_delivered_rejects_failed_item_with_clear_message(self):
         """A failed checklist item blocks delivery and explains the policy."""
         owner = make_profile()
@@ -3062,6 +3165,23 @@ class ClientSignViewTests(TestCase):
         self.assertContains(response, "Thank you")
         self.assertContains(response, attestation.payload_hash)
 
+    def test_client_sign_records_project_client_email_exactly(self):
+        """Token signing records the project's exact client email spelling."""
+        self.project.client_email = "Client.MixedCase@Example.COM"
+        self.project.save(update_fields=("client_email",))
+
+        response = self.client.post(
+            reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+            {
+                "signature_name": "Acme Authorized Signer",
+                "confirm": "on",
+            },
+        )
+
+        attestation = self.project.attestations.get(is_current=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(attestation.client_email, "Client.MixedCase@Example.COM")
+
     def test_client_sign_missing_confirm_is_rejected(self):
         """Signing without the confirmation checkbox does not create an attestation."""
         response = self.client.post(
@@ -3085,6 +3205,27 @@ class ClientSignViewTests(TestCase):
         )
         self.assertEqual(response.status_code, 410)
 
+    def test_client_sign_post_non_delivered_never_calls_signing_service(self):
+        """A valid POST cannot reach Ledger before delivery."""
+        active_project = make_draft_project()
+        advance_to_active(active_project)
+        token = make_client_token(active_project, "sign")
+
+        with patch("ledger.services.sign_attestation") as sign_record:
+            response = self.client.post(
+                reverse("surface:client-sign", kwargs={"token": token}),
+                {
+                    "signature_name": "Acme Authorized Signer",
+                    "confirm": "on",
+                },
+            )
+
+        sign_record.assert_not_called()
+        self.assertEqual(response.status_code, 410)
+        active_project.refresh_from_db()
+        self.assertEqual(active_project.status, Project.Status.ACTIVE)
+        self.assertFalse(active_project.attestations.exists())
+
     def test_client_sign_already_attested_shows_signed_page(self):
         """An already attested project shows the signed confirmation page."""
         attestation = sign_project_via_service(self.project)
@@ -3095,6 +3236,48 @@ class ClientSignViewTests(TestCase):
         self.assertContains(response, "Thank you")
         self.assertContains(response, attestation.payload_hash)
         self.assertNotContains(response, "Type your full name")
+
+    def test_client_sign_post_already_attested_reuses_signed_record(self):
+        """A repeated valid POST shows the existing record without signing again."""
+        attestation = sign_project_via_service(self.project)
+
+        with patch("ledger.services.sign_attestation") as sign_record:
+            response = self.client.post(
+                reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+                {
+                    "signature_name": "Different Signer",
+                    "confirm": "on",
+                },
+            )
+
+        sign_record.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, attestation.payload_hash)
+        self.assertEqual(self.project.attestations.count(), 1)
+
+    def test_client_sign_invalid_transition_returns_token_error(self):
+        """A delivery race returns the generic unavailable response without a record."""
+        with patch(
+            "ledger.services.sign_attestation",
+            side_effect=InvalidTransition("status changed"),
+        ):
+            response = self.client.post(
+                reverse("surface:client-sign", kwargs={"token": self.sign_token}),
+                {
+                    "signature_name": "Acme Authorized Signer",
+                    "confirm": "on",
+                },
+            )
+
+        self.assertEqual(response.status_code, 410)
+        self.assertContains(
+            response,
+            "This review link is no longer available",
+            status_code=410,
+        )
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertFalse(self.project.attestations.exists())
 
     def test_client_sign_empty_signature_is_rejected(self):
         """Blank signature names re-render the form with validation errors."""
@@ -3811,6 +3994,29 @@ class ChangeOrderCreateViewTests(TestCase):
         )
         self.assertContains(response, "Change order sent for client review.")
 
+    @override_settings(**LOCMem_EMAIL)
+    def test_change_order_email_keeps_action_first_and_discovers_portal(self):
+        """The actual proposal view includes both action and portal URLs."""
+        owner = make_profile()
+        project = make_draft_project(owner=owner)
+        advance_to_active(project)
+        client = Client()
+        login_as(client, owner)
+
+        client.post(
+            reverse("surface:change-order-create", kwargs={"project_pk": project.pk}),
+            change_order_form_data(),
+        )
+
+        body_lines = [
+            line for line in mail.outbox[0].body.splitlines() if line.strip()
+        ]
+        self.assertIn("/client/change-order/", body_lines[0])
+        self.assertTrue(
+            any("/portal/login/" in line for line in body_lines[1:]),
+            "Change-order email did not include portal discovery after its action URL.",
+        )
+
     def test_propose_change_order_returns_404_when_not_active(self):
         """Draft projects cannot propose change orders through the Surface UI."""
         owner = make_profile()
@@ -4229,3 +4435,1666 @@ class BillingPageTests(TestCase):
         )
         self.assertRedirects(blocked, reverse("surface:billing"))
         self.assertFalse(Project.objects.filter(title="No Stub Create").exists())
+
+
+class ClientPortalFoundationTests(TestCase):
+    """Account-free portal authentication, isolation, and project discovery."""
+
+    def setUp(self):
+        """Clear portal counters and create one client-visible project."""
+        cache.clear()
+        self.email = "client@example.com"
+        self.owner = make_profile(
+            handle="portal-owner",
+            email="freelancer-owner@example.com",
+        )
+        self.owner.display_name = "Portal Freelancer"
+        self.owner.save(update_fields=["display_name"])
+        self.project = make_draft_project(owner=self.owner)
+        self.project.client_email = "Client@Example.COM"
+        self.project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(self.project)
+        self.project.refresh_from_db()
+
+    def establish_portal_session(self, client, email=None):
+        """Store a current verified client identity in a test session."""
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = email or self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_complete_portal_cycle_creates_no_user_or_profile(self):
+        """Every portal route preserves the User and Profile row counts."""
+        existing_identity_email = self.owner.user.email
+        self.project.client_email = existing_identity_email
+        self.project.save(update_fields=["client_email"])
+        self.assertTrue(
+            get_user_model().objects.filter(email=existing_identity_email).exists()
+        )
+        self.assertTrue(Profile.objects.filter(user=self.owner.user).exists())
+        user_count = get_user_model().objects.count()
+        profile_count = Profile.objects.count()
+        client = Client()
+
+        def assert_identity_counts_unchanged(route_name):
+            """Assert neither account-backed identity table changed."""
+            self.assertEqual(
+                Profile.objects.count(),
+                profile_count,
+                f"Profile count changed after {route_name}",
+            )
+            self.assertEqual(
+                get_user_model().objects.count(),
+                user_count,
+                f"User count changed after {route_name}",
+            )
+
+        request_get_response = client.get(reverse("surface:portal-request"))
+        self.assertEqual(request_get_response.status_code, 200)
+        assert_identity_counts_unchanged("portal-request GET")
+
+        request_post_response = client.post(
+            reverse("surface:portal-request"),
+            {"email": existing_identity_email},
+        )
+        self.assertRedirects(
+            request_post_response,
+            reverse("surface:portal-sent"),
+            fetch_redirect_response=False,
+        )
+        assert_identity_counts_unchanged("portal-request POST")
+        self.assertEqual(len(mail.outbox), 1)
+        portal_path = urlparse(mail.outbox[0].body.splitlines()[0])
+        confirm_path = f"{portal_path.path}?{portal_path.query}"
+
+        sent_response = client.get(reverse("surface:portal-sent"))
+        self.assertEqual(sent_response.status_code, 200)
+        assert_identity_counts_unchanged("portal-sent GET")
+
+        login_get_response = client.get(confirm_path)
+        self.assertContains(login_get_response, "Confirm your client portal access")
+        assert_identity_counts_unchanged("portal-login GET")
+
+        login_post_response = client.post(
+            reverse("surface:portal-login"),
+            {"token": login_get_response.context["token"]},
+        )
+        self.assertRedirects(
+            login_post_response,
+            reverse("surface:portal"),
+            fetch_redirect_response=False,
+        )
+        assert_identity_counts_unchanged("portal-login POST")
+        self.assertEqual(
+            client.session[client_auth.CLIENT_EMAIL_SESSION_KEY],
+            existing_identity_email,
+        )
+
+        portal_response = client.get(reverse("surface:portal"))
+        self.assertEqual(portal_response.status_code, 200)
+        assert_identity_counts_unchanged("portal list GET")
+
+        detail_response = client.get(
+            reverse(
+                "surface:portal-project",
+                kwargs={"project_pk": self.project.pk},
+            )
+        )
+        self.assertEqual(detail_response.status_code, 200)
+        assert_identity_counts_unchanged("portal project GET")
+
+        logout_response = client.post(reverse("surface:portal-logout"))
+        self.assertRedirects(
+            logout_response,
+            reverse("surface:portal-request"),
+            fetch_redirect_response=False,
+        )
+        assert_identity_counts_unchanged("portal-logout POST")
+
+    def test_virgin_client_detail_get_creates_no_identity_rows(self):
+        """A detail route cannot mint identity rows for a brand-new client email."""
+        virgin_email = "virgin-portal-detail@example.com"
+        self.assertFalse(
+            get_user_model().objects.filter(email__iexact=virgin_email).exists()
+        )
+        virgin_project = make_draft_project(owner=self.owner)
+        virgin_project.client_email = virgin_email
+        virgin_project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(virgin_project)
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = virgin_email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+        user_count = get_user_model().objects.count()
+        profile_count = Profile.objects.count()
+
+        response = client.get(
+            reverse(
+                "surface:portal-project",
+                kwargs={"project_pk": virgin_project.pk},
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(get_user_model().objects.count(), user_count)
+        self.assertEqual(Profile.objects.count(), profile_count)
+        self.assertFalse(
+            get_user_model().objects.filter(email__iexact=virgin_email).exists()
+        )
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_portal_routes_never_reach_freelancer_identity_functions(self):
+        """Every portal endpoint remains independent of freelancer identity creation."""
+        token = make_portal_token(self.email)
+        client = Client()
+
+        with (
+            patch("surface.auth.get_or_create_freelancer") as create_freelancer,
+            patch("surface.auth.ensure_profile") as ensure_freelancer_profile,
+        ):
+            request_get = client.get(reverse("surface:portal-request"))
+            request_post = client.post(
+                reverse("surface:portal-request"),
+                {"email": self.email},
+            )
+            sent_get = client.get(reverse("surface:portal-sent"))
+            login_get = client.get(
+                reverse("surface:portal-login"),
+                {"token": token},
+            )
+            login_post = client.post(
+                reverse("surface:portal-login"),
+                {"token": token},
+            )
+            portal_get = client.get(reverse("surface:portal"))
+            detail_get = client.get(
+                reverse(
+                    "surface:portal-project",
+                    kwargs={"project_pk": self.project.pk},
+                )
+            )
+            logout_post = client.post(reverse("surface:portal-logout"))
+
+        self.assertEqual(request_get.status_code, 200)
+        self.assertEqual(request_post.status_code, 302)
+        self.assertEqual(request_post.url, reverse("surface:portal-sent"))
+        self.assertEqual(sent_get.status_code, 200)
+        self.assertEqual(login_get.status_code, 200)
+        self.assertEqual(login_post.status_code, 302)
+        self.assertEqual(login_post.url, reverse("surface:portal"))
+        self.assertEqual(portal_get.status_code, 200)
+        self.assertEqual(detail_get.status_code, 200)
+        self.assertEqual(logout_post.status_code, 302)
+        self.assertEqual(logout_post.url, reverse("surface:portal-request"))
+        create_freelancer.assert_not_called()
+        ensure_freelancer_profile.assert_not_called()
+
+    def test_client_auth_has_no_forbidden_identity_imports(self):
+        """Portal auth and display modules cannot import freelancer identity code."""
+        for module in (client_auth, portal_views):
+            with self.subTest(module=module.__name__):
+                module_tree = ast.parse(inspect.getsource(module))
+                imported_names = {
+                    alias.name
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, (ast.Import, ast.ImportFrom))
+                    for alias in node.names
+                }
+                directly_imported_modules = {
+                    alias.name
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, ast.Import)
+                    for alias in node.names
+                }
+                dynamic_import_calls = [
+                    node
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "__import__"
+                ]
+                forbidden_dynamic_module_calls = [
+                    node
+                    for node in ast.walk(module_tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "importlib"
+                    and node.func.attr == "import_module"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value
+                    in {"django.contrib.auth", "surface.auth"}
+                ]
+
+                self.assertNotIn("get_or_create_freelancer", imported_names)
+                self.assertNotIn("ensure_profile", imported_names)
+                self.assertNotIn("Profile", imported_names)
+                self.assertNotIn("importlib", imported_names)
+                self.assertNotIn("import_module", imported_names)
+                self.assertNotIn("ledger.models", directly_imported_modules)
+                self.assertEqual(dynamic_import_calls, [])
+                self.assertEqual(forbidden_dynamic_module_calls, [])
+
+    def test_portal_and_project_token_namespaces_are_isolated_both_ways(self):
+        """No portal credential is accepted by any project-scoped purpose."""
+        portal_token = make_portal_token(self.email)
+        for purpose in ("review", "sign", "change_order"):
+            with self.subTest(purpose=purpose):
+                with self.assertRaises(signing.BadSignature):
+                    read_client_token(portal_token, purpose)
+
+        for purpose in ("review", "sign"):
+            with self.subTest(purpose=purpose):
+                with self.assertRaises(signing.BadSignature):
+                    read_portal_token(make_client_token(self.project, purpose))
+        change_order = ChangeOrder.objects.create(
+            project=self.project,
+            description="Portal isolation",
+            amount_cents=100,
+            timeline_days=1,
+        )
+        with self.assertRaises(signing.BadSignature):
+            read_portal_token(make_change_order_token(change_order))
+
+    def test_portal_token_salt_differs_from_every_project_purpose(self):
+        """The portal signer has a distinct namespace independent of payload shape."""
+        project_salts = {
+            f"surface.client.{purpose}" for purpose in CLIENT_TOKEN_PURPOSES
+        }
+        self.assertNotIn(PORTAL_TOKEN_SALT, project_salts)
+
+    def test_portal_token_rejects_invalid_nonce_shape(self):
+        """A portal-signed payload still requires a random 32-character nonce."""
+        token = signing.dumps(
+            {"email": self.email, "nonce": "too-short"},
+            salt=PORTAL_TOKEN_SALT,
+            compress=True,
+        )
+
+        with self.assertRaises(signing.BadSignature):
+            read_portal_token(token)
+
+    def test_portal_token_rejects_non_normalized_email(self):
+        """A portal-signed payload cannot carry mixed-case or padded identity."""
+        token = signing.dumps(
+            {"email": "Client@Example.COM", "nonce": "a" * 32},
+            salt=PORTAL_TOKEN_SALT,
+            compress=True,
+        )
+
+        with self.assertRaises(signing.BadSignature):
+            read_portal_token(token)
+
+    def test_portal_used_token_namespace_is_distinct_and_pinned(self):
+        """Portal consumption markers never share the freelancer namespace."""
+        self.assertEqual(
+            client_auth.PORTAL_LOGIN_USED_NAMESPACE,
+            "surface.portal-login.used",
+        )
+        self.assertNotEqual(
+            client_auth.PORTAL_LOGIN_USED_NAMESPACE,
+            MAGIC_LOGIN_USED_NAMESPACE,
+        )
+
+    def test_get_does_not_consume_and_post_consumes_portal_token_once(self):
+        """Scanner GETs are harmless and only the first confirmation POST succeeds."""
+        token = make_portal_token(self.email)
+        login_url = reverse("surface:portal-login")
+
+        get_response = Client().get(login_url, {"token": token})
+        self.assertContains(get_response, "Confirm your client portal access")
+
+        first_client = Client()
+        first_response = first_client.post(login_url, {"token": token})
+        self.assertRedirects(first_response, reverse("surface:portal"))
+
+        second_client = Client()
+        second_response = second_client.post(login_url, {"token": token})
+        self.assertContains(second_response, "no longer available")
+        self.assertNotIn(
+            client_auth.CLIENT_EMAIL_SESSION_KEY,
+            second_client.session,
+        )
+
+    def test_expired_portal_token_is_rejected(self):
+        """A portal link stops working after its one-hour lifetime."""
+        base_time = 1_700_000_000
+        with patch("django.core.signing.time.time", return_value=base_time):
+            token = make_portal_token(self.email)
+        with patch(
+            "django.core.signing.time.time",
+            return_value=base_time + PORTAL_TOKEN_MAX_AGE + 1,
+        ):
+            response = Client().get(
+                reverse("surface:portal-login"),
+                {"token": token},
+            )
+        self.assertContains(response, "no longer available")
+
+    @override_settings(**LOCMem_EMAIL)
+    def test_new_portal_link_after_consumption_is_usable(self):
+        """A consumed link does not prevent a fresh request and confirmation."""
+        first_token = make_portal_token(self.email)
+        client_auth.read_and_consume_portal_token(first_token)
+
+        request_client = Client()
+        request_client.post(
+            reverse("surface:portal-request"),
+            {"email": self.email},
+        )
+        parsed = urlparse(mail.outbox[0].body.splitlines()[0])
+        query = parsed.query
+        second_token = query.partition("token=")[2]
+        from urllib.parse import unquote
+
+        second_token = unquote(second_token)
+        self.assertNotEqual(second_token, first_token)
+        self.assertEqual(
+            client_auth.read_and_consume_portal_token(second_token),
+            self.email,
+        )
+
+    @override_settings(DEBUG=False, **LOCMem_EMAIL)
+    def test_unknown_draft_only_and_limited_requests_have_enumeration_parity(self):
+        """Every valid request has identical visible status, messages, and sent page."""
+        draft = make_draft_project(owner=self.owner)
+        draft.client_email = "draft-only@example.com"
+        draft.save(update_fields=["client_email"])
+        limited_project = make_draft_project(owner=self.owner)
+        limited_project.client_email = "limited-client@example.com"
+        limited_project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(limited_project)
+        for _request_number in range(client_auth.PORTAL_REQUEST_LIMIT):
+            client_auth.portal_link_request_allowed(limited_project.client_email)
+
+        def visible_outcome(email):
+            """Return all user-visible channels for one portal request."""
+            request_client = Client()
+            response = request_client.post(
+                reverse("surface:portal-request"),
+                {"email": email},
+            )
+            visible_messages = tuple(
+                (message.level, message.message, message.tags)
+                for message in get_messages(response.wsgi_request)
+            )
+            sent_response = request_client.get(reverse("surface:portal-sent"))
+            return (
+                response.status_code,
+                response.url,
+                visible_messages,
+                sent_response.status_code,
+                sent_response.content,
+            )
+
+        unknown_outcome = visible_outcome("unknown@example.com")
+        draft_outcome = visible_outcome(draft.client_email)
+        limited_outcome = visible_outcome(limited_project.client_email)
+        successful_outcome = visible_outcome(self.email)
+
+        self.assertEqual(unknown_outcome, successful_outcome)
+        self.assertEqual(draft_outcome, successful_outcome)
+        self.assertEqual(limited_outcome, successful_outcome)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_server_timestamp_expires_session_while_cookie_remains_valid(self):
+        """Absolute client expiry does not rely on Django's sliding cookie age."""
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp() - client_auth.CLIENT_SESSION_MAX_AGE - 1
+        )
+        session["unrelated_session_value"] = "preserved"
+        session.save()
+
+        response = client.get(reverse("surface:portal"))
+
+        self.assertRedirects(
+            response,
+            reverse("surface:portal-request"),
+            fetch_redirect_response=False,
+        )
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+        self.assertEqual(client.session["unrelated_session_value"], "preserved")
+
+    def test_successful_reads_do_not_slide_absolute_session_cutoff(self):
+        """Activity preserves verification time and cannot extend the original cutoff."""
+        client = Client()
+        current_time = timezone.now()
+        original_verified_at = (
+            current_time.timestamp() - client_auth.CLIENT_SESSION_MAX_AGE + 60
+        )
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = original_verified_at
+        session.save()
+
+        with patch("surface.client_auth.timezone.now", return_value=current_time):
+            active_response = client.get(reverse("surface:portal"))
+
+        self.assertEqual(active_response.status_code, 200)
+        self.assertEqual(
+            client.session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY],
+            original_verified_at,
+        )
+
+        after_original_cutoff = current_time + timedelta(seconds=61)
+        with patch(
+            "surface.client_auth.timezone.now",
+            return_value=after_original_cutoff,
+        ):
+            expired_response = client.get(reverse("surface:portal"))
+
+        self.assertEqual(expired_response.status_code, 302)
+        self.assertEqual(expired_response.url, reverse("surface:portal-request"))
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_expired_client_identity_is_hidden_without_context_mutation(self):
+        """The header hides an expired client while pure context lookup preserves it."""
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp() - client_auth.CLIENT_SESSION_MAX_AGE - 1
+        )
+        session.save()
+
+        response = client.get(reverse("surface:portal-request"))
+
+        self.assertNotContains(response, 'data-identity="client"')
+        self.assertNotContains(response, self.email)
+        self.assertEqual(
+            client.session[client_auth.CLIENT_EMAIL_SESSION_KEY],
+            self.email,
+        )
+        self.assertIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_portal_lists_case_insensitive_matches_without_drafts(self):
+        """A client sees all and only matching non-draft projects across owners."""
+        other_owner = make_profile(handle="second-portal-owner")
+        second_project = make_draft_project(owner=other_owner)
+        second_project.title = "Second freelancer project"
+        second_project.client_email = self.email
+        second_project.save(update_fields=["title", "client_email"])
+        submit_criteria_for_approval(second_project)
+        hidden_draft = make_draft_project(owner=other_owner)
+        hidden_draft.title = "Private draft"
+        hidden_draft.client_email = self.email
+        hidden_draft.save(update_fields=["title", "client_email"])
+        foreign_project = make_draft_project(owner=other_owner)
+        foreign_project.title = "Different client"
+        foreign_project.client_email = "other@example.com"
+        foreign_project.save(update_fields=["title", "client_email"])
+        submit_criteria_for_approval(foreign_project)
+        client = Client()
+        self.establish_portal_session(client, "CLIENT@EXAMPLE.COM")
+
+        response = client.get(reverse("surface:portal"))
+
+        self.assertContains(response, self.project.title)
+        self.assertContains(response, "Portal Freelancer")
+        self.assertContains(response, second_project.title)
+        self.assertNotContains(response, hidden_draft.title)
+        self.assertNotContains(response, foreign_project.title)
+
+    def test_client_sign_out_preserves_freelancer_and_billing_session(self):
+        """Client sign-out removes two client keys and leaves the other hat intact."""
+        client = Client()
+        login_as(client, self.owner)
+        self.establish_portal_session(client)
+
+        response = client.post(reverse("surface:portal-logout"))
+
+        self.assertRedirects(response, reverse("surface:portal-request"))
+        self.assertIn("_auth_user_id", client.session)
+        self.assertTrue(client.session[billing._PRO_SESSION_KEY])
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_freelancer_logout_flushes_client_session(self):
+        """Freelancer logout intentionally ends both identities in one browser."""
+        client = Client()
+        login_as(client, self.owner)
+        self.establish_portal_session(client)
+
+        response = client.post(reverse("surface:logout"))
+
+        self.assertRedirects(response, reverse("surface:login-request"))
+        self.assertNotIn("_auth_user_id", client.session)
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+
+    def test_switching_freelancers_flushes_existing_client_session(self):
+        """Django deliberately flushes client state when login changes user identity."""
+        client = Client()
+        self.establish_portal_session(client)
+        original_verified_at = client.session[
+            client_auth.CLIENT_VERIFIED_AT_SESSION_KEY
+        ]
+        first_token = make_magic_login_token(self.owner.user)
+
+        first_response = client.post(
+            reverse("surface:magic-login"),
+            {"token": first_token},
+        )
+
+        self.assertRedirects(
+            first_response,
+            reverse("surface:project-list"),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(int(client.session["_auth_user_id"]), self.owner.user_id)
+        self.assertEqual(
+            client.session[client_auth.CLIENT_EMAIL_SESSION_KEY],
+            self.email,
+        )
+        self.assertEqual(
+            client.session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY],
+            original_verified_at,
+        )
+
+        second_owner = make_profile(
+            handle="second-login-owner",
+            email="second-login-owner@example.com",
+        )
+        second_token = make_magic_login_token(second_owner.user)
+        second_response = client.post(
+            reverse("surface:magic-login"),
+            {"token": second_token},
+        )
+
+        self.assertRedirects(
+            second_response,
+            reverse("surface:project-list"),
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(int(client.session["_auth_user_id"]), second_owner.user_id)
+        self.assertNotIn(client_auth.CLIENT_EMAIL_SESSION_KEY, client.session)
+        self.assertNotIn(client_auth.CLIENT_VERIFIED_AT_SESSION_KEY, client.session)
+
+    def test_two_identity_strips_render_distinctly_with_both_emails(self):
+        """The two-hats header labels freelancer and client identity separately."""
+        client = Client()
+        login_as(client, self.owner)
+        self.establish_portal_session(client)
+
+        response = client.get(reverse("surface:portal"))
+
+        self.assertContains(response, 'data-identity="freelancer"')
+        self.assertContains(response, 'data-identity="client"')
+        self.assertContains(response, self.owner.user.email)
+        self.assertContains(response, self.email)
+
+    def test_portal_login_rotates_session_without_losing_freelancer(self):
+        """Client verification closes fixation while retaining an authenticated user."""
+        client = Client()
+        login_as(client, self.owner)
+        old_session_key = client.session.session_key
+        token = make_portal_token(self.email)
+
+        response = client.post(
+            reverse("surface:portal-login"),
+            {"token": token},
+        )
+
+        self.assertRedirects(response, reverse("surface:portal"))
+        self.assertNotEqual(client.session.session_key, old_session_key)
+        self.assertEqual(int(client.session["_auth_user_id"]), self.owner.user_id)
+
+    def test_live_project_client_email_cannot_be_edited(self):
+        """The portal identity dependency fails if live project edits are widened."""
+        client = Client()
+        login_as(client, self.owner)
+        original_email = self.project.client_email
+
+        response = client.post(
+            reverse(
+                "surface:project-update",
+                kwargs={"project_pk": self.project.pk},
+            ),
+            project_form_data(client_email="intruder@example.com"),
+        )
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.project.client_email, original_email)
+
+    def test_action_email_body_keeps_action_first_and_adds_portal_discovery(self):
+        """All three action email types append the plain portal request URL."""
+        from surface.views import _with_portal_discovery
+
+        request = RequestFactory().get("/")
+        request.META["HTTP_HOST"] = "testserver"
+        action_url = "http://testserver/client/review/action-token/"
+
+        body = _with_portal_discovery(request, action_url)
+
+        self.assertEqual(body.splitlines()[0], action_url)
+        self.assertIn("http://testserver/portal/login/", body.splitlines()[-1])
+
+    @override_settings(
+        DEBUG=True,
+        EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend",
+    )
+    def test_console_portal_request_exposes_one_time_dev_link(self):
+        """DEBUG console delivery provides a one-click QP-safe portal URL."""
+        client = Client()
+        response = client.post(
+            reverse("surface:portal-request"),
+            {"email": self.email},
+            follow=True,
+        )
+
+        self.assertContains(response, "Continue to client portal")
+        self.assertContains(response, "/portal/login/confirm/?token=")
+        second_response = client.get(reverse("surface:portal-sent"))
+        self.assertNotContains(second_response, "Continue to client portal")
+
+    @override_settings(DEBUG=True)
+    def test_quoted_printable_portal_token_is_repaired_in_debug(self):
+        """Portal confirmation shares the console token repair primitive."""
+        token = make_portal_token(self.email)
+        mangled = "3D" + token[:20] + "=" + token[20:]
+
+        response = Client().get(
+            reverse("surface:portal-login"),
+            {"token": mangled},
+        )
+
+        self.assertContains(response, "Confirm your client portal access")
+
+
+class ClientPortalProjectViewTests(TestCase):
+    """Read-only client project detail, progress, and signed-record replay."""
+
+    def setUp(self):
+        """Create one submitted project and a verified matching client session."""
+        self.owner = make_profile(handle="portal-detail-owner")
+        self.project = make_draft_project(owner=self.owner)
+        self.project.client_email = "portal-detail@example.com"
+        self.project.brief = "Client-readable project brief"
+        self.project.save(update_fields=["client_email", "brief"])
+        submit_criteria_for_approval(self.project)
+        self.project.refresh_from_db()
+        self.client = Client()
+        session = self.client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = "PORTAL-DETAIL@example.com"
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+
+    def detail_url(self, project=None):
+        """Return the portal detail URL for one project."""
+        return reverse(
+            "surface:portal-project",
+            kwargs={"project_pk": (project or self.project).pk},
+        )
+
+    @staticmethod
+    def portal_detail_markup(response):
+        """Return only the read-only project article, excluding global navigation."""
+        content = response.content.decode()
+        start = content.index('<article id="portal-project-detail">')
+        end = content.index("</article>", start) + len("</article>")
+        return content[start:end]
+
+    @staticmethod
+    def signed_record_markup(response):
+        """Return only the frozen signed-record section."""
+        return response.content.decode().split(
+            '<section class="card signed-record" data-signed-record>',
+            1,
+        )[1].split("</section>", 1)[0]
+
+    @staticmethod
+    def delivery_item_markup_from_content(content, item_text):
+        """Return shared delivery-row markup surrounding one criterion."""
+        item_position = content.index(item_text)
+        start = content.rfind("<li data-delivery-item>", 0, item_position)
+        end = content.index("</li>", item_position) + len("</li>")
+        return content[start:end]
+
+    @classmethod
+    def delivery_item_markup(cls, response, item_text):
+        """Return shared delivery-row markup from a full response."""
+        return cls.delivery_item_markup_from_content(
+            response.content.decode(),
+            item_text,
+        )
+
+    @staticmethod
+    def status_badge_text(markup):
+        """Extract exactly one client-facing status badge's text."""
+        match = re.search(r'<span class="badge(?: failed)?">([^<]+)</span>', markup)
+        if match is None:
+            raise AssertionError("Client-facing status badge was not rendered.")
+        return match.group(1).strip()
+
+    def assert_checklist_mode(self, response, *, live, signed):
+        """Assert exactly the authoritative checklist mode expected for a status."""
+        detail_markup = self.portal_detail_markup(response)
+        live_count = detail_markup.count("<h2>Scope and progress</h2>")
+        signed_count = detail_markup.count("<h2>Signed delivery record</h2>")
+        self.assertEqual(live_count, int(live))
+        self.assertEqual(signed_count, int(signed))
+        self.assertEqual(live_count + signed_count, 1)
+
+    def test_other_client_and_draft_projects_return_404(self):
+        """Project existence is hidden from foreign clients and for private drafts."""
+        foreign_project = make_draft_project(owner=self.owner)
+        foreign_project.client_email = "someone-else@example.com"
+        foreign_project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(foreign_project)
+        private_draft = make_draft_project(owner=self.owner)
+        private_draft.client_email = "portal-detail@example.com"
+        private_draft.save(update_fields=["client_email"])
+
+        foreign_response = self.client.get(self.detail_url(foreign_project))
+        draft_response = self.client.get(self.detail_url(private_draft))
+
+        self.assertEqual(foreign_response.status_code, 404)
+        self.assertEqual(draft_response.status_code, 404)
+
+    def test_all_client_statuses_use_consistent_plain_language(self):
+        """List and detail render every visible status with the same client wording."""
+        expected_labels = {
+            Project.Status.CRITERIA_PENDING: "Awaiting your approval",
+            Project.Status.ACTIVE: "Work in progress",
+            Project.Status.DELIVERED: "Delivered — awaiting your signature",
+            Project.Status.ATTESTED: "Signed",
+            Project.Status.DISPUTED: "Disputed",
+        }
+        for status, label in expected_labels.items():
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                detail_response = self.client.get(self.detail_url())
+                list_response = self.client.get(reverse("surface:portal"))
+
+                self.assertEqual(detail_response.status_code, 200)
+                detail_badge = self.status_badge_text(
+                    self.portal_detail_markup(detail_response)
+                )
+                list_content = list_response.content.decode()
+                row_start = list_content.index('<a class="portal-project-row"')
+                row_end = list_content.index("</a>", row_start)
+                list_badge = self.status_badge_text(
+                    list_content[row_start:row_end]
+                )
+                self.assertEqual(detail_badge, label)
+                self.assertEqual(list_badge, label)
+                self.assertEqual(detail_badge, list_badge)
+
+    def test_detail_shows_scope_live_steps_and_change_order_history(self):
+        """Active detail exposes client-visible scope, progress, and prior changes."""
+        approve_criteria(self.project)
+        self.project.refresh_from_db()
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Completed granular step",
+            order=1,
+            is_done=True,
+        )
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Outstanding granular step",
+            order=2,
+            is_done=False,
+        )
+        AcceptanceItem.objects.create(
+            project=self.project,
+            text="Private freelancer draft criterion",
+            order=2,
+            state=AcceptanceItem.State.DRAFT,
+        )
+        ChangeOrder.objects.create(
+            project=self.project,
+            description="Approved reporting extension",
+            amount_cents=12000,
+            timeline_days=3,
+            status=ChangeOrder.Status.APPROVED,
+            resolved_at=timezone.now(),
+        )
+
+        response = self.client.get(self.detail_url())
+
+        self.assertContains(response, self.project.brief)
+        self.assertContains(response, item.text)
+        self.assertContains(response, "Completed granular step")
+        self.assertContains(response, "Outstanding granular step")
+        self.assertContains(response, "Done")
+        self.assertContains(response, "Not done")
+        self.assertContains(response, "Approved reporting extension")
+        self.assertContains(response, "Approved")
+        self.assertNotContains(response, "Private freelancer draft criterion")
+
+    def test_delivery_rows_render_identically_on_sign_and_portal_surfaces(self):
+        """Shared partial matches unsigned live scope and signed payload replay."""
+        approve_criteria(self.project)
+        self.project.refresh_from_db()
+        parked_item = AcceptanceItem.objects.create(
+            project=self.project,
+            text="Shared suspended criterion",
+            order=2,
+            state=AcceptanceItem.State.SUSPENDED,
+            submitted_at=timezone.now(),
+            approved_at=timezone.now(),
+            is_passed=False,
+        )
+        AcceptanceStep.objects.create(
+            item=parked_item,
+            text="Shared unfinished step",
+            order=1,
+            is_done=False,
+        )
+        self.project.acceptance_items.filter(
+            state=AcceptanceItem.State.APPROVED
+        ).update(is_passed=True)
+        mark_delivered(self.project)
+        self.project.refresh_from_db()
+        token = make_client_token(self.project, "sign")
+
+        sign_response = Client().get(
+            reverse("surface:client-sign", kwargs={"token": token})
+        )
+        delivered_portal_response = self.client.get(self.detail_url())
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        Attestation.objects.create(
+            project=self.project,
+            payload={
+                "acceptance_items": [
+                    {
+                        "text": parked_item.text,
+                        "state": AcceptanceItem.State.SUSPENDED,
+                        "is_passed": False,
+                        "evidence_url": "",
+                        "steps": [
+                            {"text": "Shared unfinished step", "is_done": False}
+                        ],
+                    }
+                ]
+            },
+            payload_hash="a" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Parity Signer",
+            signature_meta={},
+        )
+        portal_response = self.client.get(self.detail_url())
+        sign_markup = self.delivery_item_markup(sign_response, parked_item.text)
+
+        self.assertEqual(
+            sign_markup,
+            self.delivery_item_markup(
+                delivered_portal_response,
+                parked_item.text,
+            ),
+        )
+        self.assertEqual(
+            sign_markup,
+            self.delivery_item_markup_from_content(
+                self.signed_record_markup(portal_response),
+                parked_item.text,
+            ),
+        )
+
+    def test_signed_record_replays_frozen_payload_not_live_rows(self):
+        """Signed checklist comes from immutable payload even if live rows differ."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        live_item = self.project.acceptance_items.get()
+        live_item.text = "Changed live criterion after signing"
+        live_item.is_passed = False
+        live_item.save(update_fields=["text", "is_passed"])
+        frozen_text = "Frozen criterion the client signed"
+        frozen_step = "Frozen signed step"
+        signed_at = datetime(2026, 3, 14, 9, 26, tzinfo=UTC)
+        attestation = Attestation.objects.create(
+            project=self.project,
+            payload={
+                "acceptance_items": [
+                    {
+                        "text": frozen_text,
+                        "state": "approved",
+                        "is_passed": True,
+                        "evidence_url": "",
+                        "steps": [{"text": frozen_step, "is_done": True}],
+                    }
+                ]
+            },
+            payload_hash="f" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Frozen Signer",
+            signed_at=signed_at,
+            signature_meta={},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assert_checklist_mode(response, live=False, signed=True)
+        self.assertIn(frozen_text, signed_markup)
+        self.assertIn(frozen_step, signed_markup)
+        self.assertNotIn(live_item.text, signed_markup)
+        self.assertNotIn(live_item.text, self.portal_detail_markup(response))
+        self.assertIn("<strong>Passed</strong>", signed_markup)
+        self.assertNotIn("<strong>Not passed</strong>", signed_markup)
+        self.assertIn(attestation.payload_hash, signed_markup)
+        self.assertIn("Mar 14, 2026, 9:26 AM UTC", signed_markup)
+
+    def test_signed_record_explains_hash_fingerprint(self):
+        """Signed detail explains the intact copyable hash in client language."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        payload_hash = "e" * 64
+        Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": []},
+            payload_hash=payload_hash,
+            client_email=self.project.client_email,
+            client_name_typed="Hash Explanation Signer",
+            signature_meta={},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assertIn(
+            "This is a fingerprint of the exact record you signed; if any detail "
+            "is altered, the fingerprint changes so the record can be checked later.",
+            signed_markup,
+        )
+        self.assertIn(
+            f'<span class="break-word record-hash">{payload_hash}</span>',
+            signed_markup,
+        )
+
+    def test_legacy_signed_payload_missing_item_fields_renders_safely(self):
+        """Legacy checklist items without newer keys remain readable."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        legacy_text = "Legacy frozen criterion"
+        Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": [{"text": legacy_text}]},
+            payload_hash="b" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Legacy Signer",
+            signature_meta={},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(legacy_text, signed_markup)
+        self.assertIn("<strong>No result recorded</strong>", signed_markup)
+        self.assertNotIn("excluded from this delivery", signed_markup)
+
+    def test_portal_replays_current_amendment_not_superseded_record(self):
+        """Portal selects the current amendment at the signed-record call site."""
+        approve_criteria(self.project)
+        self.project.refresh_from_db()
+        item = self.project.acceptance_items.get()
+        item.is_passed = True
+        item.save(update_fields=["is_passed"])
+        mark_delivered(self.project)
+        original = sign_attestation(
+            self.project,
+            self.project.client_email,
+            "Original Signer",
+            {},
+        )
+        amended_text = "Criterion frozen in current amendment"
+        AcceptanceItem.objects.filter(pk=item.pk).update(text=amended_text)
+        amendment = amend_attestation(
+            original,
+            self.project.client_email,
+            "Amendment Signer",
+            {},
+        )
+
+        response = self.client.get(self.detail_url())
+        signed_markup = self.signed_record_markup(response)
+
+        self.assertIn(amended_text, signed_markup)
+        self.assertIn(amendment.payload_hash, signed_markup)
+        self.assertNotIn(original.payload_hash, signed_markup)
+        self.assertNotIn(original.payload["acceptance_items"][0]["text"], signed_markup)
+
+    def test_detail_query_count_is_flat_across_multiple_items(self):
+        """Detail prefetches step rows instead of querying once per criterion."""
+        AcceptanceItem.objects.create(
+            project=self.project,
+            text="Second submitted criterion",
+            order=2,
+            state=AcceptanceItem.State.SUBMITTED,
+            submitted_at=timezone.now(),
+        )
+
+        with self.assertNumQueries(6):
+            response = self.client.get(self.detail_url())
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_unsigned_statuses_show_live_scope_without_signed_record(self):
+        """Pending, active, and delivered projects retain the live progress view."""
+        for status in (
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+            Project.Status.DELIVERED,
+        ):
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                response = self.client.get(self.detail_url())
+
+                self.assert_checklist_mode(response, live=True, signed=False)
+
+    def test_every_visible_status_renders_exactly_one_checklist(self):
+        """No client-visible status can render live and signed checklists together."""
+        for status in (
+            Project.Status.CRITERIA_PENDING,
+            Project.Status.ACTIVE,
+            Project.Status.DELIVERED,
+        ):
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                response = self.client.get(self.detail_url())
+                self.assert_checklist_mode(response, live=True, signed=False)
+
+        Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": []},
+            payload_hash="c" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Checklist Mode Signer",
+            signature_meta={},
+        )
+        for status in (Project.Status.ATTESTED, Project.Status.DISPUTED):
+            with self.subTest(status=status):
+                Project.objects.filter(pk=self.project.pk).update(status=status)
+                response = self.client.get(self.detail_url())
+                self.assert_checklist_mode(response, live=False, signed=True)
+
+    def test_disputed_project_is_explicitly_labelled_not_clean(self):
+        """Disputed signed work carries both status and non-clean warning."""
+        clean_response = self.client.get(self.detail_url())
+        self.assertNotContains(
+            clean_response,
+            "not presented as a clean attestation",
+        )
+        self.assertNotContains(clean_response, 'class="dispute-notice"', html=False)
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.DISPUTED
+        )
+        Attestation.objects.create(
+            project=self.project,
+            payload={
+                "acceptance_items": [
+                    {
+                        "text": "Disputed frozen criterion",
+                        "state": "approved",
+                        "is_passed": True,
+                        "steps": [],
+                    }
+                ]
+            },
+            payload_hash="d" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Disputed Signer",
+            signature_meta={},
+            is_disputed=True,
+            disputed_at=timezone.now(),
+        )
+
+        response = self.client.get(self.detail_url())
+
+        self.assert_checklist_mode(response, live=False, signed=True)
+        self.assertContains(response, "Disputed")
+        self.assertContains(response, "not presented as a clean attestation")
+        self.assertContains(response, 'class="dispute-notice"', html=False)
+
+    def test_detail_has_no_mutating_controls_and_rejects_post(self):
+        """I3b exposes no project action while POST remains unsupported."""
+        response = self.client.get(self.detail_url())
+        detail_markup = self.portal_detail_markup(response)
+
+        self.assertNotIn("<form", detail_markup)
+        self.assertNotIn("<button", detail_markup)
+        action_links = re.findall(
+            r"<a\b[^>]*>.*?</a>",
+            detail_markup,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for link_markup in action_links:
+            with self.subTest(link=link_markup):
+                self.assertNotRegex(
+                    link_markup,
+                    r'class="[^"]*\bbutton\b',
+                )
+                self.assertNotRegex(
+                    link_markup,
+                    r">\s*[^<]*(?:Confirm|Approve|Sign)\b",
+                )
+        post_response = self.client.post(self.detail_url())
+        self.assertEqual(post_response.status_code, 405)
+
+
+class PortalConsentActionTests(TestCase):
+    """Portal approval and signing through the shared consent seam."""
+
+    def setUp(self):
+        """Create submitted scope and a matching verified client session."""
+        self.owner = make_profile(handle="portal-consent-owner")
+        self.project = make_draft_project(owner=self.owner)
+        self.project.client_email = "Portal-Consent@Example.COM"
+        self.project.save(update_fields=["client_email"])
+        submit_criteria_for_approval(self.project)
+        self.project.refresh_from_db()
+        self.client = Client()
+        self.client_email = "portal-consent@example.com"
+        session = self.client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = self.client_email
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = (
+            timezone.now().timestamp()
+        )
+        session.save()
+
+    def approve_url(self):
+        """Return the session-authenticated approval URL."""
+        return reverse(
+            "surface:portal-approve",
+            kwargs={"project_pk": self.project.pk},
+        )
+
+    def sign_url(self):
+        """Return the session-authenticated signing URL."""
+        return reverse(
+            "surface:portal-sign",
+            kwargs={"project_pk": self.project.pk},
+        )
+
+    def approval_fingerprint(self):
+        """Render portal approval and return its current hidden fingerprint."""
+        response = self.client.get(self.approve_url())
+        return response.context["approval_form"]["batch_fingerprint"].value()
+
+    def create_fixed_signed_attestation(self):
+        """Create a stable signed record for portal presentation assertions."""
+        Project.objects.filter(pk=self.project.pk).update(
+            status=Project.Status.ATTESTED
+        )
+        return Attestation.objects.create(
+            project=self.project,
+            payload={"acceptance_items": []},
+            payload_hash="9" * 64,
+            client_email=self.project.client_email,
+            client_name_typed="Portal Confirmation Client",
+            signed_at=datetime(2026, 3, 14, 9, 26, tzinfo=UTC),
+            signature_meta={},
+        )
+
+    def test_portal_approval_accepts_exact_batch_and_activates_project(self):
+        """The session doorway approves the rendered batch through shared logic."""
+        response = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": self.approval_fingerprint()},
+        )
+
+        self.project.refresh_from_db()
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Scope approved")
+        self.assertEqual(self.project.status, Project.Status.ACTIVE)
+        self.assertFalse(
+            self.project.acceptance_items.exclude(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_portal_approval_rejects_stale_fingerprint_without_mutation(self):
+        """A stale session form re-renders current scope and commits nothing."""
+        response = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": "0" * 64},
+        )
+
+        self.project.refresh_from_db()
+        self.assertContains(response, "changed after this page was shown")
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_portal_approval_empty_batch_never_calls_ledger(self):
+        """A handled empty batch is distinct from stale scope and stays inert."""
+        approve_criteria(self.project)
+        with (
+            patch("surface.consent.services.approve_acceptance_items") as approve_items,
+            patch("surface.consent.services.approve_criteria") as approve_project,
+        ):
+            response = self.client.post(
+                self.approve_url(),
+                {"batch_fingerprint": "0" * 64},
+            )
+
+        approve_items.assert_not_called()
+        approve_project.assert_not_called()
+        self.assertContains(response, "No criteria are currently awaiting approval.")
+        self.assertContains(response, "These criteria have already been handled.")
+        self.assertNotContains(response, "changed after this page was shown")
+
+    def test_portal_approval_invalid_form_empty_batch_uses_only_stale_framing(self):
+        """An invalid replay does not call an empty batch already handled too."""
+        approve_criteria(self.project)
+
+        response = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": ""},
+        )
+
+        self.assertContains(response, "changed after this page was shown")
+        self.assertContains(response, "No criteria are currently awaiting approval.")
+        self.assertNotContains(response, "These criteria have already been handled.")
+
+    def test_portal_approval_rolls_back_items_when_activation_fails(self):
+        """The shared savepoint prevents a partially approved session batch."""
+        fingerprint = self.approval_fingerprint()
+        with patch(
+            "surface.consent.services.approve_criteria",
+            side_effect=InvalidTransition("status changed"),
+        ):
+            response = self.client.post(
+                self.approve_url(),
+                {"batch_fingerprint": fingerprint},
+            )
+
+        self.project.refresh_from_db()
+        self.assertContains(response, "changed after this page was shown")
+        self.assertEqual(self.project.status, Project.Status.CRITERIA_PENDING)
+        self.assertFalse(
+            self.project.acceptance_items.filter(
+                state=AcceptanceItem.State.APPROVED
+            ).exists()
+        )
+
+    def test_portal_sign_rejects_mismatched_verified_email_with_404(self):
+        """A session for another email cannot reach the signing service."""
+        advance_to_delivered(self.project)
+        session = self.client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = "other-client@example.com"
+        session.save()
+
+        with patch("surface.consent.services.sign_attestation") as sign_record:
+            response = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Wrong Client", "confirm": "on"},
+            )
+
+        self.assertEqual(response.status_code, 404)
+        sign_record.assert_not_called()
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertFalse(self.project.attestations.exists())
+
+    def test_portal_sign_records_project_client_email_exactly(self):
+        """Portal and token signing preserve the same project email spelling."""
+        advance_to_delivered(self.project)
+        sign_token = make_client_token(self.project, "sign")
+        token_attestation = Attestation(
+            project=self.project,
+            payload_hash="a" * 64,
+            signed_at=timezone.now(),
+        )
+        with patch(
+            "surface.consent.services.sign_attestation",
+            return_value=token_attestation,
+        ) as sign_record:
+            token_response = Client().post(
+                reverse("surface:client-sign", kwargs={"token": sign_token}),
+                {"signature_name": "Token Client", "confirm": "on"},
+            )
+        token_client_email = sign_record.call_args.kwargs["client_email"]
+
+        response = self.client.post(
+            self.sign_url(),
+            {"signature_name": "Portal Client", "confirm": "on"},
+        )
+
+        self.project.refresh_from_db()
+        attestation = self.project.attestations.get(is_current=True)
+        self.assertEqual(token_response.status_code, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signature recorded")
+        self.assertEqual(self.project.status, Project.Status.ATTESTED)
+        self.assertEqual(token_client_email, self.project.client_email)
+        self.assertEqual(attestation.client_email, self.project.client_email)
+        self.assertEqual(attestation.client_email, token_client_email)
+
+    def test_portal_signed_confirmation_explains_hash_and_signature_time(self):
+        """Post-signing confirmation presents readable trust-anchor metadata."""
+        attestation = self.create_fixed_signed_attestation()
+
+        response = self.client.get(self.sign_url())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, attestation.payload_hash)
+        self.assertContains(response, "Mar 14, 2026, 9:26 AM UTC")
+        self.assertContains(
+            response,
+            "This is a fingerprint of the exact record you signed; if any detail "
+            "is altered, the fingerprint changes so the record can be checked later.",
+        )
+
+    def test_signed_surfaces_share_identical_trust_anchor_partial(self):
+        """Confirmation and detail render trust metadata from one partial."""
+        self.create_fixed_signed_attestation()
+
+        signed_response = self.client.get(self.sign_url())
+        detail_response = self.client.get(
+            reverse(
+                "surface:portal-project",
+                kwargs={"project_pk": self.project.pk},
+            )
+        )
+
+        def trust_anchor_markup(response):
+            """Extract the shared signed-record metadata block."""
+            content = response.content.decode()
+            start = content.index("<dl data-signed-record-meta>")
+            end = content.index("</dl>", start) + len("</dl>")
+            return content[start:end]
+
+        include_tag = (
+            '{% include "surface/partials/signed_record_meta.html" '
+            "with attestation=attestation only %}"
+        )
+        signed_template = (
+            settings.BASE_DIR / "templates" / "surface" / "portal" / "signed.html"
+        ).read_text(encoding="utf-8")
+        detail_template = (
+            settings.BASE_DIR / "templates" / "surface" / "portal" / "detail.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertEqual(
+            trust_anchor_markup(signed_response),
+            trust_anchor_markup(detail_response),
+        )
+        self.assertIn(include_tag, signed_template)
+        self.assertIn(include_tag, detail_template)
+
+    def test_portal_sign_lost_race_renders_recovery_without_dead_form(self):
+        """A signing transition race explains the change and links back."""
+        advance_to_delivered(self.project)
+        with patch(
+            "surface.consent.services.sign_attestation",
+            side_effect=InvalidTransition("status changed"),
+        ):
+            response = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Portal Client", "confirm": "on"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signing status changed")
+        self.assertContains(response, "changed while you were signing")
+        self.assertContains(response, "Return to project")
+        self.assertNotContains(response, "Type your full name")
+        self.assertNotContains(response, ">Sign delivery record</button>", html=False)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.DELIVERED)
+        self.assertFalse(self.project.attestations.exists())
+
+    def test_portal_sign_lost_race_shows_concurrently_signed_record(self):
+        """A completed signature race resolves to the successful signed record."""
+        advance_to_delivered(self.project)
+        concurrent_attestations = []
+
+        def finish_signature_first(**_kwargs):
+            """Complete the competing signature, then report the stale attempt."""
+            concurrent_attestations.append(
+                sign_attestation(
+                    self.project,
+                    self.project.client_email,
+                    "Concurrent Portal Client",
+                    {},
+                )
+            )
+            raise InvalidTransition("another signature completed")
+
+        with patch(
+            "surface.consent.services.sign_attestation",
+            side_effect=finish_signature_first,
+        ):
+            response = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Stale Portal Client", "confirm": "on"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Signature recorded")
+        self.assertContains(response, concurrent_attestations[0].payload_hash)
+        self.assertNotContains(response, "Signing status changed")
+        self.assertNotContains(response, "Type your full name")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.status, Project.Status.ATTESTED)
+        self.assertEqual(self.project.attestations.count(), 1)
+
+    def test_portal_sign_uses_shared_delivery_row_with_prominent_warning(self):
+        """Portal signing keeps outstanding work attached to its criterion."""
+        item = self.project.acceptance_items.get()
+        AcceptanceStep.objects.create(
+            item=item,
+            text="Portal outstanding signing step",
+            order=1,
+            is_done=False,
+        )
+        advance_to_delivered(self.project)
+
+        response = self.client.get(self.sign_url())
+        content = response.content.decode()
+        criterion_position = content.index(item.text)
+        warning_position = content.index('class="outstanding-steps-notice"')
+        result_position = content.index("<strong>Passed</strong>")
+        template = (
+            settings.BASE_DIR / "templates" / "surface" / "portal" / "sign.html"
+        ).read_text(encoding="utf-8")
+        stylesheet = (
+            settings.BASE_DIR / "static" / "css" / "app.css"
+        ).read_text(encoding="utf-8")
+        prominence_rule = stylesheet.split(
+            ".portal-signing-page .outstanding-steps-notice {",
+            1,
+        )[1].split("}", 1)[0]
+
+        self.assertContains(
+            response,
+            'class="outstanding-steps-notice" role="alert"',
+        )
+        self.assertContains(response, 'class="narrow portal-signing-page"')
+        self.assertContains(response, "Portal outstanding signing step")
+        self.assertLess(criterion_position, warning_position)
+        self.assertLess(warning_position, result_position)
+        self.assertIn(
+            '{% include "surface/partials/delivery_row.html" with row=row only %}',
+            template,
+        )
+        self.assertIn("border-width: 3px", prominence_rule)
+        self.assertIn("box-shadow:", prominence_rule)
+        self.assertIn("font-size: 1.05rem", prominence_rule)
+
+    def test_new_portal_routes_preserve_identity_row_counts(self):
+        """Every new action route remains account-free on GET and POST."""
+        login_as(self.client, self.owner)
+        user_count = get_user_model().objects.count()
+        profile_count = Profile.objects.count()
+
+        approve_get = self.client.get(self.approve_url())
+        approve_post = self.client.post(
+            self.approve_url(),
+            {"batch_fingerprint": "0" * 64},
+        )
+        advance_to_delivered(self.project)
+        sign_get = self.client.get(self.sign_url())
+        sign_post = self.client.post(
+            self.sign_url(),
+            {"signature_name": "Missing confirmation"},
+        )
+
+        for response in (approve_get, approve_post, sign_get, sign_post):
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(get_user_model().objects.count(), user_count)
+        self.assertEqual(Profile.objects.count(), profile_count)
+
+    def test_new_portal_routes_never_reach_freelancer_identity_functions(self):
+        """Approval and signing cannot call account-backed identity helpers."""
+        login_as(self.client, self.owner)
+        with (
+            patch("surface.auth.get_or_create_freelancer") as create_freelancer,
+            patch("surface.auth.ensure_profile") as ensure_freelancer_profile,
+        ):
+            approve_get = self.client.get(self.approve_url())
+            approve_post = self.client.post(
+                self.approve_url(),
+                {"batch_fingerprint": "0" * 64},
+            )
+            advance_to_delivered(self.project)
+            sign_get = self.client.get(self.sign_url())
+            sign_post = self.client.post(
+                self.sign_url(),
+                {"signature_name": "Missing confirmation"},
+            )
+
+        for response in (approve_get, approve_post, sign_get, sign_post):
+            self.assertEqual(response.status_code, 200)
+        create_freelancer.assert_not_called()
+        ensure_freelancer_profile.assert_not_called()
+
+    def test_consent_module_has_only_ledger_project_dependencies(self):
+        """The neutral consent seam cannot reach Surface identity code."""
+        module_tree = ast.parse(inspect.getsource(consent))
+        imported_names = {
+            alias.name
+            for node in ast.walk(module_tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        imported_modules = {
+            node.module
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.ImportFrom)
+        } | {
+            alias.name
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        dynamic_import_calls = [
+            node
+            for node in ast.walk(module_tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "__import__")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "importlib"
+                    and node.func.attr == "import_module"
+                )
+            )
+        ]
+
+        self.assertEqual(
+            {"services", "AcceptanceItem", "Project"} & imported_names,
+            {"services", "AcceptanceItem", "Project"},
+        )
+        self.assertNotIn("Profile", imported_names)
+        self.assertNotIn("create_user", imported_names)
+        self.assertNotIn("get_user_model", imported_names)
+        self.assertNotIn("get_or_create_freelancer", imported_names)
+        self.assertNotIn("ensure_profile", imported_names)
+        self.assertNotIn("django.contrib.auth", imported_modules)
+        self.assertFalse(
+            any(
+                module_name and module_name.startswith("surface")
+                for module_name in imported_modules
+            )
+        )
+        self.assertEqual(dynamic_import_calls, [])
+
+    def test_portal_action_page_keeps_two_identities_distinct_and_client_primary(self):
+        """Every consent-reachable portal response puts client identity first."""
+        login_as(self.client, self.owner)
+
+        responses = {
+            "list": self.client.get(reverse("surface:portal")),
+            "detail": self.client.get(
+                reverse(
+                    "surface:portal-project",
+                    kwargs={"project_pk": self.project.pk},
+                )
+            ),
+            "approve": self.client.get(self.approve_url()),
+        }
+        advance_to_delivered(self.project)
+        responses["sign"] = self.client.get(self.sign_url())
+        sign_project_via_service(self.project)
+        responses["signed confirmation"] = self.client.get(self.sign_url())
+        stylesheet = (
+            settings.BASE_DIR / "static" / "css" / "app.css"
+        ).read_text(encoding="utf-8")
+        client_rule = stylesheet.split(
+            "body:has([data-portal-page]) .client-strip {",
+            1,
+        )[1].split("}", 1)[0]
+        freelancer_rule = stylesheet.split(
+            "body:has([data-portal-page]) .site-header {",
+            1,
+        )[1].split("}", 1)[0]
+
+        for route_name, response in responses.items():
+            with self.subTest(route=route_name):
+                content = response.content.decode()
+                self.assertEqual(response.status_code, 200)
+                self.assertContains(response, 'data-identity="freelancer"')
+                self.assertContains(response, 'data-identity="client"')
+                self.assertContains(response, self.owner.user.email)
+                self.assertContains(response, self.client_email)
+                self.assertContains(response, "data-portal-page")
+                self.assertLess(
+                    content.index('data-identity="client"'),
+                    content.index('<header class="site-header">'),
+                )
+        self.assertIn("order: -2", client_rule)
+        self.assertIn("order: -1", freelancer_rule)
+
+    def test_non_portal_page_keeps_freelancer_identity_first(self):
+        """Ordinary application pages retain freelancer-first DOM order."""
+        login_as(self.client, self.owner)
+
+        response = self.client.get(reverse("surface:project-list"))
+        content = response.content.decode()
+
+        self.assertContains(response, 'data-identity="freelancer"')
+        self.assertContains(response, 'data-identity="client"')
+        self.assertContains(response, self.owner.user.email)
+        self.assertContains(response, self.client_email)
+        self.assertLess(
+            content.index('<header class="site-header">'),
+            content.index('data-identity="client"'),
+        )

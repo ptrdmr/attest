@@ -1,37 +1,26 @@
 """Helpers for passwordless freelancer authentication."""
 
-from hashlib import sha256
 from uuid import uuid4
 
-from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.cache import cache
 from django.core import signing
 from django.db import IntegrityError, transaction
 from django.utils.text import slugify
 
 from ledger.models import Profile
 
+from .signed_links import (
+    consume_token_once,
+    normalize_magic_login_token,
+    prepare_magic_login_token,
+    require_unconsumed_token,
+    single_use_cache_key,
+)
+
 MAGIC_LOGIN_SALT = "surface.magic-login"
 # Long enough for console copy/paste and slow email clients; still short-lived.
 MAGIC_LOGIN_MAX_AGE = 60 * 60
-
-
-def normalize_magic_login_token(token):
-    """Repair tokens mangled by console quoted-printable email copy/paste.
-
-    Django's console email backend prints MIME quoted-printable. Copying that
-    raw text turns ``token=8:…`` into ``token=3D8:…`` and inserts soft-break
-    ``=`` characters mid-token. TimestampSigner payloads are url-safe base64
-    without ``=`` padding, so stripping ``=`` is safe.
-    """
-    if token is None:
-        return ""
-    cleaned = "".join(str(token).split())
-    # Copied QP escape for '=': the query looks like token=3D8:timestamp:sig
-    if cleaned.startswith("3D") and ":" in cleaned[2:]:
-        cleaned = cleaned[2:]
-    return cleaned.replace("=", "")
+MAGIC_LOGIN_USED_NAMESPACE = "surface.magic-login.used"
 
 
 def _unique_handle(seed):
@@ -116,9 +105,7 @@ def make_magic_login_token(user):
 
 def _prepare_magic_login_token(token):
     """Normalize one token in DEBUG and otherwise preserve its raw value."""
-    if settings.DEBUG:
-        return normalize_magic_login_token(token)
-    return token
+    return prepare_magic_login_token(token)
 
 
 def _read_magic_login_token(token):
@@ -139,16 +126,14 @@ def _read_magic_login_token(token):
 
 def _magic_login_cache_key(token):
     """Return the consumed-token cache key for one prepared token."""
-    token_digest = sha256(str(token).encode("utf-8")).hexdigest()
-    return f"surface.magic-login.used:{token_digest}"
+    return single_use_cache_key(token, MAGIC_LOGIN_USED_NAMESPACE)
 
 
 def read_unconsumed_magic_login_token(token):
     """Validate an unused token without consuming it."""
     prepared_token = _prepare_magic_login_token(token)
     user = _read_magic_login_token(prepared_token)
-    if cache.get(_magic_login_cache_key(prepared_token)):
-        raise signing.BadSignature("Login token has already been used.")
+    require_unconsumed_token(prepared_token, MAGIC_LOGIN_USED_NAMESPACE)
     return user
 
 
@@ -156,9 +141,11 @@ def read_and_consume_magic_login_token(token):
     """Validate and atomically consume a single-use magic login token."""
     prepared_token = _prepare_magic_login_token(token)
     user = _read_magic_login_token(prepared_token)
-    cache_key = _magic_login_cache_key(prepared_token)
     # Multi-worker production assumes a shared CACHES backend; LocMemCache
     # makes this atomic single-use guarantee process-local only.
-    if not cache.add(cache_key, True, timeout=MAGIC_LOGIN_MAX_AGE + 60):
-        raise signing.BadSignature("Login token has already been used.")
+    consume_token_once(
+        prepared_token,
+        MAGIC_LOGIN_USED_NAMESPACE,
+        MAGIC_LOGIN_MAX_AGE + 60,
+    )
     return user

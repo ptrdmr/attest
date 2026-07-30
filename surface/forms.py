@@ -14,6 +14,15 @@ class MagicLinkRequestForm(forms.Form):
     )
 
 
+class ClientPortalRequestForm(forms.Form):
+    """Validate a client email requesting portal access."""
+
+    email = forms.EmailField(
+        label="Client email",
+        widget=forms.EmailInput(attrs={"autocomplete": "email", "autofocus": True}),
+    )
+
+
 class ProjectForm(forms.ModelForm):
     """Validate editable project details."""
 

@@ -9,20 +9,13 @@
   <script src="{% static 'js/htmx.min.js' %}" defer></script>
 </head>
 <body>
-  <header class="site-header">
-    <a class="brand" href="{% url 'surface:home' %}">Attest</a>
-    {% if request.user.is_authenticated %}
-      <nav aria-label="Application">
-        <a href="{% url 'surface:project-list' %}">Projects</a>
-        <a href="{% url 'surface:record' %}">Record</a>
-        <a href="{% url 'surface:billing' %}">Billing</a>
-      </nav>
-      <form method="post" action="{% url 'surface:logout' %}">
-        {% csrf_token %}
-        <button class="button-link" type="submit">Log out</button>
-      </form>
-    {% endif %}
-  </header>
+  {% if portal_page %}
+    {% include "surface/partials/client_strip.html" %}
+    {% include "surface/partials/site_header.html" %}
+  {% else %}
+    {% include "surface/partials/site_header.html" %}
+    {% include "surface/partials/client_strip.html" %}
+  {% endif %}
   <main class="{% block main_class %}container{% endblock %}">
     {% if messages %}
       <div class="messages" aria-live="polite">

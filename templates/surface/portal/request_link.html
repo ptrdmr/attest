@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Client portal · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <p class="eyebrow">Client access</p>
+    <h1>Open your client portal</h1>
+    <p>We will email you a secure link that expires in 60 minutes.</p>
+    <form method="post">
+      {% csrf_token %}
+      {{ form.as_div }}
+      <button type="submit">Email portal link</button>
+    </form>
+  </section>
+{% endblock %}

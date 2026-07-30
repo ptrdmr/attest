@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Delivery record signed · Client portal · Attest{% endblock %}
+{% block content %}
+  <div class="narrow" data-portal-page>
+    <section class="card" role="status">
+      <p class="eyebrow">Signature recorded</p>
+      <h1>Thank you</h1>
+      <p>The delivery record for <strong>{{ project.title }}</strong> is signed.</p>
+      {% if attestation %}
+        {% include "surface/partials/signed_record_meta.html" with attestation=attestation only %}
+      {% endif %}
+      <p><a href="{% url 'surface:portal-project' project.pk %}">View signed project</a></p>
+    </section>
+  </div>
+{% endblock %}

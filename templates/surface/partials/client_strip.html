@@ -1,0 +1,10 @@
+{% if attest_client_email %}
+  <aside class="client-strip" data-identity="client" aria-label="Client session">
+    <span><strong>Client:</strong> {{ attest_client_email }}</span>
+    <a href="{% url 'surface:portal' %}">Client portal</a>
+    <form method="post" action="{% url 'surface:portal-logout' %}">
+      {% csrf_token %}
+      <button class="button-link" type="submit">Sign out as client</button>
+    </form>
+  </aside>
+{% endif %}

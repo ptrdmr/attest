@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Check your email · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <p class="eyebrow">Client access</p>
+    <h1>Check your email</h1>
+    <p>If the address can receive a portal link, it is on its way.</p>
+    {% if dev_portal_url %}
+      <p class="muted">
+        Development mode: use this button instead of copying the MIME-encoded
+        URL from the terminal.
+      </p>
+      <p><a class="button" href="{{ dev_portal_url }}">Continue to client portal</a></p>
+    {% endif %}
+    <a href="{% url 'surface:portal-request' %}">Request another link</a>
+  </section>
+{% endblock %}

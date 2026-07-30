@@ -210,3 +210,74 @@ Sequence from here is unchanged: I3 (portal) → I4 (branding), with I5
 parallelizable. One human ruling is outstanding and logged in `PLAN.md`: whether
 to bound step text length and step count before there is production data, and if
 so at what numbers.
+
+## Initiative 3 underway — client portal (goal 2)
+
+**Two human rulings reshaped it before planning.** The portal **hosts the actions**
+rather than only displaying state, so clients will approve scope and sign from
+inside it — a read-only portal was recommended and rejected. And a client email
+appearing on projects belonging to different freelancers sees **one combined list**,
+with the shared-inbox consequence accepted knowingly. The first ruling is what makes
+this initiative large: it gives the consent seam a second doorway, so the plan
+forbids duplicating that logic and instead extracts it behind a shared helper under
+a no-existing-test-may-change invariant.
+
+Three sequential milestones: **I3a** the sign-in foundation, **I3b** the project
+view, **I3c** the portal-hosted actions. They must never be dispatched concurrently
+— all three claim the same four files.
+
+The plan needed **two Planner-adversary rounds, both REJECT**, which is the charter's
+limit, so it went to the human rather than looping again. Round 1 found the most
+dangerous milestone's central decision undecided — "the approval logic will be
+shared" without saying how, where the obvious reading was provably impossible — and
+found that nothing in the plan would ever tell a client the portal existed. Round 2
+proved by reproduction that the fix for that would break a green test, and found the
+checklist extraction was sharing the half that never drifted.
+
+### I3a complete — client session foundation
+
+A client signs in with a one-hour single-use magic link and gets a fourteen-day
+session, absolute rather than sliding, listing every non-draft project for their
+email across all their freelancers. **A client still gets no account**, which
+required amending this project's own department rule — the old wording said client
+access was tokenized and clients never get accounts, and the human approved the
+replacement before the build.
+
+The load-bearing constraint: the freelancer login form creates a `User` **and** a
+`Profile` with a public handle for any email typed into it, before the link is ever
+clicked. So portal auth lives in a module structurally forbidden from importing that
+code, enforced by a test rather than by discipline. The Verifier-adversary seat
+rejected this — its **fourth consecutive rejection and fourth real finding** — by
+defeating all three identity guards at once with a dynamic import, and by showing the
+absolute session cutoff could silently become a sliding window with nothing going
+red. Suite is at 338.
+
+### I3b complete — the portal project page
+
+A client can now open a project and read the brief, the agreed scope with live
+progress on its granular steps, change-order history and delivery state, all in plain
+language instead of the internal status vocabulary. **Once signed, the page replays
+the frozen attestation payload** with its hash and signature time — closing a real
+gap, since a client who signed previously had no way to ever re-read what they signed.
+
+The delivery-checklist markup is now a shared partial used by both the signing page
+and the portal, with a parity test, because that markup is what once told a client a
+suspended criterion was "Not passed" and letting the portal re-implement it would have
+reproduced the bug on a new surface.
+
+The Verifier-adversary rejected this too — **five consecutive milestones, five real
+findings** — most notably a *new* identity bypass, where the guards banned one style of
+dynamic import but not `importlib`, and the row-count test used an email that already
+had an account, so a portal route could have minted a user for a fresh client email
+undetected. It also caught a dispute warning that could render on every project, and a
+frozen replay that pinned criterion text but not its pass/fail result.
+
+**Final acceptance caught what both adversaries missed**: a signed project rendered the
+checklist twice, live scope above the frozen record, so a client would read the
+*unsigned* one first. Ruled that once an attestation exists the page shows the signed
+record only. Suite is at 352.
+
+Carried into I3c and logged in `PLAN.md`: the client identity reads as subordinate to
+the freelancer nav, and the "steps still outstanding" caution sits with its criterion
+rather than at page level. Both are right for read-only pages and both want revisiting
+the moment signing moves inside the portal.

@@ -1,7 +1,6 @@
 """HTTP views for projects, delivery, signing, and public records."""
 
 from hashlib import sha256
-import json
 import smtplib
 
 from urllib.parse import urlencode
@@ -37,6 +36,14 @@ from .auth import (
     read_and_consume_magic_login_token,
     read_unconsumed_magic_login_token,
 )
+from .consent import (
+    APPROVAL_ACCEPTED,
+    APPROVAL_STALE,
+    _approve_submitted_batch,
+    _sign_delivery_record,
+    _submitted_batch_fingerprint,
+)
+from .delivery import _delivery_rows
 from .forms import (
     AcceptanceItemForm,
     AcceptanceStepDoneForm,
@@ -106,6 +113,12 @@ def _send_email(request, subject, body, recipient):
     return True
 
 
+def _with_portal_discovery(request, action_url):
+    """Keep an action URL first and append the client portal request page."""
+    portal_url = request.build_absolute_uri(reverse("surface:portal-request"))
+    return f"{action_url}\n\nView all your projects in Attest: {portal_url}"
+
+
 def _send_signing_link(request, project):
     """Email a purpose-bound signing URL without rendering its token."""
     sign_token = make_client_token(project, "sign")
@@ -115,7 +128,7 @@ def _send_signing_link(request, project):
     return _send_email(
         request,
         subject="Sign the project delivery record",
-        body=sign_url,
+        body=_with_portal_discovery(request, sign_url),
         recipient=project.client_email,
     )
 
@@ -129,7 +142,7 @@ def _send_review_link(request, project):
     return _send_email(
         request,
         subject="Review project criteria",
-        body=review_url,
+        body=_with_portal_discovery(request, review_url),
         recipient=project.client_email,
     )
 
@@ -143,7 +156,7 @@ def _send_change_order_link(request, change_order):
     return _send_email(
         request,
         subject=f"Review a change order for {change_order.project.title}",
-        body=review_url,
+        body=_with_portal_discovery(request, review_url),
         recipient=change_order.project.client_email,
     )
 
@@ -227,27 +240,6 @@ def _render_criteria(
 def _client_token_error(request):
     """Return the friendly gone page for an invalid or expired client token."""
     return render(request, "surface/client/token_error.html", status=410)
-
-
-def _submitted_batch_fingerprint(items):
-    """Hash submitted item identity, timestamp, and complete step scope."""
-    submitted_entries = sorted(
-        [
-            item.pk,
-            (
-                item.submitted_at.isoformat()
-                if item.submitted_at is not None
-                else "__missing_submitted_at__"
-            ),
-            [
-                [step.pk, step.text, step.order, step.is_done]
-                for step in item.steps.all()
-            ],
-        ]
-        for item in items
-    )
-    serialized_entries = json.dumps(submitted_entries, separators=(",", ":"))
-    return sha256(serialized_entries.encode("utf-8")).hexdigest()
 
 
 def _client_review_context(project, token, *, stale_batch=False):
@@ -1177,27 +1169,16 @@ class ClientApproveView(ClientTokenMixin, View):
         form = ClientApprovalForm(request.POST)
         if not form.is_valid():
             return self._review_response(request, token, stale_batch=True)
-        with transaction.atomic():
-            submitted_items = list(
-                self.project.acceptance_items.select_for_update().filter(
-                    state=AcceptanceItem.State.SUBMITTED
-                ).prefetch_related("steps")
+        outcome = _approve_submitted_batch(
+            self.project,
+            form.cleaned_data["batch_fingerprint"],
+        )
+        if outcome != APPROVAL_ACCEPTED:
+            return self._review_response(
+                request,
+                token,
+                stale_batch=outcome == APPROVAL_STALE,
             )
-            current_fingerprint = _submitted_batch_fingerprint(submitted_items)
-            if not submitted_items:
-                return self._review_response(request, token, stale_batch=False)
-            if form.cleaned_data["batch_fingerprint"] != current_fingerprint:
-                return self._review_response(request, token, stale_batch=True)
-            try:
-                # One savepoint over both writes: a client is either told their
-                # approval landed and all of it did, or told to re-review and
-                # none of it did.
-                with transaction.atomic():
-                    services.approve_acceptance_items(submitted_items)
-                    if self.project.status == Project.Status.CRITERIA_PENDING:
-                        services.approve_criteria(self.project)
-            except services.InvalidTransition:
-                return self._review_response(request, token, stale_batch=True)
         return render(request, "surface/client/thanks.html", {"project": self.project})
 
     def _review_response(self, request, token, *, stale_batch):
@@ -1254,7 +1235,7 @@ class ClientSignView(ClientTokenMixin, View):
         if not form.is_valid():
             return self._render(request, form)
         try:
-            attestation = services.sign_attestation(
+            attestation = _sign_delivery_record(
                 project=self.project,
                 client_email=self.project.client_email,
                 client_name_typed=form.cleaned_data["signature_name"],
@@ -1279,25 +1260,12 @@ class ClientSignView(ClientTokenMixin, View):
 
     def _render(self, request, form):
         """Render delivery evidence without exposing the signing token."""
-        acceptance_items = list(
-            self.project.acceptance_items.prefetch_related("steps")
-        )
-        acceptance_rows = [
-            {
-                "item": item,
-                "steps": list(item.steps.all()),
-                "has_undone_steps": any(
-                    not step.is_done for step in item.steps.all()
-                ),
-            }
-            for item in acceptance_items
-        ]
         return render(
             request,
             self.template_name,
             {
                 "project": self.project,
-                "acceptance_rows": acceptance_rows,
+                "acceptance_rows": _delivery_rows(self.project),
                 "form": form,
             },
         )

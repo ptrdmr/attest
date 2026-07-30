@@ -1,0 +1,65 @@
+{% with item=row.item %}
+<li data-delivery-item>
+  <p class="pre-line">{{ item.text }}</p>
+  {% if item.state == "suspended" or item.state == "withdrawn" %}
+    <div class="parked-scope">
+      <p>
+        <span class="badge parked">{% if item.state == "suspended" %}Suspended{% else %}Withdrawn{% endif %} — excluded from this delivery</span>
+      </p>
+      {% if item.is_passed and row.has_undone_steps %}
+        <p class="outstanding-steps-notice" role="alert">
+          <strong>Outstanding work:</strong> this criterion has a recorded result of Passed, but one or more steps are not done.
+        </p>
+      {% endif %}
+      <p>
+        <span class="muted">
+          Recorded result:
+          {% if item.is_passed is None %}No result recorded{% elif item.is_passed %}Passed{% else %}Failed{% endif %}
+        </span>
+      </p>
+      {% if row.steps %}
+        <div class="criterion-steps">
+          <p class="muted">Steps</p>
+          <ol class="step-list">
+            {% for step in row.steps %}
+              <li>
+                <span class="pre-line">{{ step.text }}</span>
+                <span class="badge {% if step.is_done %}passed{% else %}failed{% endif %}">
+                  {% if step.is_done %}Done{% else %}Not done{% endif %}
+                </span>
+              </li>
+            {% endfor %}
+          </ol>
+        </div>
+      {% endif %}
+    </div>
+  {% else %}
+    {% if item.is_passed and row.has_undone_steps %}
+      <p class="outstanding-steps-notice" role="alert">
+        <strong>Outstanding work:</strong> this criterion is marked Passed, but one or more steps are not done.
+      </p>
+    {% endif %}
+    <p>
+      <strong>{% if item.is_passed is None %}No result recorded{% elif item.is_passed %}Passed{% else %}Not passed{% endif %}</strong>
+      {% if item.evidence_url %}
+      · <a class="break-word" href="{{ item.evidence_url }}" rel="noopener noreferrer">View evidence</a>
+      {% endif %}
+    </p>
+    {% if row.steps %}
+      <div class="criterion-steps">
+        <p class="muted">Steps</p>
+        <ol class="step-list">
+          {% for step in row.steps %}
+            <li>
+              <span class="pre-line">{{ step.text }}</span>
+              <span class="badge {% if step.is_done %}passed{% else %}failed{% endif %}">
+                {% if step.is_done %}Done{% else %}Not done{% endif %}
+              </span>
+            </li>
+          {% endfor %}
+        </ol>
+      </div>
+    {% endif %}
+  {% endif %}
+</li>
+{% endwith %}

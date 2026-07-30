@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}{{ project.title }} · Client portal · Attest{% endblock %}
+{% block main_class %}container wide{% endblock %}
+{% block content %}
+  <article id="portal-project-detail">
+    <div class="page-heading" data-portal-page>
+      <div>
+        <a href="{% url 'surface:portal' %}">← Your projects</a>
+        <p class="eyebrow">Client project · {{ project.owner.display_name }}</p>
+        <h1>{{ project.title }}</h1>
+      </div>
+      <span class="badge{% if project.status == "disputed" %} failed{% endif %}">{{ status_label }}</span>
+    </div>
+
+    {% if project.status == "disputed" %}
+      <p class="dispute-notice" role="status">
+        This signed record is disputed. It is not presented as a clean attestation.
+      </p>
+    {% endif %}
+
+    <div class="project-layout">
+      <div class="project-column">
+        <section class="card">
+          <h2>Project brief</h2>
+          <p class="pre-line">{{ project.brief }}</p>
+        </section>
+
+        {% if not attestation %}
+          <section class="card">
+            <h2>Scope and progress</h2>
+            <ol class="delivery-record">
+              {% for row in acceptance_rows %}
+                {% include "surface/partials/delivery_row.html" with row=row only %}
+              {% empty %}
+                <li>No client-visible scope has been submitted.</li>
+              {% endfor %}
+            </ol>
+          </section>
+        {% endif %}
+
+        <section class="card">
+          <h2>Change-order history</h2>
+          <div class="stack">
+            {% for change_order in change_orders %}
+              <div class="delivery-item">
+                <div class="page-heading">
+                  <strong>{{ change_order.description }}</strong>
+                  <span class="badge">{{ change_order.get_status_display }}</span>
+                </div>
+                <p>
+                  {{ change_order.amount_cents }} cents ·
+                  {{ change_order.timeline_days }} additional day{{ change_order.timeline_days|pluralize }}
+                </p>
+              </div>
+            {% empty %}
+              <p>No change orders have been proposed.</p>
+            {% endfor %}
+          </div>
+        </section>
+      </div>
+
+      <div class="project-column">
+        <section class="card">
+          <h2>Delivery state</h2>
+          <p><strong>{{ status_label }}</strong></p>
+          {% if project.status == "criteria_pending" %}
+            <p>The freelancer has sent the scope for your approval.</p>
+            {% if has_submitted_items %}
+              <p><a href="{% url 'surface:portal-approve' project.pk %}">Review scope</a></p>
+            {% endif %}
+          {% elif project.status == "active" %}
+            <p>Work is underway. Step badges show live progress.</p>
+          {% elif project.status == "delivered" %}
+            <p>The delivery record is ready for your signature.</p>
+            <p><a href="{% url 'surface:portal-sign' project.pk %}">Review delivery record</a></p>
+          {% elif project.status == "attested" %}
+            <p>The delivery record has been signed.</p>
+          {% elif project.status == "disputed" %}
+            <p>The signed delivery record has an unresolved dispute.</p>
+          {% endif %}
+        </section>
+
+        {% if attestation %}
+          <section class="card signed-record" data-signed-record>
+            <h2>Signed delivery record</h2>
+            <p>This checklist is replayed from the frozen payload you signed.</p>
+            <ol class="delivery-record">
+              {% for row in signed_rows %}
+                {% include "surface/partials/delivery_row.html" with row=row only %}
+              {% empty %}
+                <li>The frozen record contains no acceptance criteria.</li>
+              {% endfor %}
+            </ol>
+            {% include "surface/partials/signed_record_meta.html" with attestation=attestation only %}
+          </section>
+        {% endif %}
+      </div>
+    </div>
+  </article>
+{% endblock %}

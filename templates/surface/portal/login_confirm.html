@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Confirm client access · Attest{% endblock %}
+{% block content %}
+  <section class="card narrow">
+    <p class="eyebrow">Client access</p>
+    <h1>Confirm your client portal access</h1>
+    <p>Continue to view the projects connected to your verified email.</p>
+    <form method="post">
+      {% csrf_token %}
+      <input type="hidden" name="token" value="{{ token }}">
+      <button type="submit">Continue to client portal</button>
+    </form>
+  </section>
+{% endblock %}
