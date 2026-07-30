@@ -2856,6 +2856,74 @@ class AttestationImmutabilityTests(TestCase):
         with self.assertRaises(ImmutableAttestation):
             self.project.attestations.update(payload_hash="0" * 64)
 
+    def test_queryset_update_allows_mutable_fields_and_returns_row_count(self):
+        """Manager updates keep their integer result while changing mutable markers."""
+        disputed_at = timezone.now()
+
+        updated_count = Attestation.objects.filter(pk=self.attestation.pk).update(
+            is_disputed=True,
+            disputed_at=disputed_at,
+        )
+
+        self.attestation.refresh_from_db()
+        self.assertEqual(updated_count, 1)
+        self.assertTrue(self.attestation.is_disputed)
+        self.assertEqual(self.attestation.disputed_at, disputed_at)
+
+    def test_queryset_mixed_update_raises_and_persists_nothing(self):
+        """An immutable manager update blocks mutable fields before any write."""
+        original_payload_hash = self.attestation.payload_hash
+
+        with self.assertRaises(ImmutableAttestation):
+            Attestation.objects.filter(pk=self.attestation.pk).update(
+                payload_hash="0" * 64,
+                is_disputed=True,
+            )
+
+        self.attestation.refresh_from_db()
+        self.assertEqual(self.attestation.payload_hash, original_payload_hash)
+        self.assertFalse(self.attestation.is_disputed)
+
+    def test_related_manager_update_allows_mutable_fields_and_returns_row_count(self):
+        """Related updates match manager success effects and integer return values."""
+        disputed_at = timezone.now()
+
+        updated_count = self.project.attestations.update(
+            is_disputed=True,
+            disputed_at=disputed_at,
+        )
+
+        self.attestation.refresh_from_db()
+        self.assertEqual(updated_count, 1)
+        self.assertTrue(self.attestation.is_disputed)
+        self.assertEqual(self.attestation.disputed_at, disputed_at)
+
+    def test_related_manager_mixed_update_raises_and_persists_nothing(self):
+        """An immutable related update blocks mutable fields before any write."""
+        original_payload_hash = self.attestation.payload_hash
+
+        with self.assertRaises(ImmutableAttestation):
+            self.project.attestations.update(
+                payload_hash="0" * 64,
+                is_disputed=True,
+            )
+
+        self.attestation.refresh_from_db()
+        self.assertEqual(self.attestation.payload_hash, original_payload_hash)
+        self.assertFalse(self.attestation.is_disputed)
+
+    def test_save_update_fields_persists_both_dispute_markers(self):
+        """Marker-only update_fields saves remain valid for dispute services and signals."""
+        disputed_at = timezone.now()
+        self.attestation.is_disputed = True
+        self.attestation.disputed_at = disputed_at
+
+        self.attestation.save(update_fields=("is_disputed", "disputed_at"))
+
+        self.attestation.refresh_from_db()
+        self.assertTrue(self.attestation.is_disputed)
+        self.assertEqual(self.attestation.disputed_at, disputed_at)
+
     def test_instance_delete_raises_and_preserves_row(self):
         """Instance deletion cannot remove a signed attestation."""
         with self.assertRaises(ImmutableAttestation):
@@ -2866,6 +2934,12 @@ class AttestationImmutabilityTests(TestCase):
         """Manager queryset deletion cannot remove signed attestations."""
         with self.assertRaises(ImmutableAttestation):
             Attestation.objects.all().delete()
+        self.assertTrue(Attestation.objects.filter(pk=self.attestation.pk).exists())
+
+    def test_filtered_queryset_delete_raises_and_preserves_row(self):
+        """A realistic filtered bulk deletion keeps its matching signed row."""
+        with self.assertRaises(ImmutableAttestation):
+            Attestation.objects.filter(pk=self.attestation.pk).delete()
         self.assertTrue(Attestation.objects.filter(pk=self.attestation.pk).exists())
 
     def test_related_manager_delete_raises_and_preserves_row(self):

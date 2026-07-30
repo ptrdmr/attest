@@ -2113,6 +2113,46 @@ the form's field set must keep matching `_PROFILE_DETAIL_FIELDS` exactly, and
 I5b's Verifier owes a test asserting the form's declared fields equal the service's
 allowlist — turning a comment-level assumption into a failing test if anyone breaks it.
 
+#### I5c dispatch decisions (2026-07-30)
+
+Recon re-verified every code location the milestone touches. One plan correction and
+four decisions a builder would otherwise have to invent in a hazard zone.
+
+- **Correction to finding 3's citations.** It cites `ledger/tests.py:2825` and `:2852`
+  as the direct dispute writes. Those line numbers have drifted — today they are
+  `payload`/`payload_hash` immutability tests. The actual direct dispute writes are
+  `ledger/tests.py:3079-3080` (`save(update_fields=("is_disputed",))`) and `:3105-3107`
+  (both markers). Finding 3's substance is unaffected and was re-verified: the three
+  bypass paths are real, and `AttestationQuerySet.update()` at `ledger/models.py:192-199`
+  still blocks only `IMMUTABLE_FIELDS`, which excludes both dispute markers.
+- **Decision C1 — the `post_save` receiver recomputes unconditionally, on create and
+  update alike, with no change-detection predicate.** Any predicate is somewhere a false
+  negative can hide, and a false negative here is precisely the bypass this milestone
+  exists to close. Keying off `update_fields` was rejected outright: it misses a plain
+  `.save()` that changed dispute state. `recompute_capability_tags` is idempotent by
+  construction (delete then rebuild), and **no query-count test covers a signing or
+  dispute path** — verified, the only `assertNumQueries` is a portal GET
+  (`surface/tests.py:5934`) and the `CaptureQueriesContext` blocks cover acceptance
+  steps and `canonical_payload`. The honest cost, stated so the adversary can weigh it
+  rather than discover it: `amend_attestation` will now recompute three times
+  (`is_current` flip, amendment create, explicit call), all inside one transaction with
+  the last authoritative. Wasteful, correct, and cheap at MVP scale.
+- **Decision C2 — the same unconditional rule applies to `AttestationQuerySet.update()`**,
+  for symmetry and for the same no-predicate reasoning. Affected profile ids are
+  captured **before** `super().update()` runs, and update-plus-recompute is wrapped in
+  `transaction.atomic`.
+- **Decision C3 — the receiver lives in `ledger/services.py`, connected from a new
+  `ready()` in `ledger/apps.py`.** No `signals.py`: the plan's boundary does not include
+  one, and derivation belongs in services per `dept_ledger.mdc`. `INSTALLED_APPS` holds
+  the bare string `"ledger"` (`config/settings.py:39`), so Django auto-selects
+  `LedgerConfig` and `ready()` will run. **A test must assert the receiver is actually
+  connected, not merely defined** — a disconnected receiver is the silent failure this
+  layer is most likely to ship with, and every behavioural test would still pass via
+  layer 1 or the services.
+- **Decision C4 — `models.py` imports `recompute_capability_tags` at function scope.**
+  `ledger/services.py` imports from `ledger/models.py` at module level, so the reverse
+  import at module scope is circular. This is a known trap, not a style preference.
+
 #### I5b execution log (2026-07-29)
 
 Owning department Surface, full dispatch. Suite **387 → 408 green**, ruff clean on every
