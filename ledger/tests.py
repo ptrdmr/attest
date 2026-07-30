@@ -48,6 +48,8 @@ from ledger.services import (
     mark_delivered,
     propose_change_order,
     public_attestations,
+    public_capability_search,
+    public_directory_profiles,
     pull_back_acceptance_item,
     recompute_capability_tags,
     recompute_capability_tags_after_attestation_save,
@@ -3809,3 +3811,729 @@ class ModelConstraintTests(TestCase):
                     text="Duplicate order slot",
                     order=1,
                 )
+
+
+class PublicDirectoryOptInTests(TestCase):
+    """Published-only directory queries respect strict opt-in."""
+
+    def test_private_profile_with_tags_never_appears_in_browse_or_search(self):
+        """A private tagged profile and its tag names are absent everywhere."""
+        private_profile = make_profile(handle="opt-in-private")
+        private_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="secret-capability",
+            owner=private_profile,
+        )
+        sign_project(private_project)
+        self.assertEqual(
+            CapabilityTag.objects.filter(profile=private_profile).count(),
+            1,
+        )
+        self.assertIs(private_profile.is_public, False)
+
+        published_peer = make_profile(handle="opt-in-public")
+        set_profile_visibility(published_peer, True)
+        peer_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="public-decoy",
+            owner=published_peer,
+        )
+        sign_project(peer_project)
+
+        browse_handles = [
+            profile.handle for profile in public_directory_profiles()
+        ]
+        self.assertNotIn(private_profile.handle, browse_handles)
+        self.assertIn(published_peer.handle, browse_handles)
+
+        search_results = list(public_capability_search("secret-capability"))
+        self.assertEqual(search_results, [])
+        search_tag_names = {
+            tag.name
+            for profile in public_capability_search("secret")
+            for tag in profile.capability_tags.all()
+        }
+        self.assertNotIn("secret-capability", search_tag_names)
+
+
+class PublicDirectoryDisputePresentationTests(TestCase):
+    """Directory presentation never inflates counts across disputed work."""
+
+    def test_partial_dispute_reports_matching_attested_count_not_two(self):
+        """One disputed twin project leaves matched_attested_count at one."""
+        profile = make_profile(handle="dispute-partial")
+        set_profile_visibility(profile, True)
+        first_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="django",
+            owner=profile,
+        )
+        second_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="django",
+            owner=profile,
+        )
+        sign_project(first_project)
+        sign_project(second_project)
+        self.assertEqual(
+            CapabilityTag.objects.get(profile=profile, name="django").attested_count,
+            2,
+        )
+
+        flag_dispute(first_project)
+
+        results = list(public_capability_search("django"))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].pk, profile.pk)
+        self.assertEqual(results[0].matched_attested_count, 1)
+
+    def test_fully_disputed_profile_browses_with_zero_tags_not_search(self):
+        """A disputed-only freelancer stays in browse but drops from search."""
+        profile = make_profile(handle="dispute-only")
+        set_profile_visibility(profile, True)
+        project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="django",
+            owner=profile,
+        )
+        sign_project(project)
+        flag_dispute(project)
+
+        self.assertEqual(CapabilityTag.objects.filter(profile=profile).count(), 0)
+        browse_ids = [row.pk for row in public_directory_profiles()]
+        self.assertIn(profile.pk, browse_ids)
+        self.assertEqual(list(public_capability_search("django")), [])
+
+
+class PublicDirectoryTamperTests(TestCase):
+    """Tamper-failed attestations never contribute to directory aggregates."""
+
+    def test_tampered_attestation_excluded_after_recompute(self):
+        """Raw payload tamper drops the skill from search once the cache rebuilds."""
+        profile = make_profile(handle="tamper-directory")
+        set_profile_visibility(profile, True)
+        tampered_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="django",
+            owner=profile,
+        )
+        clean_project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="django",
+            owner=profile,
+        )
+        tampered_attestation = sign_project(tampered_project)
+        sign_project(clean_project)
+        tampered_payload = dict(tampered_attestation.payload)
+        tampered_payload["brief"] = "Database-tampered brief"
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE ledger_attestation SET payload = %s WHERE id = %s",
+                [json.dumps(tampered_payload), tampered_attestation.pk],
+            )
+        tampered_attestation.refresh_from_db()
+        self.assertFalse(verify_payload_hash(tampered_attestation))
+
+        recompute_capability_tags(profile)
+
+        results = list(public_capability_search("django"))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].matched_attested_count, 1)
+
+
+class PublicCapabilitySearchMatchingTests(TestCase):
+    """Capability search normalizes slugs and applies substring semantics."""
+
+    def setUp(self):
+        """Publish one profile carrying a react-native capability tag."""
+        self.profile = make_profile(handle="match-react-native")
+        set_profile_visibility(self.profile, True)
+        project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="React Native",
+            owner=self.profile,
+        )
+        sign_project(project)
+
+    def test_slug_normalization_finds_react_native_tag(self):
+        """Mixed case and spacing slugify to the stored react-native tag."""
+        for query in ("React Native", "  REACT-NATIVE  "):
+            with self.subTest(query=query):
+                results = list(public_capability_search(query))
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0].pk, self.profile.pk)
+
+    def test_substring_semantics_match_react_native_for_react(self):
+        """A react query matches react-native rather than requiring exact equality."""
+        results = list(public_capability_search("react"))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].pk, self.profile.pk)
+
+    def test_unmatchable_capability_query_returns_empty_against_populated_directory(
+        self,
+    ):
+        """Punctuation-only and whitespace queries never return every published row."""
+        decoy = make_profile(handle="match-decoy")
+        set_profile_visibility(decoy, True)
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="python",
+                owner=decoy,
+            )
+        )
+        self.assertGreater(public_directory_profiles().count(), 0)
+
+        for query in ("!!!", "   "):
+            with self.subTest(query=query):
+                self.assertEqual(list(public_capability_search(query)), [])
+                self.assertEqual(public_capability_search(query).count(), 0)
+
+
+class PublicDirectoryZeroTagTests(TestCase):
+    """Zero-tag attested profiles browse but never appear in capability search."""
+
+    def test_zero_tag_attested_profile_browses_not_searches(self):
+        """Genuine signed work without skills stays in browse only."""
+        profile = make_profile(handle="zero-tag-browse")
+        set_profile_visibility(profile, True)
+        project = make_project_with_items(
+            status=Project.Status.DELIVERED,
+            skills_csv="",
+            owner=profile,
+        )
+        sign_project(project)
+        self.assertEqual(CapabilityTag.objects.filter(profile=profile).count(), 0)
+
+        tagged_peer = make_profile(handle="zero-tag-peer")
+        set_profile_visibility(tagged_peer, True)
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="django",
+                owner=tagged_peer,
+            )
+        )
+
+        browse_handles = [
+            row.handle for row in public_directory_profiles()
+        ]
+        self.assertIn(profile.handle, browse_handles)
+        self.assertEqual(list(public_capability_search("django")), [
+            tagged_peer,
+        ])
+
+
+class PublicCapabilitySearchRankingTests(TestCase):
+    """Capability search ordering uses only matching tags for rank."""
+
+    def test_search_orders_by_count_then_recency_then_handle(self):
+        """Deliberate ties at each rank level resolve deterministically."""
+        anchor = timezone.now()
+        oldest = anchor - timedelta(days=20)
+        tie_time = anchor - timedelta(days=10)
+        newer = anchor - timedelta(days=1)
+
+        leader = make_profile(handle="rank-leader")
+        set_profile_visibility(leader, True)
+        CapabilityTag.objects.create(
+            profile=leader,
+            name="react-native",
+            attested_count=3,
+            last_attested_at=oldest,
+        )
+
+        recent_late_handle = make_profile(handle="rank-zzz")
+        set_profile_visibility(recent_late_handle, True)
+        CapabilityTag.objects.create(
+            profile=recent_late_handle,
+            name="react-native",
+            attested_count=2,
+            last_attested_at=newer,
+        )
+
+        stale_early_handle = make_profile(handle="rank-aaa")
+        set_profile_visibility(stale_early_handle, True)
+        CapabilityTag.objects.create(
+            profile=stale_early_handle,
+            name="react-native",
+            attested_count=2,
+            last_attested_at=oldest,
+        )
+
+        tie_nnn = make_profile(handle="rank-nnn")
+        set_profile_visibility(tie_nnn, True)
+        CapabilityTag.objects.create(
+            profile=tie_nnn,
+            name="react-native",
+            attested_count=2,
+            last_attested_at=tie_time,
+        )
+
+        tie_mmm = make_profile(handle="rank-mmm")
+        set_profile_visibility(tie_mmm, True)
+        CapabilityTag.objects.create(
+            profile=tie_mmm,
+            name="react-native",
+            attested_count=2,
+            last_attested_at=tie_time,
+        )
+
+        results = list(public_capability_search("react"))
+        self.assertEqual(
+            [profile.handle for profile in results],
+            [
+                "rank-leader",
+                "rank-zzz",
+                "rank-mmm",
+                "rank-nnn",
+                "rank-aaa",
+            ],
+        )
+        self.assertEqual(results[0].matched_attested_count, 3)
+        self.assertEqual(results[1].matched_attested_count, 2)
+        self.assertEqual(results[1].matched_last_attested_at, newer)
+        self.assertEqual(results[1].handle, "rank-zzz")
+        self.assertEqual(results[2].matched_last_attested_at, tie_time)
+        self.assertEqual(results[2].handle, "rank-mmm")
+        self.assertEqual(results[3].handle, "rank-nnn")
+        self.assertEqual(results[4].matched_last_attested_at, oldest)
+        self.assertEqual(results[4].handle, "rank-aaa")
+
+    def test_non_matching_high_count_tag_does_not_influence_rank(self):
+        """Search rank reflects the matching react-native tag, not python."""
+        anchor = timezone.now()
+        profile = make_profile(handle="rank-mismatch")
+        set_profile_visibility(profile, True)
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="python",
+            attested_count=50,
+            last_attested_at=anchor - timedelta(days=30),
+        )
+        react_at = anchor - timedelta(days=2)
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="react-native",
+            attested_count=1,
+            last_attested_at=react_at,
+        )
+
+        results = list(public_capability_search("react"))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].matched_attested_count, 1)
+        self.assertEqual(results[0].matched_last_attested_at, react_at)
+
+    def test_multi_matching_tags_yield_one_row_per_profile(self):
+        """Several matching tags still produce exactly one search row per profile."""
+        profile = make_profile(handle="multi-match-once")
+        set_profile_visibility(profile, True)
+        anchor = timezone.now()
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="react",
+            attested_count=1,
+            last_attested_at=anchor - timedelta(days=5),
+        )
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="react-native",
+            attested_count=1,
+            last_attested_at=anchor - timedelta(days=3),
+        )
+
+        results = list(public_capability_search("react"))
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            [row.pk for row in results].count(profile.pk),
+            1,
+        )
+
+    def test_multi_matching_tags_rank_on_max_count_and_recency(self):
+        """Matching-tag annotations take the maximum count and recency separately."""
+        profile = make_profile(handle="multi-match-rank")
+        set_profile_visibility(profile, True)
+        anchor = timezone.now()
+        older = anchor - timedelta(days=10)
+        newer = anchor - timedelta(days=2)
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="react",
+            attested_count=2,
+            last_attested_at=newer,
+        )
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="react-native",
+            attested_count=5,
+            last_attested_at=older,
+        )
+
+        row = public_capability_search("react").get(pk=profile.pk)
+
+        self.assertEqual(row.matched_attested_count, 5)
+        self.assertEqual(row.matched_last_attested_at, newer)
+
+
+class PublicDirectoryBrowseOrderingTests(TestCase):
+    """Browse listing orders by recency with nulls last and pins annotations."""
+
+    def test_browse_orders_by_latest_attested_at_then_handle(self):
+        """Recency descending with null tags last, then handle ascending."""
+        anchor = timezone.now()
+        newest = anchor - timedelta(days=1)
+        middle = anchor - timedelta(days=10)
+        oldest_tagged = anchor - timedelta(days=20)
+
+        top_profile = make_profile(handle="browse-top")
+        set_profile_visibility(top_profile, True)
+        CapabilityTag.objects.create(
+            profile=top_profile,
+            name="django",
+            attested_count=1,
+            last_attested_at=newest,
+        )
+
+        tied_nnn = make_profile(handle="browse-nnn")
+        set_profile_visibility(tied_nnn, True)
+        CapabilityTag.objects.create(
+            profile=tied_nnn,
+            name="python",
+            attested_count=1,
+            last_attested_at=middle,
+        )
+
+        tied_mmm = make_profile(handle="browse-mmm")
+        set_profile_visibility(tied_mmm, True)
+        CapabilityTag.objects.create(
+            profile=tied_mmm,
+            name="htmx",
+            attested_count=1,
+            last_attested_at=middle,
+        )
+
+        low_profile = make_profile(handle="browse-low")
+        set_profile_visibility(low_profile, True)
+        CapabilityTag.objects.create(
+            profile=low_profile,
+            name="rails",
+            attested_count=1,
+            last_attested_at=oldest_tagged,
+        )
+
+        zero_tag_profile = make_profile(handle="browse-zero")
+        set_profile_visibility(zero_tag_profile, True)
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="",
+                owner=zero_tag_profile,
+            )
+        )
+
+        results = list(public_directory_profiles())
+        self.assertEqual(
+            [profile.handle for profile in results],
+            [
+                "browse-top",
+                "browse-mmm",
+                "browse-nnn",
+                "browse-low",
+                "browse-zero",
+            ],
+        )
+        self.assertIsNone(results[-1].latest_attested_at)
+        self.assertEqual(results[-1].handle, "browse-zero")
+        handles = [profile.handle for profile in results]
+        zero_index = handles.index("browse-zero")
+        for handle in ("browse-top", "browse-mmm", "browse-nnn", "browse-low"):
+            self.assertLess(handles.index(handle), zero_index)
+
+    def test_browse_queryset_exposes_latest_attested_at_annotation(self):
+        """The browse contract exposes latest_attested_at for I5e rendering."""
+        profile = make_profile(handle="browse-annotation")
+        set_profile_visibility(profile, True)
+        signed_at = timezone.now() - timedelta(days=3)
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="django",
+            attested_count=1,
+            last_attested_at=signed_at,
+        )
+
+        row = public_directory_profiles().get(pk=profile.pk)
+        self.assertEqual(row.latest_attested_at, signed_at)
+
+    def test_browse_deduplicates_multi_tag_profile_at_max_recency(self):
+        """Two tags still yield one browse row annotated with the later recency."""
+        profile = make_profile(handle="browse-multi-tag")
+        set_profile_visibility(profile, True)
+        anchor = timezone.now()
+        older = anchor - timedelta(days=12)
+        newer = anchor - timedelta(days=4)
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="django",
+            attested_count=1,
+            last_attested_at=older,
+        )
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="python",
+            attested_count=3,
+            last_attested_at=newer,
+        )
+
+        results = list(public_directory_profiles())
+
+        self.assertEqual([row.pk for row in results].count(profile.pk), 1)
+        row = public_directory_profiles().get(pk=profile.pk)
+        self.assertEqual(row.latest_attested_at, newer)
+
+    def test_search_queryset_exposes_matched_annotation_names(self):
+        """Search exposes matched_attested_count and matched_last_attested_at."""
+        signed_at = timezone.now() - timedelta(days=4)
+        profile = make_profile(handle="search-annotation")
+        set_profile_visibility(profile, True)
+        CapabilityTag.objects.create(
+            profile=profile,
+            name="django",
+            attested_count=2,
+            last_attested_at=signed_at,
+        )
+
+        row = public_capability_search("django").get(pk=profile.pk)
+        self.assertEqual(row.matched_attested_count, 2)
+        self.assertEqual(row.matched_last_attested_at, signed_at)
+
+
+class PublicDirectoryQueryEfficiencyTests(TestCase):
+    """Directory services stay lazy and query-flat for pagination."""
+
+    BROWSE_QUERY_COUNT = 2
+    SEARCH_QUERY_COUNT = 2
+
+    @classmethod
+    def setUpTestData(cls):
+        """Seed one published profile with a capability tag."""
+        cls.single_profile = make_profile(handle="query-single")
+        set_profile_visibility(cls.single_profile, True)
+        CapabilityTag.objects.create(
+            profile=cls.single_profile,
+            name="django",
+            attested_count=1,
+            last_attested_at=timezone.now(),
+        )
+
+    def test_browse_query_count_is_flat_across_profile_volume(self):
+        """Materializing browse results uses the same queries for one or many."""
+        with self.assertNumQueries(self.BROWSE_QUERY_COUNT):
+            list(public_directory_profiles())
+
+        for index in range(3):
+            peer = make_profile(handle=f"query-peer-{index}")
+            set_profile_visibility(peer, True)
+            CapabilityTag.objects.create(
+                profile=peer,
+                name=f"skill-{index}",
+                attested_count=1,
+                last_attested_at=timezone.now(),
+            )
+
+        with self.assertNumQueries(self.BROWSE_QUERY_COUNT):
+            list(public_directory_profiles())
+
+    def test_search_query_count_is_flat_across_profile_volume(self):
+        """Materializing search results uses the same queries for one or many."""
+        with self.assertNumQueries(self.SEARCH_QUERY_COUNT):
+            list(public_capability_search("django"))
+
+        for index in range(3):
+            peer = make_profile(handle=f"query-search-{index}")
+            set_profile_visibility(peer, True)
+            CapabilityTag.objects.create(
+                profile=peer,
+                name="django",
+                attested_count=index + 2,
+                last_attested_at=timezone.now(),
+            )
+
+        with self.assertNumQueries(self.SEARCH_QUERY_COUNT):
+            list(public_capability_search("django"))
+
+    def test_services_return_lazy_querysets_supporting_slice_and_count(self):
+        """Both services stay lazy for Paginator slice and count operations."""
+        with CaptureQueriesContext(connection) as capture:
+            browse_queryset = public_directory_profiles()
+            search_queryset = public_capability_search("django")
+        self.assertEqual(len(capture.captured_queries), 0)
+
+        self.assertEqual(browse_queryset.count(), 1)
+        self.assertEqual(len(list(browse_queryset[:1])), 1)
+        self.assertEqual(search_queryset.count(), 1)
+        self.assertEqual(len(list(search_queryset[:1])), 1)
+
+
+class PublicDirectoryTextFilterTests(TestCase):
+    """Secondary text filters search profile fields and intersect capability."""
+
+    def setUp(self):
+        """Two published profiles: one bio match, one skills-only decoy."""
+        self.matching_profile = make_profile(handle="text-match")
+        set_profile_visibility(self.matching_profile, True)
+        set_profile_details(
+            self.matching_profile,
+            bio=(
+                "Freelance Django developer building HIPAA-aware APIs. "
+                "Reach me via FindMeInBioOnly anytime."
+            ),
+            headline="",
+            location="",
+        )
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="django",
+                owner=self.matching_profile,
+            )
+        )
+
+        self.skills_only_profile = make_profile(handle="text-skills-only")
+        set_profile_visibility(self.skills_only_profile, True)
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="FindMeInBioOnly",
+                owner=self.skills_only_profile,
+            )
+        )
+
+        self.location_profile = make_profile(handle="text-location")
+        set_profile_visibility(self.location_profile, True)
+        set_profile_details(
+            self.location_profile,
+            bio="",
+            headline="",
+            location="Portland, OR (FindMeInLocationOnly metro)",
+        )
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="python",
+                owner=self.location_profile,
+            )
+        )
+
+    def test_text_filter_matches_profile_fields_not_skills_csv(self):
+        """Declared profile text matches; project skills_csv alone does not."""
+        self.assertIn("FindMeInBioOnly", self.matching_profile.bio)
+        self.assertNotEqual("FindMeInBioOnly", self.matching_profile.bio)
+        self.assertIn("FindMeInLocationOnly", self.location_profile.location)
+
+        for query, expected_handle in (
+            ("FindMeInBioOnly", self.matching_profile.handle),
+            ("FindMeInLocationOnly", self.location_profile.handle),
+        ):
+            with self.subTest(query=query):
+                browse = list(public_directory_profiles(text_query=query))
+                self.assertEqual({profile.handle for profile in browse}, {expected_handle})
+
+        self.assertNotIn(
+            self.skills_only_profile.handle,
+            {
+                profile.handle
+                for profile in public_directory_profiles(text_query="FindMeInBioOnly")
+            },
+        )
+
+    def test_text_filter_matches_display_name_headline_and_is_case_insensitive(self):
+        """display_name and headline participate with case-insensitive icontains."""
+        display_profile = make_profile(handle="text-display")
+        set_profile_visibility(display_profile, True)
+        set_profile_details(
+            display_profile,
+            display_name="Alex FindMeInDisplay Chen",
+            headline="",
+            bio="",
+            location="",
+        )
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="django",
+                owner=display_profile,
+            )
+        )
+
+        headline_profile = make_profile(handle="text-headline")
+        set_profile_visibility(headline_profile, True)
+        set_profile_details(
+            headline_profile,
+            display_name="Headline Owner",
+            headline="Senior FindMeInHeadline engineer",
+            bio="",
+            location="",
+        )
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="django",
+                owner=headline_profile,
+            )
+        )
+
+        for query, expected_handle in (
+            ("findmeindisplay", display_profile.handle),
+            ("FINDMEINHEADLINE", headline_profile.handle),
+        ):
+            with self.subTest(query=query):
+                handles = {
+                    profile.handle
+                    for profile in public_directory_profiles(text_query=query)
+                }
+                self.assertIn(expected_handle, handles)
+
+    def test_text_filter_intersects_with_capability_search(self):
+        """Capability and text filters combine with AND semantics."""
+        results = list(
+            public_capability_search("django", text_query="FindMeInBioOnly")
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].pk, self.matching_profile.pk)
+
+    def test_text_filter_respects_is_public(self):
+        """Private profiles never match even when their profile text fits."""
+        private_profile = make_profile(handle="text-private")
+        set_profile_details(
+            private_profile,
+            bio="Private consultant. Marker FindMeInBioOnly should stay hidden.",
+            headline="",
+            location="",
+        )
+        sign_project(
+            make_project_with_items(
+                status=Project.Status.DELIVERED,
+                skills_csv="django",
+                owner=private_profile,
+            )
+        )
+
+        matching_handles = {
+            profile.handle
+            for profile in public_directory_profiles(text_query="FindMeInBioOnly")
+        }
+        self.assertNotIn(private_profile.handle, matching_handles)
+        self.assertIn(self.matching_profile.handle, matching_handles)
+
+    def test_whitespace_only_text_query_applies_no_filter(self):
+        """All-whitespace text_query behaves like an unfiltered directory."""
+        unfiltered_handles = [
+            profile.handle for profile in public_directory_profiles()
+        ]
+        whitespace_handles = [
+            profile.handle
+            for profile in public_directory_profiles(text_query="   \t  ")
+        ]
+        self.assertEqual(whitespace_handles, unfiltered_handles)

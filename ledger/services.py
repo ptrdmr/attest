@@ -3,6 +3,7 @@ import json
 from collections import defaultdict
 
 from django.db import transaction
+from django.db.models import F, Max, Q
 from django.utils import timezone
 from django.utils.text import slugify
 
@@ -13,6 +14,7 @@ from .models import (
     CapabilityTag,
     ChangeOrder,
     ImmutableAttestation,
+    Profile,
     Project,
 )
 
@@ -749,3 +751,74 @@ def disputed_count(profile):
         is_current=True,
         is_disputed=True,
     ).count()
+
+
+def _published_directory_profiles(text_query=""):
+    """Return published profiles with optional text filter and tag prefetch.
+
+    Applies ``is_public=True``, an optional OR'd ``icontains`` filter over
+    ``display_name``, ``headline``, ``bio`` and ``location``, and prefetches
+    ``capability_tags``. Does not annotate or order.
+    """
+    queryset = Profile.objects.filter(is_public=True)
+    keyword = text_query.strip() if text_query else ""
+    if keyword:
+        queryset = queryset.filter(
+            Q(display_name__icontains=keyword)
+            | Q(headline__icontains=keyword)
+            | Q(bio__icontains=keyword)
+            | Q(location__icontains=keyword)
+        )
+    return queryset.prefetch_related("capability_tags")
+
+
+def public_directory_profiles(text_query=""):
+    """Return published profiles for the unfiltered directory browse.
+
+    Inputs: optional ``text_query`` keyword for the secondary profile-text
+    filter. Outputs: a lazy ``QuerySet`` of ``Profile`` rows annotated with
+    ``latest_attested_at`` (the maximum tag recency, null when there are no
+    tags), prefetched ``capability_tags``, ordered by recency descending with
+    nulls last then ``handle`` ascending. Raises no errors.
+    """
+    return (
+        _published_directory_profiles(text_query)
+        .annotate(
+            latest_attested_at=Max("capability_tags__last_attested_at"),
+        )
+        .order_by(
+            F("latest_attested_at").desc(nulls_last=True),
+            "handle",
+        )
+    )
+
+
+def public_capability_search(capability_query, text_query=""):
+    """Return published profiles whose attested capabilities match a query.
+
+    Inputs: ``capability_query`` slugified the same way as project skills;
+    optional ``text_query`` for the secondary profile-text filter. Outputs: a
+    lazy ``QuerySet`` annotated with ``matched_attested_count`` and
+    ``matched_last_attested_at`` from matching tags only, prefetched
+    ``capability_tags``, ordered by matched volume descending, matched recency
+    descending, then ``handle`` ascending. Returns an empty queryset when the
+    normalized capability slug is blank. Raises no errors.
+    """
+    normalized_slug = (
+        slugify(capability_query.strip()) if capability_query else ""
+    )
+    if not normalized_slug:
+        return Profile.objects.none()
+    return (
+        _published_directory_profiles(text_query)
+        .filter(capability_tags__name__contains=normalized_slug)
+        .annotate(
+            matched_attested_count=Max("capability_tags__attested_count"),
+            matched_last_attested_at=Max("capability_tags__last_attested_at"),
+        )
+        .order_by(
+            "-matched_attested_count",
+            "-matched_last_attested_at",
+            "handle",
+        )
+    )

@@ -2169,6 +2169,157 @@ four decisions a builder would otherwise have to invent in a hazard zone.
   `ledger/services.py` imports from `ledger/models.py` at module level, so the reverse
   import at module scope is circular. This is a known trap, not a style preference.
 
+#### I5d dispatch decisions (2026-07-30)
+
+Recon re-verified every symbol this milestone reads. I5d is read-only: it adds query
+services over the `CapabilityTag` cache and touches nothing that writes. Boundaries stay
+exactly `ledger/services.py` and `ledger/tests.py` — no migration, no admin, no views, no
+templates. Standard (non-hazard) builder seat, full dispatch per the initiative's
+designation, because the surface it feeds is the public Capability Record.
+
+- **Decision D1 — two public services plus one private helper.**
+  `public_directory_profiles(text_query="")` is the unfiltered browse;
+  `public_capability_search(capability_query, text_query="")` is the capability search.
+  Both begin with `public_` to echo `public_attestations`, the existing marker for
+  "safe to render to an anonymous visitor". A shared private helper applies the
+  `is_public` filter, the optional text filter and the tag prefetch, so the strict-opt-in
+  filter exists in **one** place rather than two that can drift.
+- **Decision D2 — the secondary text filter belongs to I5d, not I5e.** The milestone text
+  names only the listing and the capability search, but plan decision 1 defines a
+  secondary text filter and `dept_ledger.mdc` forbids query logic in views. Leaving it out
+  would force I5e to write ORM in Surface. It searches `display_name`, `headline`, `bio`
+  and `location` with `icontains` OR'd together, and **never** `Project.skills_csv`, per
+  decision 1. It is an optional keyword argument on both services and intersects (AND)
+  with the capability filter.
+- **Decision D3 — capability matching is substring on the normalized slug**
+  (`name__contains=<slug>`), not exact equality. The visitor does not know that the stored
+  tag is `react-native`, so exact matching would make the primary search axis unusable
+  unless typed perfectly. `contains` rather than `icontains`: `CapabilityTag.name` is
+  written by `slugify` and the query is slugified the same way, so both sides are already
+  lowercase ASCII and case-insensitivity would only buy collation differences between
+  backends. The known imprecision — "react" also matches "preact" — is accepted: the card
+  displays the freelancer's *own* tag names, so a loose match never presents an
+  unattested claim, and ruling 1's concern is conflation, not recall precision. Pinned by
+  a test so a later switch to exact matching fails loudly.
+- **Decision D4 — an unmatchable query returns nothing, never everything.** If the
+  normalized slug is empty (the visitor typed `!!!`, or whitespace), the search returns
+  `Profile.objects.none()`. This is load-bearing: `name__contains=""` matches every row,
+  so the naive implementation of this path silently turns a failed search into "all
+  published freelancers, ranked as if they matched". The seam with I5e: a **blank** search
+  box is the view's signal to call the browse service; a **non-blank but unmatchable**
+  query reaches the search service and comes back empty, which is decision 3's
+  "no result matches this search" state. Gets its own test.
+- **Decision D5 — ranking when several of a profile's tags match.** Rank by the highest
+  matching tag's `attested_count`, tie-broken by the latest matching `last_attested_at`,
+  then `handle` ascending, which is total because `handle` is unique. Tags that did **not**
+  match must not influence rank at all — Django scopes an aggregate to a join already
+  narrowed by a preceding `filter()`, which is documented behaviour but subtle enough that
+  it gets a dedicated test rather than trust (a profile with `python` at count 50 and
+  `react-native` at count 1, searched for "react", ranks on 1).
+- **Decision D6 — annotation names are part of the contract I5e renders**, so they are
+  pinned by test, not left to the builder's convenience: `latest_attested_at` on the
+  browse, `matched_attested_count` and `matched_last_attested_at` on the search.
+- **Decision D7 — both services return a lazy `QuerySet`, not a list.** Decision 4's
+  pagination promise depends on it: `Paginator` must be able to slice and count without
+  pulling every published profile into memory. A list return would satisfy every
+  behavioural test and quietly break the bounded-page guarantee.
+- **Traps the builders are told about up front, all verified today rather than assumed:**
+  - `Attestation.signed_at` is in `IMMUTABLE_FIELDS` **and** `editable=False`, so a test
+    cannot backdate a signed row. Distinct recency must come from either `create()` with
+    an explicit `signed_at` (the guard only runs when `pk` is set) or from writing
+    `CapabilityTag` rows directly, which is legitimate because the cache is precisely what
+    these read-only services consume.
+  - **Since I5c, any attestation save recomputes that owner's tags.** A test that writes
+    `CapabilityTag` rows by hand and then saves an attestation will have its fixture
+    silently rebuilt underneath it.
+  - `CapabilityTag.Meta.ordering` is `("name",)`. `Profile` has no `Meta.ordering`, so the
+    classic default-ordering-poisons-`GROUP BY` trap does not apply here — but the browse
+    ordering must still be asserted explicitly rather than inherited from anywhere.
+  - A **raw-SQL payload tamper does not trigger a recompute**, so a cache built before the
+    tamper stays stale. The tamper test therefore asserts the guard where it actually
+    lives: tamper, recompute, then assert the tag is gone from the listing. The staleness
+    window is out-of-band by construction (no view, service or admin control reaches it)
+    and is pre-existing rather than introduced here — recorded, not fixed, and explicitly
+    **not** an invitation to widen scope.
+
+#### I5d execution log (2026-07-30)
+
+Owning department Ledger, full dispatch, standard (non-hazard) builder seat. Suite
+**426 → 450 green**, ruff clean on both touched files. The implementation is 73 additive
+lines in `ledger/services.py`; every defect found in this milestone was in the **tests**,
+not the code.
+
+- **Implementer-adversary (Sonnet 5): ACCEPT**, one advisory. It settled the aggregate-
+  scoping question by printing the generated SQL rather than citing the ORM docs: the
+  capability filter lands in the same `WHERE` clause as the join, so `MAX()` sees only
+  rows that already passed the name filter, and the `GROUP BY` over `Profile`'s columns
+  means the join cannot duplicate a profile row. It also confirmed laziness by inspecting
+  `_result_cache` and `_prefetch_related_lookups` rather than by reading the code. The
+  single advisory — a non-string `capability_query` would raise `AttributeError` on
+  `.strip()` — is unreachable, since the only caller is an I5e view reading `request.GET`,
+  which yields `str` or `None`, both handled.
+- **Orchestrator caught a coverage gap before the harness reached the adversary.** No test
+  gave a single profile **several** matching tags, which is exactly where a join
+  multiplies rows. Three contracts were unasserted: one row per profile in each service,
+  and which of the matching tags sets the rank. Sent back rather than filed, and all three
+  now hold — Django's `GROUP BY` deduplicates without an explicit `.distinct()`.
+- **Verifier-adversary (Grok 4.5), 29 mutations: REJECT** with three majors, all
+  behaviour-changing and reachable through the views I5e will add, and all of them
+  softball *tests* rather than implementation defects. The pattern in all three is the
+  same and worth naming: **a fixture that ties on nothing cannot pin a tie-break.** The
+  search `handle` clause decided nothing because no fixture tied on both count and
+  recency; the search recency clause decided nothing because the handles happened to sort
+  in the same order as the timestamps, so one clause silently stood in for the other; and
+  `icontains` survived promotion to `iexact` because every text query equalled the whole
+  field value, never a substring. Twenty-six mutations died, including every
+  load-bearing cell: the `is_public` filter, the empty-slug guard, `slugify`, `contains`,
+  the filter-before-annotate scoping, the `skills_csv` exclusion, `prefetch_related` and
+  the lazy-`QuerySet` contract.
+- **The fix for the fixtures caused a regression, which is the lesson of this milestone.**
+  While closing the three findings the builder also strengthened the browse
+  null-placement assertion by giving every browse profile a distinct timestamp — and in
+  doing so removed the ties that had been pinning the browse `handle` tie-break. A
+  mutation the adversary had already killed began surviving. Caught at final acceptance,
+  fixed by a fixture that pins recency tiers, the handle tie-break and null placement
+  simultaneously, and **re-verified by the orchestrator running that mutation directly**
+  rather than accepting the builder's report. Carry this forward: **when a fixture is
+  rewritten to close a coverage hole, re-run the mutations that the old fixture was
+  killing** — the rewrite is as likely to move coverage as to add it.
+- **Second Verifier-adversary, fresh context, scoped to the three rewritten classes:
+  ACCEPT**, 25 in-scope mutations, no behaviour-changing reachable survivors. Dispatched
+  fresh rather than resumed, per the I5c precedent that an adversary asked whether its own
+  findings were addressed is prone to agree. It was told about the regression above as
+  evidence that this specific rewrite carries risk. Two survivors, neither a finding:
+  `icontains` → `contains` is an equivalent mutant on SQLite, and the `nulls_last`
+  omission is the known limitation below.
+- **Known limitation, recorded rather than chased.** Removing `nulls_last=True` from the
+  browse ordering **cannot be falsified on SQLite**, because plain `DESC` already places
+  nulls last on that backend. On PostgreSQL `DESC` places them first, so the keyword is
+  load-bearing in production and unfalsifiable in the only environment the suite runs in.
+  Mutating to `nulls_first=True` does die, which proves the clause is read, and that is
+  the most the harness can honestly claim. The same asymmetry makes `icontains` →
+  `contains` an equivalent mutant here and a real difference on Postgres.
+- Both dispute claims in the plan's test strategy stayed separate as intended. I5c owns
+  "the cache stays correct after any dispute write path"; I5d owns "given a correct cache,
+  a disputed freelancer is never presented as clean" — a partly-disputed freelancer
+  reports an attested count of one rather than two, and a wholly-disputed one drops out of
+  capability search while remaining in the browse with zero tags.
+- **Compliance Gate (fresh-context, Opus 5): PASS**, all eight items verified against the
+  code rather than the plan, including `makemigrations --check` to prove there is no
+  schema change and its own full-suite run. It confirmed the diff is additive by
+  `--numstat` (zero deleted lines in all three files), so the two open `I001` import Refit
+  candidates were not closed by stealth. Two non-blocking advisories, one of which I5e
+  must act on.
+- **Carried to I5e by the Compliance Gate (advisory, non-blocking, accepted).**
+  `matched_attested_count` is the **maximum** across matching tags, not a sum: a search for
+  "react" against a freelancer holding `react` at 1 and `react-native` at 4 reports **4**,
+  not 5. That is decision D5 as written and it errs conservatively — the number always
+  corresponds to a real attested count for one real tag and can never overstate. But
+  because D3 makes matching a substring, I5e will render that number beside a possibly
+  broader match, so **the card copy must read as the count for a single attested
+  capability, not as a total across everything the query matched.** Getting this wrong
+  would be a ruling 1 conflation failure of exactly the kind decision 2 exists to prevent.
+
 #### I5c execution log (2026-07-30)
 
 Owning department Ledger, hazard zone, full dispatch, Verifier-first. Suite
