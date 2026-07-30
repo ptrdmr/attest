@@ -57,7 +57,7 @@ production deploy today would be a dead end for every visitor.** Evidence:
    `DEBUG=0`, and there is no real gateway, so the entitlement gate on
    `ProjectCreateView` rejects everyone.
 
-```148:151:config/settings.py
+```149:151:config/settings.py
 ATTEST_BILLING_STUB_MODE = (
     os.environ.get("ATTEST_BILLING_STUB_MODE", "1" if DEBUG else "0") == "1"
 )
@@ -205,6 +205,11 @@ explanation, is a spam-filter magnet that reads as phishing to a human who gets
 past the filter. **This is the single highest-leverage marketing defect in the
 codebase, and it presents as a deliverability bug rather than a marketing one.**
 
+All four of the product's emails share this shape — the three client-facing ones
+(criteria review, signing, change order) and the freelancer's own login link,
+whose body is likewise just `login_url` under the subject "Your Attest login
+link." So the defect costs us the client channel *and* our own signup completion.
+
 Three further gaps on the same surface:
 
 - **Client pages never explain what Attest is** or that the process protects the
@@ -218,12 +223,12 @@ Three further gaps on the same surface:
   it, or how to check. To a prospective client, an unexplained self-published
   "Verified" badge is decoration at best and suspicious at worst.
 
-**Candidates for a Planner, in leverage order:** (1) rewrite the four client
-emails as real messages — who it is from, what is being asked, what Attest is,
-why the link is long; (2) a public "how this is verified" explainer the record
-links to; (3) a client-facing footer and a post-signature moment on the client
-templates. Item 1 is a prerequisite for measuring anything about the client
-funnel, because a spam-foldered email is indistinguishable from client apathy.
+**Candidates for a Planner, in leverage order:** (1) rewrite all four emails as
+real messages — who it is from, what is being asked, what Attest is, why the
+link is long; (2) a public "how this is verified" explainer the record links to;
+(3) a client-facing footer and a post-signature moment on the client templates.
+Item 1 is a prerequisite for measuring anything about the client funnel, because
+a spam-foldered email is indistinguishable from client apathy.
 
 ---
 
@@ -253,6 +258,22 @@ Assumes a very small team and no meaningful ad budget.
    known. We have no LTV, no retention curve, and an activation event that
    depends on a third party. Paid spend before that is buying noise.
 
+**Assumptions this plan relies on, stated so they can be attacked:**
+
+- **The freelancer already has clients.** Attest documents work; it does not
+  source it. Someone with no pipeline gets zero value, which rules out "win more
+  work" as the *acquisition* promise even though it is the Product B narrative.
+- **The freelancer is willing to impose process on a client they are courting.**
+  This is the most underweighted adoption risk in the whole plan. The client
+  holds the power in the relationship, and a freelancer competing for a contract
+  may not risk adding a step. If the freelancer will not ask, nothing downstream
+  happens — and unlike the email defect, no product fix solves it. Every design
+  partner interview must ask directly: *did you hesitate to send this to your
+  client, and why?*
+- **Clients will tolerate a second web app** with no account, on an emailed link.
+- **Fixed-price engagements are common in the target niche.** In hourly or
+  retainer work the acceptance-criteria frame is much weaker.
+
 **Wedge audience recommendation:** fixed-price, single-deliverable engagements
 in the $2k–$25k range where one dispute costs a month's income — website and
 Shopify builds, brand identity, audits, technical writing, data and automation
@@ -267,11 +288,16 @@ PROJECT_PACK_LABEL = "$39/project pack"
 ```
 
 Pro grants unlimited projects for $29/mo; the pack grants **one** project for
-$39. The pack is strictly dominated — any rational buyer takes one month of Pro
-for $10 less and cancels. As priced, nobody should ever buy the pack. This needs
-resolving before Stripe is wired, and the per-project SKU is arguably the one to
+$39. **The price ladder is inverted:** a single project costs more than a month
+of unlimited projects, so anyone willing to subscribe and cancel pays $10 less
+for strictly more. The pack's only rational buyer is someone who prefers a
+one-time charge to a subscription they must remember to cancel — a real
+preference, but not one worth a $10 premium framed this way. This needs
+resolving before Stripe is wired. The per-project SKU is arguably the one to
 lead with, since it maps to the moment of felt risk and does not compete for the
-subscription budget already spent on an all-in-one tool.
+subscription budget already spent on an all-in-one tool — but then it must be
+priced below a month of Pro, or Pro must be repositioned as the volume plan it
+actually is.
 
 ---
 
@@ -312,6 +338,10 @@ not established benchmarks:
   delivery and signing step is too heavy, or projects simply do not finish.
 - **Second project started unassisted within 60 days of the first attestation:
   ≥ 40%.** The real product-market-fit signal for a per-project tool.
+  *"Unassisted" needs an operational definition, or the number is unfalsifiable:*
+  no outreach of any kind from us to that freelancer inside the window — no
+  check-in, no nudge, no interview request. Concierge onboarding makes this easy
+  to violate accidentally, so the window must be logged per user.
 - **Willingness to pay: ≥ 25%** of freelancers who complete one attestation pay
   for the second. **Currently unmeasurable** — the billing stub means the most
   important business question in the document cannot be answered until Stripe is
@@ -331,8 +361,14 @@ Cohort gates, in order:
   nothing on acquisition.
 - **Gate 2 — it works unassisted.** Across 25 attestations from 15 or more
   freelancers, unassisted second-project rate at or above the threshold.
-- **Gate 3 — the moat is real.** Non-owner record views are non-trivial, and
-  multiple freelancers independently report sending their record to a prospect.
+- **Gate 3 — the moat is real.** Two conditions, because "the moat is working" is
+  otherwise a vibe rather than a gate. Quantitative: **at least half of published
+  records receive one or more non-owner views**, and the median published record
+  gets more than one. Qualitative: **at least 3 freelancers, unprompted in
+  structured interviews, report sending their record to a prospect**, with at
+  least one describing a response to it. The qualitative half cannot be
+  instrumented and must be gathered by interview — that is a deliberate choice,
+  not an oversight, because "did it help you win work" has no telemetry.
 
 ---
 
@@ -365,6 +401,21 @@ A sixth risk is reputational rather than metric: **trust-artifact skepticism.**
 A self-published "Verified" badge with no third-party verification path can read
 as self-certification. Mitigated by the public verification explainer in
 section 5 and by the claim discipline in section 4.
+
+**Two failure paths the plan must not leave undefined:**
+
+- **The project that never gets signed.** A client who is unhappy simply does not
+  sign, leaving a `delivered` project and a freelancer whose experience is "I did
+  the work, used the tool, and got no record." This is not a bug, but it is a
+  churn event and a support event, and it must be counted separately from client
+  apathy — otherwise it corrupts the stage 6 → 7 ratio.
+- **The client who wants to dispute has nowhere to go.** `flag_dispute` and
+  `resolve_dispute` exist in the Ledger with no URL and no view anywhere in
+  Surface. We intend to market honest dispute disclosure — the public record is
+  built to withhold disputed attestations — while offering the disputing party no
+  route to raise one. If we make dispute handling part of the pitch, that gap is
+  a credibility liability, and it belongs on the pre-marketing list rather than
+  in the roadmap's tail.
 
 ---
 
@@ -403,8 +454,16 @@ constitution's prohibition on logging client PII:
 
 Any analytics choice is a **new dependency and therefore requires explicit
 approval** per the constitution. A first pass can be built from existing model
-timestamps (`submitted_at`, `approved_at`, `signed_at`) plus a small event
-table, with no third-party service and no new package.
+timestamps (`submitted_at`, `approved_at`, `signed_at`) plus a small event table,
+with no third-party service and no new package.
+
+**Two dispatch facts the eventual Planner must not miss.** An event table is a
+**schema change and therefore Ledger-owned, requiring explicit plan
+authorization** — instrumentation is a real initiative, not a fast-path add-on.
+And rewriting the emails means editing the send paths that mint purpose-bound
+client tokens and the magic-link login token; that is **auth-flow and hazard-zone
+code, so it takes full dispatch**, not a copy edit. Neither is a reason to defer
+the work; both are reasons not to under-scope it.
 
 ---
 
@@ -414,8 +473,13 @@ table, with no third-party service and no new package.
    with one message everywhere?
 2. **Design-partner billing posture** — run the first cohort with
    `ATTEST_BILLING_STUB_MODE=1` and defer the pricing question, or wire Stripe
-   first and learn willingness to pay from the first cohort?
-3. **Pricing structure** — resolve the dominated project pack. Which SKU leads,
+   first and learn willingness to pay from the first cohort? Note that running a
+   real deployment with the stub enabled means **every visitor can create
+   projects for free**, which the constitution treats as a billing gate that may
+   not be weakened "except by an explicitly authorized plan." Whichever way this
+   goes, it needs to be an explicit written authorization, not an env var someone
+   sets during a deploy.
+3. **Pricing structure** — resolve the inverted price ladder. Which SKU leads,
    and at what numbers?
 4. **Success thresholds** — ratify, adjust, or reject the proposed rates in
    section 7. They are informed guesses and should be owned by a human.
@@ -435,3 +499,15 @@ table, with no third-party service and no new package.
 - Launch-readiness gaps cross-checked against `PLAN.md`, `ROADMAP.md`,
   `config/settings.py`, `requirements.txt`, and git history (32 commits,
   2026-07-18 → 2026-07-27, no deployment artifacts).
+
+**Review provenance, recorded because the charter requires an adversary pass.**
+An independent Planner-adversary seat could not be dispatched — three subagent
+launches were aborted by the environment. This document was therefore
+self-reviewed against the Planner-adversary checklist in `stance_adversary.mdc`,
+which produced the assumptions list in section 6, the operational definition of
+"unassisted" and the quantified Gate 3 in section 7, the two undefined failure
+paths in section 8, and the dispatch notes in section 10. Self-review is weaker
+than an independent seat by exactly the amount the charter implies, so **this
+document has not cleared an independent adversary and should be treated as a
+first draft pending one.** Its factual claims, by contrast, were each verified
+directly against the code and are cited inline.

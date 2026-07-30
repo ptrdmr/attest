@@ -83,4 +83,6 @@ ceiling.
 - `surface/` — views, templates, urls, forms, magic-link auth, client token
   access, integration call sites (Stripe/AI/S3).
 
-Agent workflow rules live in `.cursor/rules/`; the build plan is `PLAN.md`.
+Agent workflow rules live in `.cursor/rules/`; the build plan is `PLAN.md`, the
+feature sequence is `ROADMAP.md`, and the go-to-market plan with its success and
+failure criteria is `GO_TO_MARKET.md`.
