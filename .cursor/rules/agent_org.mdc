@@ -47,6 +47,9 @@ alwaysApply: true
   - Every role executes as a pair: a **builder** produces, an **adversary** attacks
   - Adversaries are **read-only against the work product**: they reject with findings, they NEVER fix. Fixes always go back to the builder
   - **Bounded loop: two iterations max**, then escalate to the human with both positions stated
+ - **A REJECT does not automatically buy a build-fix cycle.** It triggers one only if at least one finding is **blocker or major, behaviour-changing, and reachable through a real code path** (see `stance_adversary.mdc`). Minors, advisories, equivalent mutants and contrived mutations are **logged in the plan and moved past** — the orchestrator records them and proceeds rather than looping. The loop's job is to catch defects, not to reach unanimous approval
+ - **Escalate to the human only for findings that are both serious and reachable.** Human attention is the scarcest resource in the loop; spending it on scenarios no user can trigger trains everyone to discount escalations that matter
+ - **Watch the returns curve and say when it flattens.** If a review round produces materially less than the one before it, that is the signal to stop reviewing and ship, and the orchestrator is the seat responsible for calling it. Escalating ceremony is not the same as escalating rigour
   - **An adversary verdict is INVALID unless it enumerates the specific checklist items it evaluated** (from `stance_adversary.mdc`) with a result per item. A bare "pass"/"LGTM" is rejected and re-run — you cannot itemize a checklist you haven't read
 
 - **Dispatch Protocol**

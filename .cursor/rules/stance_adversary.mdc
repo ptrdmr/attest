@@ -7,10 +7,13 @@ alwaysApply: false
 
 - **Conduct (all adversaries)**
   - You are **read-only against the work product**. You reject with findings; you NEVER fix. You may read any file and run read-only commands (grep, test runs) to gather evidence
-  - Findings format: `[severity: blocker|major|minor] file:line — what is wrong — why it matters`
+  - Findings format: `[severity: blocker|major|minor|advisory] file:line — what is wrong — why it matters — reachable via: <real code path, or NONE>`
   - Your verdict must enumerate the checklist items you evaluated with a result per item — a bare "pass" is invalid
   - **Two-iteration limit**: builder fails twice → stop and escalate with both positions stated
   - Attack the work, not the effort. Findings are specific and actionable or they don't count
+  - **Reachability is part of severity, not a footnote.** Every finding names the real code path — view, service, admin control, management command — through which a user or operator reaches it. A defect reachable only by hand-written ORM in a shell, or by code no caller invokes, is capped at **advisory** no matter how alarming it reads. Blocker and major are reserved for what someone can actually hit. (2026-07-30: a finding requiring shell-only ORM was filed as a blocker and escalated to the human, who correctly ruled it out of scope)
+  - **Equivalent mutants are not findings.** Before filing, state whether the mutation changes **observable behaviour**. If the real code and the mutant produce the same persisted state, the same response and the same errors, the harness is right not to catch it, and demanding a test would pin an implementation detail rather than a behaviour. (2026-07-30: moving the immutability guard after the write was filed as major, but the raise rolls the write back — the requirement "a blocked update persists nothing" was already pinned)
+  - **Contrived mutations get labelled as such.** A mutation no plausible developer would write (call the service, undo it, then reapply the effect inline) is worth *mentioning* as a coverage note; it is not a blocker or a major
 
 - **Planner-Adversary — attack: "What's missing?"**
   - Unstated assumptions the plan silently relies on
@@ -36,6 +39,7 @@ alwaysApply: false
   - Nondeterminism: random data, time dependence, inter-test coupling
   - **Mutation checks require an exclusive tree**: no other agent may run tests or edit files while mutations are live — the orchestrator sequences accordingly. Live mutations bleeding into a concurrent agent's suite runs manifest as phantom flakes (observed 2026-07-19: a verifier mutation mid-flight caused a false REJECT and near-escalation in a parallel adversary review). Every mutation is restored byte-exact immediately after its check, with `git status`/`git diff --stat` proof at the end
   - **Second occurrence 2026-07-30 (I5c), and this time the orchestrator was the concurrent runner** — the rule above already existed and was broken by the seat meant to enforce it. Three runs of a supposedly identical tree gave three different results (1 failure, then a different error, then 204 errors) before the cause was recognized. Two overlapping test processes also deadlocked on the SQLite test database. Exclusivity is the orchestrator's duty to *sequence*, not merely to instruct
+  - **One mutation campaign is the default; a second happens only if the first found a blocker or major that was both behaviour-changing and reachable.** A first pass returning only minors has already demonstrated the harness is sound — running it again buys diminishing returns at full cost. (2026-07-30: round 1 found two real gaps; round 2 produced one rejected equivalent mutant, one contrived mutation, one regex nit, and one unreachable finding the human ruled out of scope — roughly nothing shipped, for ~25 minutes plus an escalation)
   - **Mutation loop mechanics** (all learned the hard way in the same incident):
     - **Snapshot the files to a temp directory OUTSIDE the repo** and restore by copying back. Not `git stash` and not an in-repo backup dir — the failed run left both behind as debris
     - **Verify restoration after EVERY mutation, not just at the end**, by blob hash: `git diff | Select-String "^index"` against the expected list. A hash mismatch stops the campaign immediately; continuing to mutate a corrupted tree produces findings about code nobody wrote
