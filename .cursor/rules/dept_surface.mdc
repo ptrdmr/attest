@@ -28,3 +28,9 @@ alwaysApply: false
 - **Verification**
   - `.\.venv\Scripts\python manage.py test <app_label>` (scoped) then full suite
   - Smoke: request public record page + one tokenized client view; assert 200 and no PII/tokens in rendered output
+
+- **Hand-driven walkthroughs — a browser agent's report is evidence, not a verdict**
+  - Two walkthrough "critical defects" have now been false positives, and both cost real investigation time. Confirm any reported defect server-side (Django test client against the dev database) before accepting it
+  - **A browser agent cannot see native browser UI.** "Submitting did nothing / gave no feedback" almost always means **HTML5 client-side validation fired and the request never reached the server** — a `URLField` renders `<input type="url">` and a required field renders `required`. Check the field types before believing the server is silent
+  - Character-encoding complaints in agent screenshots are usually the tool's own rendering. Verify with the response's `Content-Type` charset and a raw-byte fetch before treating it as a defect
+  - Identity-isolation walkthroughs must establish identities **in the order the plan specifies**; a stale session from a previous attempt produces convincing but false isolation failures

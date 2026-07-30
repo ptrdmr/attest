@@ -56,6 +56,8 @@ alwaysApply: true
   - Mission briefs carry **pointers, not payloads**: task excerpt, role + stance assignment, file boundaries for THIS task, and an instruction to read the relevant department + stance rule files before acting. Never paraphrase rule content into a brief — rule files are the single source of truth
   - **Parallel milestones must assign every shared file to exactly one milestone's boundary at dispatch** (README, urls, settings, shared templates). A file claimed by two concurrent briefs is a dispatch defect — resolve ownership before launching, not at commit time
   - **If a builder session dies mid-task, the working tree is the work product, not the report.** The orchestrator assesses the diff and test state before re-dispatching; completed work goes straight to adversary review instead of being rebuilt
+ - **An interrupt does not reliably kill a subagent** (observed 2026-07-30): an interrupted adversary kept running for ~20 more minutes, kept editing files, and kept spawning test processes. After ANY interrupt or abort, before doing anything else: verify the tree by blob hash, check `git stash list` and untracked paths for debris, and check for orphaned OS processes. The failed run left an active mutation in a production file that was minutes away from being reviewed as if it were real code
+ - **When repeated runs of "the same" tree disagree, suspect the tree, not the code.** The reliable tell is an *impossible* failure — a symptom the code in front of you cannot produce (2026-07-30: a signal receiver firing for a sender it was explicitly filtered against). Stop debugging and go looking for a second writer
 
 - **Correctness Chain (three questions, three owners)**
 
@@ -94,3 +96,5 @@ alwaysApply: true
   - Final acceptance against the approved plan before any commit
   - Updates project documentation when a feature/initiative completes
   - Maintains the plan as work progresses; logs escalations and Refit candidates
+ - **Cite code in the plan by symbol name, never by line number.** Line citations rot silently and mislead the next builder: one finding's citations broke twice in a single day (2026-07-30), the second time within an hour, because a test commit inserted lines above them. `ClassName.test_method_name` and `function_name` survive edits; `file.py:2825` does not
+ - **Briefs carry the traps, not just the task.** Every hazard the orchestrator discovers during recon — circular imports, return values a wrapper must preserve, assertions that pass vacuously — goes into the brief explicitly. A builder who hits a known trap the orchestrator already knew about is a dispatch failure, not a builder failure

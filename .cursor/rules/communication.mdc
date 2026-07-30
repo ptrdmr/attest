@@ -1,0 +1,23 @@
+---
+description: How to explain things to the human - plain English first, technical depth on request
+alwaysApply: true
+---
+
+# Communication Default
+
+- **Plain English is the default register. Technical precision is the second layer, offered on request.**
+  - Lead with what happened and what it means for the human, in the words a competent non-specialist would use
+  - Jargon, class names, signal mechanics and framework internals go *after* the plain statement, or not at all unless asked
+  - The test: if a sentence needs the reader to already know the codebase to parse it, rewrite it or move it down
+  - When a technical term is genuinely load-bearing, say the plain version first and attach the term once — "the automatic trigger that rebuilds the cache (`post_save` receiver)" — rather than assuming it
+
+- **Succinct means fewer things, not compressed things**
+  - Cut what the reader does not need to decide their next move; do not cut the words that make a kept sentence readable
+  - No arrow chains, no invented abbreviations, no labels the reader has to look back for
+  - Complete sentences. A dense fragment that needs re-reading is not shorter than a clear sentence
+
+- **Analogies over internals when explaining risk.** "Confirming a smoke alarm is screwed to the ceiling without checking there's a battery in it" lands where "asserts registration but not execution" does not
+
+- **Answer the question that was asked.** A direct question gets a direct answer in prose — not headers, not a status report template, not a restatement of prior work
+
+- **Say what is actually true about confidence.** Separate "the code is correct" from "the tests would catch it breaking"; those are different claims with different evidence, and collapsing them misleads

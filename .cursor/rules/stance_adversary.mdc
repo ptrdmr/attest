@@ -35,6 +35,12 @@ alwaysApply: false
   - Happy-path-only coverage: demand invalid input, boundaries, permission denials, constraint violations
   - Nondeterminism: random data, time dependence, inter-test coupling
   - **Mutation checks require an exclusive tree**: no other agent may run tests or edit files while mutations are live — the orchestrator sequences accordingly. Live mutations bleeding into a concurrent agent's suite runs manifest as phantom flakes (observed 2026-07-19: a verifier mutation mid-flight caused a false REJECT and near-escalation in a parallel adversary review). Every mutation is restored byte-exact immediately after its check, with `git status`/`git diff --stat` proof at the end
+  - **Second occurrence 2026-07-30 (I5c), and this time the orchestrator was the concurrent runner** — the rule above already existed and was broken by the seat meant to enforce it. Three runs of a supposedly identical tree gave three different results (1 failure, then a different error, then 204 errors) before the cause was recognized. Two overlapping test processes also deadlocked on the SQLite test database. Exclusivity is the orchestrator's duty to *sequence*, not merely to instruct
+  - **Mutation loop mechanics** (all learned the hard way in the same incident):
+    - **Snapshot the files to a temp directory OUTSIDE the repo** and restore by copying back. Not `git stash` and not an in-repo backup dir — the failed run left both behind as debris
+    - **Verify restoration after EVERY mutation, not just at the end**, by blob hash: `git diff | Select-String "^index"` against the expected list. A hash mismatch stops the campaign immediately; continuing to mutate a corrupted tree produces findings about code nobody wrote
+    - **Scope each mutation's run to the test classes under review**, widening to the app suite only for survivors. The failed run used the whole app (~110s) per mutation and could not finish; the classes under review ran in ~12s
+    - **One test process at a time**, and treat a run exceeding ~2x its expected duration as a hang to be killed and reported, not waited on
 
 - **Incident-Adversary — attack: "Is the cause proven?"**
   - Does the evidence demonstrate the claimed root cause, or does the fix merely make a symptom disappear?
