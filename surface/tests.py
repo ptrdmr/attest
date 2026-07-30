@@ -15,6 +15,7 @@ from django.contrib.messages import get_messages
 from django.core.cache import cache
 from django.core.cache.backends.db import DatabaseCache
 from django.core import mail, signing
+from django.core.exceptions import ValidationError
 from django.db import connection
 from django.test import Client, RequestFactory, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
@@ -30,22 +31,21 @@ from ledger.models import (
     Project,
 )
 from ledger.services import (
+    _PROFILE_DETAIL_FIELDS,
     InvalidTransition,
     amend_attestation,
     approve_criteria,
     compute_payload_hash,
     flag_dispute,
     mark_delivered,
+    set_profile_details,
     set_profile_visibility,
     sign_attestation,
     submit_criteria_for_approval,
     suspend_acceptance_item,
     withdraw_acceptance_item,
 )
-from surface import billing
-from surface import client_auth
-from surface import consent
-from surface import portal_views
+from surface import billing, client_auth, consent, portal_views
 from surface.auth import (
     MAGIC_LOGIN_MAX_AGE,
     MAGIC_LOGIN_SALT,
@@ -54,9 +54,10 @@ from surface.auth import (
     make_magic_login_token,
     read_and_consume_magic_login_token,
 )
+from surface.forms import ProfileDetailsForm
 from surface.tokens import (
-    CLIENT_TOKEN_PURPOSES,
     CLIENT_TOKEN_MAX_AGE,
+    CLIENT_TOKEN_PURPOSES,
     PORTAL_TOKEN_MAX_AGE,
     PORTAL_TOKEN_SALT,
     make_change_order_token,
@@ -65,7 +66,6 @@ from surface.tokens import (
     read_client_token,
     read_portal_token,
 )
-
 
 _profile_counter = 0
 
@@ -3822,6 +3822,451 @@ class ProfileVisibilityViewTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.owner.refresh_from_db()
         self.assertFalse(self.owner.is_public)
+
+
+def profile_details_form_data(**overrides):
+    """Return valid POST data for ProfileDetailsForm."""
+    data = {
+        "display_name": "Updated Name",
+        "headline": "New headline",
+        "bio": "New bio",
+        "location": "Portland, OR",
+        "website_url": "https://example.com",
+    }
+    data.update(overrides)
+    return data
+
+
+class ProfileEditViewTests(TestCase):
+    """Owner profile identity editing through the I5a service seam."""
+
+    def setUp(self):
+        """One profile with seeded identity fields and the edit URL."""
+        self.owner = make_profile(handle="profile-edit-owner")
+        set_profile_details(
+            self.owner,
+            display_name="Original Name",
+            headline="Original headline",
+            bio="Original bio",
+            location="Original City",
+            website_url="https://original.example.com",
+        )
+        self.url = reverse("surface:profile-edit")
+        self.record_url = reverse(
+            "surface:public-record",
+            kwargs={"handle": self.owner.handle},
+        )
+
+    def test_anonymous_get_redirects_to_login(self):
+        """Unauthenticated visitors cannot open the profile edit form."""
+        response = Client().get(self.url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("surface:login-request"), response.url)
+
+    def test_anonymous_post_redirects_to_login(self):
+        """Unauthenticated POSTs are rejected before any profile data can change."""
+        client = Client()
+        original_name = self.owner.display_name
+
+        response = client.post(self.url, profile_details_form_data())
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("surface:login-request"), response.url)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.display_name, original_name)
+
+    def test_portal_session_cannot_get_profile_edit(self):
+        """A client-portal session without a Django user cannot open profile edit."""
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = "portal-client@example.com"
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = timezone.now().timestamp()
+        session.save()
+
+        response = client.get(self.url)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("surface:login-request"), response.url)
+
+    def test_portal_session_cannot_post_profile_edit(self):
+        """A client-portal session cannot POST profile edits without a Django user."""
+        client = Client()
+        session = client.session
+        session[client_auth.CLIENT_EMAIL_SESSION_KEY] = "portal-client@example.com"
+        session[client_auth.CLIENT_VERIFIED_AT_SESSION_KEY] = timezone.now().timestamp()
+        session.save()
+        original_name = self.owner.display_name
+
+        response = client.post(self.url, profile_details_form_data())
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("surface:login-request"), response.url)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.display_name, original_name)
+
+    def test_freelancers_posting_to_same_url_modify_only_own_profile(self):
+        """Each authenticated freelancer updates only their own profile row."""
+        other = make_profile(handle="profile-edit-other")
+        set_profile_details(
+            other,
+            display_name="Other Original",
+            headline="Other headline",
+            bio="Other bio",
+            location="Other City",
+            website_url="https://other.example.com",
+        )
+        owner_client = Client()
+        other_client = Client()
+        login_as(owner_client, self.owner)
+        login_as(other_client, other)
+
+        owner_response = owner_client.post(
+            self.url,
+            profile_details_form_data(
+                display_name="Owner Updated",
+                headline="Original headline",
+                bio="Original bio",
+                location="Original City",
+                website_url="https://original.example.com",
+            ),
+        )
+        other_response = other_client.post(
+            self.url,
+            profile_details_form_data(
+                display_name="Other Updated",
+                headline="Other headline",
+                bio="Other bio",
+                location="Other City",
+                website_url="https://other.example.com",
+            ),
+        )
+
+        self.assertRedirects(owner_response, self.record_url)
+        self.assertRedirects(
+            other_response,
+            reverse("surface:public-record", kwargs={"handle": other.handle}),
+        )
+        self.owner.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(self.owner.display_name, "Owner Updated")
+        self.assertEqual(self.owner.headline, "Original headline")
+        self.assertEqual(other.display_name, "Other Updated")
+        self.assertEqual(other.headline, "Other headline")
+        self.assertEqual(other.bio, "Other bio")
+
+    def test_posting_foreign_handle_updates_actor_not_victim(self):
+        """A hostile POST handle cannot redirect edits onto another profile."""
+        victim = self.owner
+        actor = make_profile(handle="profile-edit-actor")
+        set_profile_details(
+            actor,
+            display_name="Actor Original",
+            headline="Actor headline",
+            bio="Actor bio",
+            location="Actor City",
+            website_url="https://actor.example.com",
+        )
+        victim_snapshot = {
+            "display_name": victim.display_name,
+            "headline": victim.headline,
+            "bio": victim.bio,
+            "location": victim.location,
+            "website_url": victim.website_url,
+        }
+        client = Client()
+        login_as(client, actor)
+        actor_record_url = reverse(
+            "surface:public-record",
+            kwargs={"handle": actor.handle},
+        )
+
+        response = client.post(
+            self.url,
+            profile_details_form_data(
+                handle=victim.handle,
+                display_name="Actor Updated Name",
+                headline="Actor Updated headline",
+                bio="Actor Updated bio",
+                location="Actor Updated City",
+                website_url="https://actor-updated.example.com",
+            ),
+        )
+
+        self.assertRedirects(response, actor_record_url)
+        victim.refresh_from_db()
+        actor.refresh_from_db()
+        self.assertEqual(victim.display_name, victim_snapshot["display_name"])
+        self.assertEqual(victim.headline, victim_snapshot["headline"])
+        self.assertEqual(victim.bio, victim_snapshot["bio"])
+        self.assertEqual(victim.location, victim_snapshot["location"])
+        self.assertEqual(victim.website_url, victim_snapshot["website_url"])
+        self.assertEqual(actor.display_name, "Actor Updated Name")
+        self.assertEqual(actor.headline, "Actor Updated headline")
+        self.assertEqual(actor.bio, "Actor Updated bio")
+        self.assertEqual(actor.location, "Actor Updated City")
+        self.assertEqual(actor.website_url, "https://actor-updated.example.com")
+
+    def test_posted_handle_leaves_stored_handle_unchanged(self):
+        """A hostile handle field in POST is ignored and does not error."""
+        client = Client()
+        login_as(client, self.owner)
+        original_handle = self.owner.handle
+
+        response = client.post(
+            self.url,
+            profile_details_form_data(handle="hijacked-handle"),
+        )
+
+        self.assertRedirects(response, self.record_url)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.handle, original_handle)
+
+    def test_valid_post_delegates_to_set_profile_details(self):
+        """Validated POSTs persist through the Ledger service, not direct writes."""
+        client = Client()
+        login_as(client, self.owner)
+
+        with patch(
+            "surface.views.services.set_profile_details",
+            wraps=set_profile_details,
+        ) as details_service:
+            response = client.post(self.url, profile_details_form_data())
+
+        self.assertRedirects(response, self.record_url)
+        details_service.assert_called_once()
+        called_args, called_kwargs = details_service.call_args
+        self.assertEqual(called_args[0].pk, self.owner.pk)
+        self.assertEqual(called_kwargs, profile_details_form_data())
+
+    def test_profile_details_form_fields_match_service_allowlist(self):
+        """The form field set must stay coupled to the service writable allowlist."""
+        self.assertEqual(
+            tuple(ProfileDetailsForm.base_fields.keys()),
+            _PROFILE_DETAIL_FIELDS,
+        )
+
+    def test_get_pre_populates_form_with_current_profile_values(self):
+        """GET renders the edit form with the owner's current profile values."""
+        client = Client()
+        login_as(client, self.owner)
+
+        response = client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        form = response.context["form"]
+        self.assertEqual(form.initial["display_name"], "Original Name")
+        self.assertEqual(form.initial["headline"], "Original headline")
+        self.assertEqual(form.initial["bio"], "Original bio")
+        self.assertEqual(form.initial["location"], "Original City")
+        self.assertEqual(form.initial["website_url"], "https://original.example.com")
+        self.assertContains(response, "Original Name")
+        self.assertContains(response, "Original headline")
+        self.assertContains(response, "Original bio")
+
+    def test_valid_post_persists_all_fields_and_redirects(self):
+        """A valid POST saves every editable field and redirects to the record page."""
+        client = Client()
+        login_as(client, self.owner)
+        post_data = profile_details_form_data(
+            display_name="Saved Name",
+            headline="Saved headline",
+            bio="Saved bio",
+            location="Saved City",
+            website_url="https://saved.example.com",
+        )
+
+        response = client.post(self.url, post_data)
+
+        self.assertRedirects(response, self.record_url)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.display_name, "Saved Name")
+        self.assertEqual(self.owner.headline, "Saved headline")
+        self.assertEqual(self.owner.bio, "Saved bio")
+        self.assertEqual(self.owner.location, "Saved City")
+        self.assertEqual(self.owner.website_url, "https://saved.example.com")
+        self.assertIs(self.owner.is_public, False)
+        self.assertEqual(self.owner.handle, "profile-edit-owner")
+
+    def test_clearing_optional_bio_field_persists_empty_bio(self):
+        """Submitting an empty optional field clears a previously stored value."""
+        client = Client()
+        login_as(client, self.owner)
+
+        response = client.post(
+            self.url,
+            profile_details_form_data(
+                display_name="Original Name",
+                headline="Original headline",
+                bio="",
+                location="Original City",
+                website_url="https://original.example.com",
+            ),
+        )
+
+        self.assertRedirects(response, self.record_url)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.bio, "")
+
+    def test_malformed_website_url_rerenders_without_persisting(self):
+        """A malformed website URL re-renders at 200 and leaves the stored value."""
+        client = Client()
+        login_as(client, self.owner)
+
+        response = client.post(
+            self.url,
+            profile_details_form_data(website_url="not-a-url"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Enter a valid URL.")
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.website_url, "https://original.example.com")
+
+    def test_overlong_location_rerenders_without_persisting(self):
+        """An over-length location re-renders at 200 and leaves the stored value."""
+        client = Client()
+        login_as(client, self.owner)
+
+        response = client.post(
+            self.url,
+            profile_details_form_data(location="x" * 121),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(
+            response.context["form"],
+            "location",
+            "Ensure this value has at most 120 characters (it has 121).",
+        )
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.location, "Original City")
+
+    def test_blank_display_name_rerenders_without_persisting(self):
+        """Whitespace-only display names are rejected by the form before the service."""
+        client = Client()
+        login_as(client, self.owner)
+
+        for blank_value in ("", "   "):
+            with self.subTest(blank_value=blank_value):
+                response = client.post(
+                    self.url,
+                    profile_details_form_data(display_name=blank_value),
+                )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertFormError(
+                    response.context["form"],
+                    "display_name",
+                    "This field is required.",
+                )
+                self.owner.refresh_from_db()
+                self.assertEqual(self.owner.display_name, "Original Name")
+
+    def test_service_field_validation_error_rerenders_without_traceback(self):
+        """A service ValidationError maps onto the form field without a 500."""
+        client = Client()
+        login_as(client, self.owner)
+
+        def raise_location_error(profile, **fields):
+            raise ValidationError({"location": ["Location is not allowed."]})
+
+        with patch(
+            "surface.views.services.set_profile_details",
+            side_effect=raise_location_error,
+        ):
+            response = client.post(
+                self.url,
+                profile_details_form_data(location="Valid City"),
+            )
+
+        content = response.content.decode()
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(
+            response.context["form"],
+            "location",
+            "Location is not allowed.",
+        )
+        self.assertContains(response, "Location is not allowed.")
+        self.assertNotIn("Traceback", content)
+        self.assertNotIn("Exception Type:", content)
+        self.assertNotIn("ValidationError", content)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.location, "Original City")
+
+    def test_service_non_field_validation_error_rerenders_without_traceback(self):
+        """A service __all__ ValidationError surfaces as a non-field form error."""
+        client = Client()
+        login_as(client, self.owner)
+
+        def raise_non_field_error(profile, **fields):
+            raise ValidationError({"__all__": ["Profile update rejected."]})
+
+        with patch(
+            "surface.views.services.set_profile_details",
+            side_effect=raise_non_field_error,
+        ):
+            response = client.post(self.url, profile_details_form_data())
+
+        content = response.content.decode()
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(
+            response.context["form"],
+            None,
+            "Profile update rejected.",
+        )
+        self.assertContains(response, "Profile update rejected.")
+        self.assertNotIn("Traceback", content)
+        self.assertNotIn("Exception Type:", content)
+        self.assertNotIn("ValidationError", content)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.display_name, "Original Name")
+
+    def test_owner_post_requires_csrf_token(self):
+        """CSRF middleware rejects profile edit POSTs without a token."""
+        client = Client(enforce_csrf_checks=True)
+        login_as(client, self.owner)
+        original_name = self.owner.display_name
+
+        response = client.post(self.url, profile_details_form_data())
+
+        self.assertEqual(response.status_code, 403)
+        self.owner.refresh_from_db()
+        self.assertEqual(self.owner.display_name, original_name)
+
+    def test_owner_record_page_shows_edit_profile_details_link(self):
+        """The owner's record page links to the profile edit form."""
+        client = Client()
+        login_as(client, self.owner)
+
+        response = client.get(self.record_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Edit profile details")
+        self.assertContains(response, self.url)
+
+    def test_anonymous_published_record_hides_edit_profile_details_link(self):
+        """Anonymous visitors do not see the owner-only profile edit link."""
+        set_profile_visibility(self.owner, True)
+
+        response = Client().get(self.record_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Edit profile details")
+        self.assertNotContains(response, self.url)
+
+    def test_non_owner_published_record_hides_edit_profile_details_link(self):
+        """Another logged-in freelancer does not see someone else's edit link."""
+        set_profile_visibility(self.owner, True)
+        other = make_profile(handle="profile-edit-viewer")
+        client = Client()
+        login_as(client, other)
+
+        response = client.get(self.record_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Edit profile details")
+        self.assertNotContains(response, self.url)
 
 
 class ProfileAutoCreationTests(TestCase):

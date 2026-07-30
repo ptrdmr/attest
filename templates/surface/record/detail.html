@@ -19,13 +19,16 @@
       {% else %}
         <p role="status"><strong>Not published</strong> — only you can see this private preview.</p>
       {% endif %}
-      <form method="post" action="{% url 'surface:profile-visibility' profile.handle %}">
-        {% csrf_token %}
-        {{ visibility_form.intent }}
-        <button type="submit">
-          {% if profile.is_public %}Unpublish record{% else %}Publish record{% endif %}
-        </button>
-      </form>
+      <div class="actions">
+        <a class="button secondary" href="{% url 'surface:profile-edit' %}">Edit profile details</a>
+        <form method="post" action="{% url 'surface:profile-visibility' profile.handle %}">
+          {% csrf_token %}
+          {{ visibility_form.intent }}
+          <button type="submit">
+            {% if profile.is_public %}Unpublish record{% else %}Publish record{% endif %}
+          </button>
+        </form>
+      </div>
     </section>
   {% endif %}
 

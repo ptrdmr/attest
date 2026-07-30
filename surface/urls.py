@@ -197,6 +197,11 @@ urlpatterns = [
         name="record",
     ),
     path(
+        "profile/edit/",
+        views.ProfileEditView.as_view(),
+        name="profile-edit",
+    ),
+    path(
         "billing/",
         views.BillingView.as_view(),
         name="billing",

@@ -1850,6 +1850,27 @@ decision, not deferred to dispatch.
    - Note for the freelancer-facing copy: the remedy is entering skills on projects,
      which is a `Project` field and therefore **outside I5's boundary**. No scope is
      added here; I5b edits profile fields only.
+7. **I5e displays the three self-declared fields; nothing else does** — added after the
+   I5b Implementer-adversary correctly refused to improvise this. The gap it found: every
+   decision so far says which profile fields are **searched** (decision 1), and none ever
+   said they are **displayed**, so I5b shipped an edit form whose output was invisible.
+   That is a plan defect, not a builder defect, and inventing a public-surface layout at
+   the Implementer layer would have repeated iteration 1's exact failure one level down.
+   Ruling:
+   - `bio`, `location` and `website_url` render in **I5e**, both on the directory card
+     and in the record page's heading region — **outside** the `Verified skills` card and
+     visually distinct from it, with **no** "attested"/"verified"/"signed" vocabulary in
+     that region. This is decision 2's anti-conflation rule applied to a detail page
+     rather than a listing.
+   - **I5e's boundary gains `templates/surface/record/detail.html`.** I5b also holds that
+     file; safe only because the milestones are strictly sequential, same caveat as
+     `static/css/app.css`.
+   - Worth recording honestly: `headline` is equally self-declared and **already** renders
+     unlabelled on the record page today, predating decision 2. So I5e is bringing an
+     existing inconsistency into line rather than introducing a new risk.
+   - Until I5e lands, I5b's form legitimately writes fields that display nowhere. Accepted
+     as a seam, not a defect, because the alternative was an unreviewed public-surface
+     design decision made by a builder.
 
 For the record, one alternative was considered and rejected: having the directory
 compute dispute-clean counts **live** and skip the cache entirely, which would make
@@ -2059,6 +2080,100 @@ one an authenticated developer never stumbles into by accident.
   decision 6's third empty state entirely). The pattern worth remembering: the
   decisions were right each time and the canonical test list was what lost fidelity —
   and the test list is what builders work from.
+
+#### I5b dispatch decisions (2026-07-29)
+
+Three things the plan left open that would have forced a builder to guess.
+
+- **The entry point is the owner's own record page**, `templates/surface/record/detail.html`,
+  beside the existing visibility control — the freelancer already manages their public
+  presence from there, and the nav reaches it via "Record". This deliberately avoids
+  `templates/surface/partials/site_header.html`, which **I5e claims**; had I5b added a
+  nav link, two milestones would own that file and finding 6's I3c coupling would be in
+  play twice.
+- **The edit URL carries no handle or pk.** The profile is derived from `request.user`,
+  so there is no object to authorize against and object-level authorization bugs are
+  structurally impossible rather than merely tested for. Login required.
+- **Boundary amendment:** add `templates/surface/record/detail.html` (unclaimed by any
+  other milestone) and `static/css/app.css`. The latter is also listed under I5e; that
+  is safe **only** because these milestones are strictly sequential, and it would be a
+  dispatch defect if they ever ran concurrently.
+
+The form offers `display_name`, `headline`, `bio`, `location`, `website_url`. `handle`
+is absent as a field entirely, and the hostile-POST test from the plan's test strategy
+proves the omission is enforced rather than incidental. The view calls
+`set_profile_details` and maps its `ValidationError` onto form errors; per the I5a
+carried note it must not call `profile.save()` on that instance itself.
+
+**Amendment from the Implementer-adversary (accepted).** The view deliberately lets the
+service's `ValueError` propagate, on the reasoning that a valid form can never trigger
+it. That reasoning was verified correct today, but it rests on an **unenforced coupling**:
+the form's field set must keep matching `_PROFILE_DETAIL_FIELDS` exactly, and
+`display_name` must remain the only required field. Nothing pinned that at either end, so
+I5b's Verifier owes a test asserting the form's declared fields equal the service's
+allowlist — turning a comment-level assumption into a failing test if anyone breaks it.
+
+#### I5b execution log (2026-07-29)
+
+Owning department Surface, full dispatch. Suite **387 → 408 green**, ruff clean on every
+file this milestone touched.
+
+- **Implementer-builder (Composer 2.5) → Implementer-adversary (Sonnet 5): ACCEPT**, two
+  nits and one forward-looking should-fix. Its most valuable act was a **refusal**: asked
+  whether the three new fields displaying nowhere was a defect it should close, it argued
+  both sides and concluded the display decision belonged to the plan, not to a builder
+  improvising a public-surface layout. That was correct, and it produced decision 7.
+- **Orchestrator reverted unauthorized cleanup, twice — and got it wrong the first time.**
+  The Implementer had run what amounts to `ruff --fix` on `surface/views.py`'s import
+  block, pre-existing mess that is one of the three logged `I001` Refit candidates.
+  Verified it was already failing at HEAD and reverted it. **The Compliance Gate then
+  caught that the Verifier had done exactly the same thing to `surface/tests.py`**, which
+  the orchestrator had missed while describing the diff as "purely additive" — true of
+  `views.py`, not of `tests.py`. Reverted that too, so both `I001` candidates stay open
+  rather than being closed by stealth in an unrelated commit. Lesson: when reverting a
+  class of drive-by change, check **every** file in the diff for it, not the one where it
+  was first noticed.
+- **Verifier-builder (Composer 2.5): 19 tests → Verifier-adversary (Grok 4.5): REJECT.**
+  Ten mutations, one at a time, against hashes the orchestrator verified byte-exact
+  afterwards. Most of the harness held. The blocker it found is the best catch of the
+  initiative so far: it mutated the view to resolve the profile from `request.POST["handle"]`
+  **with a fallback to `request.user`**, and *both* the cross-user isolation test and the
+  hostile-handle test stayed green — because the isolation test never posted a foreign
+  handle and the hostile test posted a handle that does not exist, so the fallback was
+  indistinguishable from correct behaviour. The exact authorization bug the no-pk-in-URL
+  design exists to prevent was invisible to the suite. Closed by a test where one
+  freelancer posts another's **real** handle and both halves are asserted: the victim
+  unchanged **and** the actor's own update still succeeding, so it cannot pass merely
+  because the request failed.
+- **Second finding, also real:** removing the view's `except ValidationError` broke no
+  test, because the form's constraints mirror the model's and reject bad input before the
+  service is reached. The service-to-form error bridge was therefore untested. Now pinned
+  by patching the service (a collaborator, not the subject) to raise. A vacuous
+  "response contains no `Traceback`" test was replaced by these, which cover the same
+  intent on the path that can actually raise.
+- **Walkthrough: a false positive, and the second of its kind in this project.** The
+  browser agent reported "critical: form validation gives no user feedback". Investigated
+  rather than accepted: a Django `URLField` renders `<input type="url">` and a required
+  field renders `required`, so the **browser's own HTML5 validation blocked the submit
+  client-side and the server was never reached**. Proved it by driving the same two POSTs
+  through the Django test client against the dev database, which returned 200 with a
+  rendered `errorlist` containing "Enter a valid URL" and "This field is required" and no
+  traceback. Real users do get feedback, as a native tooltip. **Lesson for future
+  walkthroughs: a browser agent cannot see native validation bubbles, so "nothing
+  happened" on submit means client-side validation fired, not that the server is silent.**
+- Everything else in the walkthrough passed, including the two that matter most: clearing
+  only `location` left the other four fields intact, and an anonymous request to
+  `/profile/edit/` redirected to login rather than rendering or erroring.
+- Gate (fresh-context, Opus 5): **PASS**, with the `tests.py` reorder above plus two
+  advisories. The substantive one: **no test asserted `is_public` was still `False` after
+  a successful edit.** The invariant held by construction, but nothing would catch a future
+  widening of the service allowlist from this surface — which is the precise failure the
+  strict opt-in ruling exists to prevent. Now pinned in the valid-POST test alongside
+  `handle`, so both invariants this milestone must not break are asserted where the write
+  actually happens. Also noted non-blocking: a freelancer editing an unpublished profile
+  is redirected to a page framed as their public record. That is deliberate — it is the
+  owner's private preview and where the publish control lives — and is recorded here so it
+  stays a choice rather than becoming an accident.
 
 #### I5a execution log (2026-07-29)
 

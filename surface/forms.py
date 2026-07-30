@@ -125,6 +125,40 @@ class ProfileVisibilityForm(forms.Form):
     )
 
 
+class ProfileDetailsForm(forms.Form):
+    """Validate editable profile identity fields for the authenticated owner."""
+
+    display_name = forms.CharField(
+        label="Display name",
+        max_length=255,
+        strip=True,
+        widget=forms.TextInput(attrs={"autocomplete": "name"}),
+    )
+    headline = forms.CharField(
+        label="Headline",
+        max_length=255,
+        required=False,
+        strip=True,
+    )
+    bio = forms.CharField(
+        label="Bio",
+        required=False,
+        strip=True,
+        widget=forms.Textarea(attrs={"rows": 6}),
+    )
+    location = forms.CharField(
+        label="Location",
+        max_length=120,
+        required=False,
+        strip=True,
+    )
+    website_url = forms.URLField(
+        label="Website",
+        required=False,
+        widget=forms.URLInput(attrs={"placeholder": "https://…"}),
+    )
+
+
 class SignatureForm(forms.Form):
     """Validate the client's typed electronic signature."""
 

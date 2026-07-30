@@ -11,6 +11,7 @@ from django.contrib.auth import get_user_model, login, logout
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.cache import cache
 from django.core import signing
+from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.db import IntegrityError, transaction
 from django.http import Http404
@@ -56,6 +57,7 @@ from .forms import (
     ClientApprovalForm,
     DeliveryItemForm,
     MagicLinkRequestForm,
+    ProfileDetailsForm,
     ProfileVisibilityForm,
     ProjectForm,
     SignatureForm,
@@ -1352,6 +1354,46 @@ class RecordRedirectView(LoginRequiredMixin, View):
     def get(self, request):
         """Resolve the current profile and redirect to its public URL."""
         profile = ensure_profile(request.user)
+        return redirect("surface:public-record", handle=profile.handle)
+
+
+def _apply_validation_error_to_form(form, exc):
+    """Map a service-layer ValidationError onto form field errors."""
+    if hasattr(exc, "error_dict"):
+        for field_name, errors in exc.error_dict.items():
+            for error in errors:
+                form.add_error(None if field_name == "__all__" else field_name, error)
+    else:
+        for message in exc.messages:
+            form.add_error(None, message)
+
+
+class ProfileEditView(LoginRequiredMixin, FormView):
+    """Edit the authenticated freelancer's profile identity fields."""
+
+    template_name = "surface/profile/form.html"
+    form_class = ProfileDetailsForm
+
+    def get_initial(self):
+        """Pre-populate the form from the current user's profile."""
+        profile = ensure_profile(self.request.user)
+        return {
+            "display_name": profile.display_name,
+            "headline": profile.headline,
+            "bio": profile.bio,
+            "location": profile.location,
+            "website_url": profile.website_url,
+        }
+
+    def form_valid(self, form):
+        """Persist validated profile details through the Ledger service."""
+        profile = ensure_profile(self.request.user)
+        try:
+            services.set_profile_details(profile, **form.cleaned_data)
+        except ValidationError as exc:
+            _apply_validation_error_to_form(form, exc)
+            return self.form_invalid(form)
+        messages.success(self.request, "Profile updated.")
         return redirect("surface:public-record", handle=profile.handle)
 
 
