@@ -1633,12 +1633,18 @@ deadlock.
   logo URL avoids both and keeps this on the fast path.
 
 ### I5 — Profile directory + search (owning: Ledger + Surface; full dispatch)
-- Richer profile fields, directory and search views. Parallelizable with
-  I1–I2; the opt-in flag itself ships earlier in M7b.
-- **Shared-file ownership at dispatch:** `surface/urls.py` and the `base.html`
-  nav belong to I5's boundary, not to any concurrent milestone.
+- Richer profile fields, directory and search views. The opt-in flag itself
+  shipped earlier in M7b. The original "parallelizable with I1–I2" note is spent:
+  both are complete, so I5 runs on its own.
+- **Shared-file ownership at dispatch:** `surface/urls.py` belongs to I5's
+  boundary. The companion note claiming the `base.html` nav is stale — I3c moved
+  the nav into `templates/surface/partials/site_header.html` (finding 5).
 
 #### Human rulings taken 2026-07-29, before planning
+
+**Numbering, to prevent a collision:** inside the I5 section, "ruling N" means one of
+the four below, and roadmap-level rulings are cited explicitly as "roadmap ruling N".
+The two sequences overlap numerically and mean different things.
 
 The human's framing: **a front-end search for visitors who browse freelancers
 without creating an account of any kind.** That is in line with what exists rather
@@ -1661,6 +1667,22 @@ currently has no entry point.
    rather than changing it: M7b-2 emits `X-Robots-Tag: noindex` only while a record
    is unpublished, so published records are already indexable and no change to that
    view is authorized here. The directory itself must not emit `noindex`.
+3. **Ranking: attested volume leads a capability search, recency leads an
+   unfiltered browse.** A capability-filtered result orders by that tag's
+   `attested_count` descending, ties broken by `last_attested_at` descending, then
+   `handle` ascending so the ordering is total and deterministic. An unfiltered
+   browse orders by `last_attested_at` descending, then `handle`, which surfaces
+   working practitioners instead of entrenching whoever registered first. Volume is
+   defensible as the headline signal precisely because it cannot be self-issued —
+   every increment costs a client signature — and the recency tie-break stops a
+   dormant high-volume profile from owning the top of the page forever.
+4. **`handle` stays immutable in MVP; `display_name` becomes editable.** The handle
+   is the public record URL (`/u/<slug:handle>/`), so editing it breaks inbound
+   links, and once records are indexable a released handle can be re-registered by
+   someone who then inherits its accumulated reputation — an impersonation vector.
+   Decoupling the name a freelancer is called from the address their record lives at
+   delivers the whole benefit without that risk, and needs no retired-handle
+   reservation table because nothing is ever retired.
 
 #### Constraints its Planner must carry
 
@@ -1683,8 +1705,359 @@ currently has no entry point.
   `icontains` on SQLite, not a full-text engine. Adequate at MVP scale and it keeps
   the constitution intact.
 - **Strict opt-in means the directory ships empty** until freelancers publish
-  (`is_public` defaults False per ruling 7). Correct, but it makes the empty state a
+  (`is_public` defaults False per roadmap ruling 7). Correct, but it makes the empty state a
   first-class design problem rather than an afterthought.
+
+#### Reconnaissance findings that shape this plan (2026-07-29)
+
+Six facts about the current code, each with a consequence the plan must carry. All
+were re-verified after the Planner-adversary review; findings 3 and 6 changed as a
+result.
+
+1. **Freelancers cannot edit their own public identity, and it is derived from
+   their email address.** `ensure_profile` (`surface/auth.py:48-56`) sets
+   `display_name` to the email local-part (`seed.partition("@")[0]`) and `handle`
+   to a slug of the same seed; `headline` is left blank and **no profile-editing
+   view or form exists anywhere** — `surface/forms.py` has only
+   `ProfileVisibilityForm`, and `surface/urls.py` has no profile-edit route. So a
+   directory shipped today would list freelancers as "dana" and "stepwalk". Worse,
+   combined with the indexability ruling it would publish the **local-part of every
+   opted-in freelancer's email address to search engines**. **A directory cannot
+   ship before freelancers control their own identity**, so that becomes the first
+   milestone rather than a later polish item.
+2. **`CapabilityTag` is a cache, and the directory is the first surface where it
+   becomes load-bearing.** `recompute_capability_tags`
+   (`ledger/services.py:655`) rebuilds from `_tag_dates_by_name`, which already
+   filters `status=ATTESTED, is_current=True, is_disputed=False` and skips any
+   attestation failing `verify_payload_hash` — so the cache is dispute-clean and
+   tamper-clean **at write time**, and it is recomputed by all four services that
+   can change the facts (`sign_attestation`, `amend_attestation`, `flag_dispute`,
+   `resolve_dispute`). Crucially, the public record *detail* page does not rely on
+   it: `public_attestations(profile)` recomputes live and re-verifies hashes on
+   every request. A directory that filters and ranks on `CapabilityTag` has **no
+   live recomputation to fall back on**, so cache correctness becomes the
+   correctness of the whole surface.
+3. **The dispute-cache bypass is wider than one admin form — I first recorded this
+   finding as narrower than it is, and the Planner-adversary was right to reject it.**
+   Verified directly against the code: `Attestation.IMMUTABLE_FIELDS`
+   (`ledger/models.py:229-235`) covers `payload`, `payload_hash`, `client_email`,
+   `client_name_typed`, `signed_at`, and necessarily **excludes** `is_disputed` and
+   `disputed_at` because `flag_dispute` must write them. Consequently
+   `AttestationQuerySet.update()` (`:189-196`) blocks only the immutable set and so
+   permits `.update(is_disputed=True)`; `Attestation.save()` permits the same; and
+   `ledger/tests.py:2825` and `:2852` already do exactly that. Separately
+   `AttestationAdmin` (`ledger/admin.py:62-72`) deliberately leaves both fields
+   editable — its docstring calls them "dispute controls". That is **three** write
+   paths that change dispute state without recomputing the cache, so promoting Refit
+   candidate (1) as written closes one of three and I presented it as sufficient. In
+   a directory with no live recomputation to fall back on, any of the three
+   **presents a disputed freelancer as cleanly credentialed**, which Domain Law
+   forbids. Note also that `QuerySet.update()` does not fire `post_save`, so a
+   signal alone is likewise insufficient.
+   Two further facts, found while verifying the above:
+   - **Locking the admin fields removes a real capability.** Dispute flagging from
+     the admin is a deliberate feature, so the fix must replace the editable fields
+     with admin actions calling `flag_dispute` / `resolve_dispute`, not merely make
+     them read-only.
+   - **An admin flipping `is_disputed` today creates a two-model inconsistency, not
+     just a stale cache.** `flag_dispute` also transitions the project to
+     `DISPUTED`; a bare field edit leaves `Project.status = ATTESTED` while the
+     attestation reads disputed, and `_tag_dates_by_name` filters on **both**. The
+     equivalent `Project.status` vector is already closed for admins —
+     `ProjectAdmin.readonly_fields` includes `status` (`ledger/admin.py:29`) — which
+     is both the precedent this fix should follow and evidence the project already
+     considers service-routed status changes the rule.
+4. **The capability cache ignores `is_public`.** `recompute_capability_tags` writes
+   tags for every profile, published or not, so **every directory and search query
+   must filter `profile__is_public=True`**. Omitting that filter silently publishes
+   every private profile's capability data, which is the exact failure the strict
+   opt-in ruling exists to prevent. It gets a dedicated test.
+5. **Tag names are slugs, and the nav has moved.** `_normalized_skills`
+   (`ledger/services.py:434-442`) slugifies, so `CapabilityTag.name` holds values
+   like `react-native` and a visitor typing "React Native" matches nothing unless
+   the query is slugified the same way. Separately, the plan's standing note that
+   "the `base.html` nav belongs to I5" is now stale: I3c extracted the nav into
+   `templates/surface/partials/site_header.html`, which is where the entry point
+   must be added — and that partial renders nav links **only when
+   `request.user.is_authenticated`**, so an anonymous visitor currently has no
+   discovery entry point at all.
+6. **`site_header.html` is load-bearing for I3c's identity-order tests.**
+   `surface/tests.py:6080-6081` and `:6098-6099` assert DOM order by string index,
+   locating the literal `<header class="site-header">` relative to
+   `data-identity="client"`. Any I5 edit to that partial must preserve that exact
+   opening tag and the client-strip / site-header ordering, and those tests must
+   pass **unchanged** — editing them to accommodate a new nav link would silently
+   retire I3c's portal-identity guarantee. The anonymous entry point therefore goes
+   outside the `{% if request.user.is_authenticated %}` block without disturbing the
+   header element itself.
+
+#### Decisions closing the Planner-adversary review (rejected iter 1)
+
+The adversary's central charge was that the plan stated goals where it owed
+mechanisms, so a builder would have to invent them. Each gap is now closed by a
+decision, not deferred to dispatch.
+
+1. **The secondary text filter searches profile fields only** — `display_name`,
+   `headline`, `bio`, `location`. It does **not** search `Project.skills_csv`.
+   Project skills are per-project, include draft text a freelancer never intended to
+   publish, and would leak unattested claims onto an anonymous indexable surface. So
+   no denormalized skills column is added and no fourth migration field is needed.
+   This **narrows** ruling 1 rather than contradicting it: ruling 1 said declared text
+   *may* filter, and this decision settles which declared text does.
+2. **Anti-conflation is a test, not an intention.** Ruling 1 forbids declared text
+   carrying the headline claim, which is unenforceable as prose. The test asserts
+   that attested capabilities render inside a distinct labelled element, that
+   self-declared text renders outside it, and that no verification language
+   ("attested", "verified", "signed") appears in the declared-text region. It must
+   fail if a template later merges the two.
+3. **Two empty states, not one.** "No freelancer has published a profile yet" (the
+   launch-day condition under strict opt-in) and "no result matches this search" are
+   different messages with different next actions, and each gets its own test. The
+   original plan named only the first.
+4. **Pagination is specified up front:** Django's built-in `Paginator`, 20 profiles
+   per page, and the flat-query test asserts a bounded result set so the page-size
+   promise cannot silently regress into "render everything". Paging uses
+   **`get_page()`, not `page()`** — the latter raises `PageNotAnInteger` / `EmptyPage`,
+   which on an anonymous public surface means `?page=abc` returns a 500 instead of the
+   friendly generic response `dept_surface.mdc` requires. A malformed and an
+   out-of-range `?page=` each get a test.
+5. **The dispute-cache fix is split into its own milestone (new I5c).** Given
+   finding 3, its scope is no longer "make two admin fields read-only" but "hold the
+   cache-freshness invariant across three write paths, one of which is the queryset
+   that enforces attestation immutability". That is hazard-zone work and cannot ride
+   along with read-only query services.
+6. **The directory anchors on `Profile`, not on `CapabilityTag`** — added in
+   iteration 2, after the adversary found a profile the plan would have silently
+   erased. `Project.skills_csv` is `blank=True` (`ledger/models.py:51`) and
+   `_normalized_skills("")` returns `[]` (verified), so an attested, opted-in,
+   dispute-clean project with no skills entered produces **zero `CapabilityTag`
+   rows**. A `CapabilityTag`-anchored query would drop that freelancer from the
+   directory entirely while their public record shows genuine signed work — hiding
+   real attested work is a presentation failure of the same family as the ones ruling
+   1 exists to prevent. So:
+   - The browse query selects published profiles and joins tags as an annotation;
+     a profile with no tags **still appears**, with its capability slot rendering a
+     designed "no attested capabilities yet" state (a third empty state, distinct
+     from decision 3's two, and tested).
+   - `last_attested_at` is per-`(profile, name)`, not per-profile — there is no
+     profile-level recency column. The unfiltered browse sort key is therefore the
+     **maximum `last_attested_at` across that profile's tags, nulls last**, then
+     `handle` ascending. Zero-tag profiles sort deterministically to the bottom,
+     which is the honest outcome: they have given the directory nothing to match on.
+   - A **capability-filtered search legitimately excludes zero-tag profiles** —
+     nothing to match is not the same as being hidden. That asymmetry is deliberate
+     and gets a test so a later "fix" cannot quietly collapse the two queries.
+   - Note for the freelancer-facing copy: the remedy is entering skills on projects,
+     which is a `Project` field and therefore **outside I5's boundary**. No scope is
+     added here; I5b edits profile fields only.
+
+For the record, one alternative was considered and rejected: having the directory
+compute dispute-clean counts **live** and skip the cache entirely, which would make
+freshness moot. It cannot work — capability tags live inside the attestation
+`payload` JSON, so they cannot be grouped in SQL, and `verify_payload_hash` runs in
+Python and cannot be expressed as a database filter. The cache is structurally
+necessary, which is exactly why the guarantee has to come from the write path.
+
+#### Milestones — five, strictly sequential
+
+The honest reason for serial execution is **not** that each milestone depends on the
+last: I5c is independent of I5b, and their boundaries do not even overlap
+(`ledger/**` versus `surface/**`, `ledger/tests.py` versus `surface/tests.py`). They
+run in series because the charter puts cross-department sequencing on the
+orchestrator (M4a/M4b, M7b-1/M7b-2 precedent), because the review loop rather than
+the typing is the bottleneck, and because I5e depends on all four. The genuine hard
+edges are: **I5b requires I5a's fields**, **I5e requires I5d's services**, and
+**I5d is only trustworthy given I5c**. Whichever milestone is in flight claims
+`surface/tests.py`, `ledger/tests.py` and `surface/urls.py`.
+
+- **I5a — Identity fields and service (owning: Ledger).** The enumerated migration
+  plus a `set_profile_details(profile, **fields)` service, because
+  `dept_surface.mdc` forbids Surface writing trust-object fields directly — the same
+  reason M7b-1 added `set_profile_visibility`.
+  **Schema authorization requested, this list only:** `bio` (`TextField`,
+  `blank=True`), `location` (`CharField(max_length=120, blank=True)`), and
+  `website_url` (`URLField(blank=True)`). `headline` already exists and needs no
+  migration, only an editing surface.
+  **Deliberately excluded, with reasons:** an hourly rate or availability flag (both
+  go stale silently and an availability promise on an indexable page invites exactly
+  the disputes this product exists to adjudicate); and an avatar or logo, because
+  image storage is I4's open question — `MEDIA_ROOT` has no backend — and smuggling
+  it in here would import that unresolved decision into a Ledger migration.
+  Boundaries: `ledger/models.py`, `ledger/migrations/`, `ledger/services.py`,
+  `ledger/tests.py`.
+- **I5b — Profile editing surface (owning: Surface; consult: Ledger read-only).**
+  The freelancer's own edit form and view, calling the I5a service. This exists so
+  that nothing is ever published under an email-derived name. Editable per ruling 4:
+  `display_name`, `headline`, `bio`, `location`, `website_url`. **`handle` is not
+  editable and must not appear as a form field** — a test asserts that posting a
+  `handle` value leaves it unchanged, so the immutability survives a future form
+  edit rather than resting on it being omitted today.
+  Boundaries: `surface/views.py`, `surface/urls.py`, `surface/forms.py`,
+  `templates/surface/profile/**`, `surface/tests.py`.
+- **I5c — Cache freshness across every dispute write path (owning: Ledger; hazard
+  zone).** The finding-3 fix, standing alone because it touches the queryset that
+  enforces attestation immutability. Three layers, because no one of them is
+  sufficient:
+  1. `AttestationQuerySet.update()` recomputes tags for affected profiles when the
+     dispute markers are touched — needed because `QuerySet.update()` never fires
+     `post_save`. This must **extend** the existing immutability guard, not rewrite
+     it; the `ImmutableAttestation` behaviour on signed fields stays byte-identical.
+  2. A `post_save` receiver on `Attestation` recomputes when dispute markers change,
+     catching direct `.save()` calls including `update_fields` writes.
+  3. `AttestationAdmin` makes `is_disputed` / `disputed_at` read-only **and** gains
+     admin actions calling `flag_dispute` / `resolve_dispute`, preserving the
+     capability while keeping `Project.status` consistent. Precedent:
+     `ProjectAdmin.readonly_fields` already contains `status`.
+  Definition of done includes a **write-path matrix test**: service call, direct
+  `.save(update_fields=...)`, bulk `.update()`, and the admin action each leave the
+  cache correct. Every cell must fail if its layer is removed.
+  **Plus one assertion the matrix structurally cannot make.** The matrix asserts
+  "this write leaves the cache correct", which can only exercise layer 3's admin
+  *actions*; it says nothing about layer 3's read-only *fields*, because a blocked
+  edit changes nothing and so satisfies "the cache is still correct" whether the
+  guard exists or not. If someone later re-exposes `is_disputed`/`disputed_at` as
+  editable admin form fields — the exact defect finding 3 found — no matrix cell
+  would fail. So I5c also asserts directly that **a staff POST to the attestation
+  admin change form attempting to set `is_disputed` / `disputed_at` leaves both
+  unchanged **while the POST itself succeeds** (200/302, no form errors), in the same
+  spirit as I5b's hostile-POST test on `handle`. The success half matters: without it
+  the test could pass because the POST failed validation for an unrelated reason
+  rather than because the guard held — the same vacuous pass this assertion exists to
+  prevent.
+  Boundaries: `ledger/models.py`, `ledger/admin.py`, `ledger/services.py`,
+  `ledger/apps.py` (signal registration only), `ledger/tests.py`. **No migration**
+  — this milestone changes no fields.
+- **I5d — Directory query services (owning: Ledger).** The read-only services the
+  directory needs: a published-profile listing and a capability search, both
+  filtering `profile__is_public=True` per finding 4, both returning capability tags
+  without an N+1, both slug-normalizing the query per finding 5, and both applying
+  ruling 3's explicit `order_by`. Query logic lives in services, not views, per
+  `dept_ledger.mdc`.
+  Boundaries: `ledger/services.py`, `ledger/tests.py`.
+- **I5e — Public directory and search UI (owning: Surface).** The
+  anonymous-accessible directory and search pages, the entry point in
+  `site_header.html` visible to visitors who are not logged in, a link from the
+  landing page, pagination per decision 4, and all three empty states — decision 3's
+  two plus decision 6's zero-capability slot.
+  Carries the finding-6 constraint: I3c's identity-order tests must pass untouched.
+  Boundaries: `surface/views.py`, `surface/urls.py`, `surface/forms.py`,
+  `templates/surface/directory/**`,
+  `templates/surface/partials/site_header.html`, `static/css/app.css`,
+  `surface/tests.py`.
+
+#### Test strategy
+
+The load-bearing cases, beyond ordinary coverage:
+
+- **A private profile with capability tags never appears** in the directory or in
+  any search result, and its tag data appears nowhere in either response body.
+  This is the strict opt-in ruling and finding 4; it must fail loudly if the
+  `is_public` filter is dropped.
+- **Two separate claims here, deliberately not merged.** First, in I5c: the cache
+  stays correct after a dispute arrives by **any** write path — the write-path
+  matrix above, which is the regression test for finding 3 and must fail if a layer
+  is removed. Second, in I5d/I5e: given a correct cache, a disputed freelancer is
+  never presented as clean in a listing. The first is about cache freshness, the
+  second about presentation; a single test that conflated them would pass while
+  either half was broken.
+- **A tamper-failed attestation does not contribute to a listing**, mirroring the
+  `verify_payload_hash` guard that `public_attestations` applies live.
+- **Slug-normalized matching**: "React Native" finds `react-native`, and the
+  chosen partial-match semantics are pinned explicitly rather than left to
+  `icontains` by accident.
+- **Anonymous access throughout**: directory and search return 200 with no session
+  of any kind, and the nav entry is present for an anonymous visitor — the finding-5
+  gap.
+- **Indexability is asserted, not assumed**: the directory must **not** emit
+  `X-Robots-Tag: noindex`, in deliberate contrast to M7b-2's unpublished-record
+  header. Ruling 2 above makes this a requirement, so it gets a test that fails if
+  someone later adds a blanket header.
+- **Query count is flat** regardless of how many profiles and tags exist, measured
+  rather than inspected, as I3b's adversary did for the portal detail page.
+- **Ordering is deterministic and explicitly asserted** — an earlier milestone was
+  caught relying on insertion order, so ruling 3's ranking must be pinned with an
+  explicit `order_by`, including the `handle` tie-break that makes the order total.
+  Construct a tie deliberately and assert the result is stable.
+- **Attested and declared text never conflate** — decision 2's test: attested
+  capabilities inside a labelled element, declared text outside it, no verification
+  vocabulary in the declared region.
+- **Both empty states**, per decision 3: nothing published yet, and no match for
+  this query. Distinct copy, one test each.
+- **Pagination is bounded** — page size holds at 20 and the flat-query test asserts
+  the result set is bounded rather than rendering every profile.
+- **`handle` survives a hostile POST** — posting a `handle` to the profile edit view
+  leaves it unchanged, per ruling 4. Its I5c counterpart: a staff POST to the
+  attestation admin form cannot set `is_disputed` / `disputed_at`.
+- **A zero-tag attested profile still appears in the browse listing** and is absent
+  from a capability search, per decision 6. This fails if the browse query is ever
+  rewritten to anchor on `CapabilityTag`.
+- **The third empty state renders its own copy** — a zero-tag profile's capability
+  slot shows the "no attested capabilities yet" state, asserted on the rendered
+  response, not merely inferred from the profile appearing in results. Kept separate
+  from the bullet above for the same reason the two dispute claims are separate: one
+  test covering both would pass while either half was broken.
+- **A malformed *or out-of-range* `?page=` does not 500**, per decision 4 — both
+  cases, since `get_page()` handles them by different routes.
+
+#### Role sequence and seats
+
+Full dispatch for all five, per the plan's existing designation. **I5c is the hazard
+zone** — it modifies the queryset that enforces attestation immutability and governs
+dispute propagation to a public surface — so it takes the hazard-zone builder seat,
+runs Verifier-first (characterization tests pinning the existing
+`ImmutableAttestation` behaviour before the guard is extended, as I3c did for the
+consent seam), and the Verifier-adversary seat stays separate, having found a real
+defect in six consecutive milestones. A hand-driven walkthrough is part of the
+definition of done for I5b and I5e, and for I5e it must include **an anonymous
+browser with no session at all** — the state the whole initiative exists for, and the
+one an authenticated developer never stumbles into by accident.
+
+#### Plan review history
+
+- **Iteration 1 (2026-07-29): Planner-adversary REJECT.** It verified all five
+  reconnaissance findings against the code and found no factual errors, so the
+  rejection was about what the plan concluded from them. Two blockers: no ranking
+  algorithm was specified (a product decision the plan had silently left to the
+  builder), and the promoted Refit fix was incomplete while being presented as
+  complete. Lesser findings: the two dispute claims in the test strategy were
+  conflated, the sequencing justification overstated inter-milestone dependency, the
+  parallelizable-with-I1/I2 note was stale, and `site_header.html`'s coupling to
+  I3c's tests was unrecorded.
+- **Orchestrator verification of the blocker, before revising.** The adversary's
+  claims about `IMMUTABLE_FIELDS`, `AttestationQuerySet.update()` and the test
+  suite's direct `save(update_fields=...)` writes were each confirmed by reading the
+  code rather than accepted on report. That pass also produced two facts the
+  adversary had not raised: locking the admin fields would remove a deliberate
+  capability, and a bare admin field edit yields a two-model inconsistency because
+  `_tag_dates_by_name` filters on `Project.status` as well. Both are now in finding 3.
+- **Human rulings taken to close the blockers:** ranking (ruling 3) and handle
+  mutability (ruling 4).
+- **Iteration 2 (2026-07-29): Planner-adversary REJECT, all findings accepted
+  without dispute.** It re-verified all ten cited code locations as exact, confirmed
+  both iteration-1 blockers genuinely closed, and explicitly judged the five-milestone
+  split not over-engineered. Three new findings, all now fixed: (blocker) the I5c
+  write-path matrix structurally could not catch a regression of layer 3's read-only
+  admin fields, since a blocked write trivially satisfies "the cache is still
+  correct" — closed by adding a direct hostile-POST assertion; (should-fix) a
+  zero-`CapabilityTag` profile would be erased by a tag-anchored query — closed by
+  decision 6; (nit) `Paginator.page()` would 500 on `?page=abc` — closed in decision
+  4. It also deliberately checked for a fourth `Project.status` bypass and reasoned
+  it out of scope, since no production code path or staff UI reaches it.
+- **The bounded two-iteration loop was spent at iteration 2.** Both positions agreed,
+  so there was no deadlock to escalate; the human was asked whether to spend a third
+  pass on the three unreviewed fixes, and ruled yes.
+- **Iteration 3 (2026-07-29): fresh-context Planner-adversary, scoped to the three
+  fixes only — ACCEPT.** Deliberately dispatched fresh rather than resuming the
+  iteration-2 adversary, since an adversary asked whether its own findings were
+  addressed is prone to agree. It independently re-verified the data-model claims,
+  confirmed `nulls_last` is portable across this project's backends and that `handle`
+  uniqueness makes the browse ordering total, and found no over-correction. Three
+  precision findings, all fixed: the hostile-POST assertion needed to require the POST
+  *succeed* or it could pass vacuously; and two test-strategy bullets had drifted from
+  the decisions they summarize (dropping the out-of-range `?page=` case, and omitting
+  decision 6's third empty state entirely). The pattern worth remembering: the
+  decisions were right each time and the canonical test list was what lost fidelity —
+  and the test list is what builders work from.
 
 ## Standing rules
 - Gate (fresh-context, Opus) runs on the final combined diff before EVERY commit
@@ -1700,8 +2073,10 @@ currently has no entry point.
   rejected once (sort_keys and is_disputed filters not load-bearing) → fixed →
   accepted with mutation-testing proof. Gate: PASS
 - Refit candidates: (1) make is_disputed/disputed_at admin-readonly and route
-  admin dispute handling through services so tag recompute always runs;
-  (2) drop redundant db_index=True on Attestation.project FK
+  admin dispute handling through services so tag recompute always runs —
+  **SUPERSEDED 2026-07-29 by I5c**, which found this fix covers one of three write
+  paths; do not action it standalone; (2) drop redundant db_index=True on
+  Attestation.project FK
 - 2026-07-18: M2 executed. Implementer-adversary (Sonnet) rejected once (no
   tests; HTMX 400 validation paths invisible; DEBUG review_url token in HTML)
   → fixed. Verifier (Composer, 34 surface tests) → Verifier-adversary (Grok)
